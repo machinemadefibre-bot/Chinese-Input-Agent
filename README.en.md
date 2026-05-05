@@ -153,6 +153,7 @@ Contact packages should contain public information only. If exported content eve
 
 - Long messages can be slow, especially on CPU.
 - Carrier articles can still have a small-model feel.
+- The current carrier is focused on Chinese text; English carrier text is planned for a future version.
 - The installer is large because the local model is large.
 - End-to-end automated tests are still incomplete.
 
