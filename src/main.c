@@ -128,6 +128,7 @@ static int g_active_profile = -1;
 static BOOL g_crypto_ready;
 static volatile LONG g_work_active;
 static volatile LONG g_cancel_work;
+static BOOL g_archive_mode;
 static LOCAL_LLM_WORKER g_llm_worker;
 static HANDLE g_llm_worker_job;
 
@@ -138,6 +139,8 @@ static void show_error(HWND owner, const WCHAR *message);
 static void do_key_transfer(HWND owner);
 static void do_archive(HWND hwnd);
 static void show_archive_for_active_profile(void);
+static void leave_archive_mode(void);
+static void refresh_main_mode_controls(void);
 static void set_textbox_overlay(HWND textbox, const WCHAR *text, BOOL show);
 static BOOL start_background_work(WORK_CTX *ctx);
 static WCHAR *get_required_topic_text(HWND owner, HWND topic_edit);
@@ -1882,7 +1885,110 @@ static BOOL build_archive_record(const KEY_PROFILE *profile, const WCHAR *plain,
     return TRUE;
 }
 
-static BOOL prepend_archive_text(const KEY_PROFILE *profile, const WCHAR *plain, WCHAR *err, size_t err_cch) {
+typedef struct ARCHIVE_BLOCK {
+    WCHAR *text;
+    WCHAR stamp[32];
+    size_t index;
+} ARCHIVE_BLOCK;
+
+static const WCHAR *find_archive_record_end(const WCHAR *start, size_t *record_cch) {
+    const WCHAR *crlf = wcsstr(start, L"\r\n\r\n");
+    const WCHAR *lf = wcsstr(start, L"\n\n");
+    const WCHAR *end = NULL;
+    size_t sep = 0;
+    if (crlf && (!lf || crlf < lf)) {
+        end = crlf;
+        sep = 4;
+    } else if (lf) {
+        end = lf;
+        sep = 2;
+    }
+    if (end) {
+        *record_cch = (size_t)(end - start) + sep;
+        return start + *record_cch;
+    }
+    *record_cch = wcslen(start);
+    return start + *record_cch;
+}
+
+static int compare_archive_blocks(const void *a, const void *b) {
+    const ARCHIVE_BLOCK *aa = (const ARCHIVE_BLOCK *)a;
+    const ARCHIVE_BLOCK *bb = (const ARCHIVE_BLOCK *)b;
+    int cmp = wcscmp(aa->stamp, bb->stamp);
+    if (cmp != 0) return cmp;
+    if (aa->index < bb->index) return -1;
+    if (aa->index > bb->index) return 1;
+    return 0;
+}
+
+static BOOL archive_text_oldest_first(const WCHAR *text, WCHAR **out) {
+    *out = NULL;
+    if (!text || !text[0]) {
+        *out = dup_wide(L"");
+        return *out != NULL;
+    }
+
+    size_t count = 0;
+    const WCHAR *p = text;
+    while (*p) {
+        size_t n = 0;
+        const WCHAR *next = find_archive_record_end(p, &n);
+        if (n > 0) ++count;
+        p = next;
+    }
+    if (count == 0) {
+        *out = dup_wide(L"");
+        return *out != NULL;
+    }
+
+    ARCHIVE_BLOCK *blocks = (ARCHIVE_BLOCK *)xalloc(sizeof(ARCHIVE_BLOCK) * count);
+    if (!blocks) return FALSE;
+
+    BOOL ok = TRUE;
+    p = text;
+    size_t idx = 0;
+    while (*p && idx < count) {
+        size_t n = 0;
+        const WCHAR *next = find_archive_record_end(p, &n);
+        if (n > 0) {
+            blocks[idx].text = (WCHAR *)xalloc((n + 1) * sizeof(WCHAR));
+            if (!blocks[idx].text) {
+                ok = FALSE;
+                break;
+            }
+            CopyMemory(blocks[idx].text, p, n * sizeof(WCHAR));
+            blocks[idx].text[n] = L'\0';
+            blocks[idx].index = idx;
+            if (n >= 21 && p[0] == L'[' && p[20] == L']') {
+                CopyMemory(blocks[idx].stamp, p, 21 * sizeof(WCHAR));
+                blocks[idx].stamp[21] = L'\0';
+            } else {
+                StringCchPrintfW(blocks[idx].stamp, ARRAYSIZE(blocks[idx].stamp), L"~%08zu", idx);
+            }
+            ++idx;
+        }
+        p = next;
+    }
+
+    if (ok) {
+        qsort(blocks, count, sizeof(ARCHIVE_BLOCK), compare_archive_blocks);
+        WSTRB b = {0};
+        for (size_t i = 0; i < count && ok; ++i) {
+            ok = wstrb_append(&b, blocks[i].text ? blocks[i].text : L"");
+        }
+        if (ok) {
+            *out = b.data;
+        } else {
+            wstrb_secure_free(&b);
+        }
+    }
+
+    for (size_t i = 0; i < count; ++i) secure_free_wide(blocks[i].text);
+    xfree(blocks);
+    return ok;
+}
+
+static BOOL append_archive_text(const KEY_PROFILE *profile, const WCHAR *plain, WCHAR *err, size_t err_cch) {
     WCHAR path[MAX_PATH];
     if (!get_profile_archive_path(profile, path, ARRAYSIZE(path))) {
         set_error(err, err_cch, L"");
@@ -1920,7 +2026,7 @@ static BOOL prepend_archive_text(const KEY_PROFILE *profile, const WCHAR *plain,
         read_file_bytes(legacy_path, &old, &old_len);
     }
 
-    DWORD total = (DWORD)record_len + old_len;
+    DWORD total = old_len + (DWORD)record_len;
     BYTE *merged = (BYTE *)xalloc(total ? total : 1);
     if (!merged) {
         secure_free_str(record_utf8);
@@ -1928,8 +2034,8 @@ static BOOL prepend_archive_text(const KEY_PROFILE *profile, const WCHAR *plain,
         set_error(err, err_cch, L"");
         return FALSE;
     }
-    CopyMemory(merged, record_utf8, (DWORD)record_len);
-    if (old && old_len) CopyMemory(merged + record_len, old, old_len);
+    if (old && old_len) CopyMemory(merged, old, old_len);
+    CopyMemory(merged + old_len, record_utf8, (DWORD)record_len);
     BYTE *protected_blob = NULL;
     DWORD protected_len = 0;
     BOOL ok = local_aes_gcm_encrypt(profile->master_key, merged, total, &protected_blob, &protected_len) &&
@@ -1961,6 +2067,13 @@ static BOOL load_archive_text(const KEY_PROFILE *profile, WCHAR **out, WCHAR *er
             read_file_bytes(legacy_path, &data, &data_len)) {
             BOOL ok = utf8_to_wide_n((const char *)data, (int)data_len, out);
             if (ok) {
+                WCHAR *ordered = NULL;
+                if (archive_text_oldest_first(*out, &ordered)) {
+                    secure_free_wide(*out);
+                    *out = ordered;
+                }
+            }
+            if (ok) {
                 BYTE *protected_blob = NULL;
                 DWORD protected_len = 0;
                 if (local_aes_gcm_encrypt(profile->master_key, data, data_len, &protected_blob, &protected_len) &&
@@ -1980,6 +2093,13 @@ static BOOL load_archive_text(const KEY_PROFILE *profile, WCHAR **out, WCHAR *er
     DWORD plain_len = 0;
     BOOL ok = local_aes_gcm_decrypt(profile->master_key, data, data_len, &plain, &plain_len) &&
               utf8_to_wide_n((const char *)plain, (int)plain_len, out);
+    if (ok) {
+        WCHAR *ordered = NULL;
+        if (archive_text_oldest_first(*out, &ordered)) {
+            secure_free_wide(*out);
+            *out = ordered;
+        }
+    }
     xfree(data);
     secure_free(plain, plain_len);
     if (!ok) {
@@ -2003,10 +2123,49 @@ static void show_archive_for_active_profile(void) {
     }
     set_textbox_overlay(g_textbox, NULL, FALSE);
     SetWindowTextW(g_textbox, archive ? archive : L"");
+    SendMessageW(g_textbox, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+    SendMessageW(g_textbox, EM_SCROLLCARET, 0, 0);
     secure_free_wide(archive);
 }
 
+static void refresh_main_mode_controls(void) {
+    if (!g_main_window || !IsWindow(g_main_window)) return;
+    BOOL busy = g_work_active != 0;
+    HWND encrypt = GetDlgItem(g_main_window, IDC_ENCRYPT);
+    HWND decrypt = GetDlgItem(g_main_window, IDC_DECRYPT);
+    HWND archive = GetDlgItem(g_main_window, IDC_CLEAR);
+    HWND key_transfer = GetDlgItem(g_main_window, IDC_KEY_TRANSFER);
+    if (archive) SetWindowTextW(archive, g_archive_mode ? L"\u8fd4\u56de" : L"\u5f52\u6863");
+    if (g_textbox) SendMessageW(g_textbox, EM_SETREADONLY, g_archive_mode ? TRUE : FALSE, 0);
+    if (g_topic_edit) EnableWindow(g_topic_edit, !busy && !g_archive_mode);
+    if (encrypt) {
+        EnableWindow(encrypt, !g_archive_mode);
+        SetWindowTextW(encrypt, busy && !g_archive_mode ? L"\u505c\u6b62" : L"\u52a0\u5bc6");
+    }
+    if (decrypt) EnableWindow(decrypt, !busy && !g_archive_mode);
+    if (archive) EnableWindow(archive, !busy);
+    if (g_key_select) EnableWindow(g_key_select, !busy);
+    if (key_transfer) EnableWindow(key_transfer, !busy && !g_archive_mode);
+}
+
+static void enter_archive_mode(void) {
+    g_archive_mode = TRUE;
+    refresh_main_mode_controls();
+    show_archive_for_active_profile();
+}
+
+static void leave_archive_mode(void) {
+    g_archive_mode = FALSE;
+    set_textbox_overlay(g_textbox, NULL, FALSE);
+    if (g_textbox) SetWindowTextW(g_textbox, L"");
+    refresh_main_mode_controls();
+}
+
 static void do_archive(HWND hwnd) {
+    if (g_archive_mode) {
+        leave_archive_mode();
+        return;
+    }
     if (g_active_profile < 0 || g_active_profile >= g_profile_count) {
         show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
         return;
@@ -2018,28 +2177,23 @@ static void do_archive(HWND hwnd) {
     }
     if (plain[0] == L'\0') {
         secure_free_wide(plain);
+        enter_archive_mode();
         return;
     }
     WCHAR err[256] = L"";
-    if (!prepend_archive_text(&g_profiles[g_active_profile], plain, err, ARRAYSIZE(err))) {
+    if (!append_archive_text(&g_profiles[g_active_profile], plain, err, ARRAYSIZE(err))) {
         secure_free_wide(plain);
         show_error(hwnd, err[0] ? err : L"");
         return;
     }
     secure_free_wide(plain);
-    show_archive_for_active_profile();
+    enter_archive_mode();
 }
 
 static void set_busy_controls(BOOL busy) {
     BOOL enable = !busy;
     if (g_main_window && IsWindow(g_main_window)) {
-        HWND encrypt = GetDlgItem(g_main_window, IDC_ENCRYPT);
-        EnableWindow(encrypt, TRUE);
-        SetWindowTextW(encrypt, busy ? L"\u505c\u6b62" : L"\u52a0\u5bc6");
-        EnableWindow(GetDlgItem(g_main_window, IDC_DECRYPT), enable);
-        EnableWindow(GetDlgItem(g_main_window, IDC_CLEAR), enable);
-        EnableWindow(GetDlgItem(g_main_window, IDC_KEY_SELECT), enable);
-        EnableWindow(GetDlgItem(g_main_window, IDC_KEY_TRANSFER), enable);
+        refresh_main_mode_controls();
     }
     if (g_key_window && IsWindow(g_key_window)) {
         EnableWindow(GetDlgItem(g_key_window, IDC_KEY_IMPORT), enable);
@@ -2948,6 +3102,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         HWND controls[] = { g_key_select, g_topic_edit, g_textbox, g_text_overlay, encrypt, decrypt, clear, key_transfer };
         for (size_t i = 0; i < ARRAYSIZE(controls); ++i) set_control_font(controls[i]);
         refresh_key_combo();
+        refresh_main_mode_controls();
         break;
     }
     case WM_SIZE:
@@ -2969,7 +3124,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                     if (!activate_profile(sel, hwnd, err, ARRAYSIZE(err))) {
                         show_error(hwnd, err[0] ? err : L"\u5207\u6362\u5bc6\u94a5\u5931\u8d25\u3002");
                         refresh_key_combo();
-                    } else {
+                    } else if (g_archive_mode) {
                         show_archive_for_active_profile();
                     }
                 }
