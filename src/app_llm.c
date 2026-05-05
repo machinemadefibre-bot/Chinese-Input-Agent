@@ -467,6 +467,14 @@ static BOOL local_llm_worker_request(const char *cmd, const WCHAR *payload_path,
             LeaveCriticalSection(&g_llm_worker.lock);
             return FALSE;
         }
+        size_t response_id = 0;
+        if (!json_get_size_t_field(response.data, "id", &response_id) || response_id != id) {
+            close_local_llm_worker_locked(TRUE);
+            set_error(err, err_cch, L"Local top-k worker returned a response for the wrong request.");
+            strb_free(&response);
+            LeaveCriticalSection(&g_llm_worker.lock);
+            return FALSE;
+        }
         if (json_line_has_string(response.data, "type", "progress")) {
             if (progress_target && IsWindow(progress_target)) {
                 size_t done = 0, total = 0;

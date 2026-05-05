@@ -1624,6 +1624,7 @@ static std::string default_model_path(int argc, char ** argv) {
     fs::path cwd = current_path_noexcept();
     fs::path exe_dir = exe_dir_path(argc, argv);
     const char * names[] = {
+        "base_model.gguf",
         "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
         "qwen3-4b-instruct-2507-q4_k_m.gguf",
     };
@@ -1649,7 +1650,7 @@ static std::string default_model_path(int argc, char ** argv) {
             return (ec ? p : abs).string();
         }
     }
-    throw std::runtime_error("未找到默认 GGUF 模型文件 Qwen3-4B-Instruct-2507-Q4_K_M.gguf。请把模型放在 models 目录，或使用 --model 指定。");
+    throw std::runtime_error("未找到默认 GGUF 模型文件 base_model.gguf 或 Qwen3-4B-Instruct-2507-Q4_K_M.gguf。请把模型放在 models 目录，或使用 --model 指定。");
 }
 
 static std::string default_adapter_path(char ** argv) {

@@ -41,7 +41,7 @@ This does not mean the project can bypass moderation, platform rules, or legal p
 ## What It Can Do Today
 
 - Exchange a contact public-key package once, then encrypt future messages to that contact.
-- Protect message content with elliptic-curve key exchange and authenticated symmetric encryption.
+- Protect message content with a per-message ephemeral X25519 sender key and authenticated symmetric encryption; Double Ratchet-style forward secrecy is not implemented yet.
 - Generate Chinese carrier text locally with a Qwen GGUF model through llama.cpp.
 - Encode ciphertext with a top-k token carrier and recover it with the same tokenizer.
 - Prefer CUDA, fall back to Vulkan, and then fall back to CPU.
@@ -144,6 +144,8 @@ models/                      local GGUF model directory
 ## Security Boundary
 
 The generated Chinese article is only a carrier. It should not be treated as the security layer. Message confidentiality and integrity come from the encryption layer.
+
+The current message format uses an ephemeral sender key and the recipient's long-term identity key. That avoids reusing one message key, but if the recipient's long-term private key is later compromised, previously captured messages may still be decryptable. Do not treat the current protocol as having full forward secrecy.
 
 The current design goal is to make copying, sending, and recovering text possible through ordinary chat software. It is not designed to resist all traffic analysis, text rewriting, summarization, translation, active attacks, or platform-side text cleanup. If a third-party platform rewrites the text, decoding may fail.
 
