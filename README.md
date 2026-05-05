@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/machinemadefibre-bot/ChineseInputAgent"><img alt="GitHub repo" src="https://img.shields.io/badge/GitHub-ChineseInputAgent-181717?logo=github"></a>
+  <a href="https://github.com/machinemadefibre-bot/Chinese-Input-Agent"><img alt="GitHub repo" src="https://img.shields.io/badge/GitHub-Chinese--Input--Agent-181717?logo=github"></a>
   <img alt="Windows" src="https://img.shields.io/badge/Windows-10%2F11-0078D4?logo=windows">
   <img alt="Native C" src="https://img.shields.io/badge/Native-C-00599C?logo=c">
   <img alt="llama.cpp" src="https://img.shields.io/badge/Runtime-llama.cpp-6B46C1">
@@ -58,8 +58,8 @@ ChineseInputAgent.exe
 ### Clone
 
 ```bash
-git clone --recursive https://github.com/machinemadefibre-bot/ChineseInputAgent.git
-cd ChineseInputAgent
+git clone --recursive https://github.com/machinemadefibre-bot/Chinese-Input-Agent.git
+cd Chinese-Input-Agent
 ```
 
 如果你已经普通 clone 了仓库：
