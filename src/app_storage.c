@@ -63,6 +63,8 @@ BOOL local_aes_gcm_encrypt(const BYTE key[MASTER_KEY_BYTES], const BYTE *plain, 
                                   BYTE **out, DWORD *out_len) {
     *out = NULL;
     *out_len = 0;
+    const DWORD overhead = LOCAL_BLOB_HEADER_BYTES + LOCAL_BLOB_NONCE_BYTES + LOCAL_BLOB_TAG_BYTES;
+    if (!key || (!plain && plain_len) || plain_len > 0xffffffffu - overhead) return FALSE;
     BOOL ok = FALSE;
     BCRYPT_ALG_HANDLE alg = NULL;
     BCRYPT_KEY_HANDLE hkey = NULL;
@@ -80,7 +82,7 @@ BOOL local_aes_gcm_encrypt(const BYTE key[MASTER_KEY_BYTES], const BYTE *plain, 
     if (!key_object) goto cleanup;
     if (BCryptGenerateSymmetricKey(alg, &hkey, key_object, obj_len, (PUCHAR)key, MASTER_KEY_BYTES, 0) < 0) goto cleanup;
 
-    DWORD total = LOCAL_BLOB_HEADER_BYTES + LOCAL_BLOB_NONCE_BYTES + LOCAL_BLOB_TAG_BYTES + plain_len;
+    DWORD total = overhead + plain_len;
     envelope = (BYTE *)xalloc(total ? total : 1);
     if (!envelope) goto cleanup;
     CopyMemory(envelope, "CIA1", 4);
@@ -115,7 +117,7 @@ cleanup:
     if (hkey) BCryptDestroyKey(hkey);
     if (alg) BCryptCloseAlgorithmProvider(alg, 0);
     secure_free(key_object, obj_len);
-    secure_free(envelope, envelope ? LOCAL_BLOB_HEADER_BYTES + LOCAL_BLOB_NONCE_BYTES + LOCAL_BLOB_TAG_BYTES + plain_len : 0);
+    secure_free(envelope, envelope ? total : 0);
     SecureZeroMemory(nonce, sizeof(nonce));
     return ok;
 }
@@ -124,7 +126,9 @@ BOOL local_aes_gcm_decrypt(const BYTE key[MASTER_KEY_BYTES], const BYTE *envelop
                                   BYTE **out, DWORD *out_len) {
     *out = NULL;
     *out_len = 0;
-    if (envelope_len < LOCAL_BLOB_HEADER_BYTES + LOCAL_BLOB_NONCE_BYTES + LOCAL_BLOB_TAG_BYTES ||
+    const DWORD overhead = LOCAL_BLOB_HEADER_BYTES + LOCAL_BLOB_NONCE_BYTES + LOCAL_BLOB_TAG_BYTES;
+    if (!key || !envelope ||
+        envelope_len < overhead ||
         memcmp(envelope, "CIA1", 4) != 0 ||
         envelope[4] != 1 ||
         envelope[5] != LOCAL_BLOB_NONCE_BYTES ||
@@ -133,7 +137,7 @@ BOOL local_aes_gcm_decrypt(const BYTE key[MASTER_KEY_BYTES], const BYTE *envelop
                        ((DWORD)envelope[9] << 8) |
                        ((DWORD)envelope[10] << 16) |
                        ((DWORD)envelope[11] << 24);
-    if (LOCAL_BLOB_HEADER_BYTES + LOCAL_BLOB_NONCE_BYTES + LOCAL_BLOB_TAG_BYTES + cipher_len != envelope_len) return FALSE;
+    if (cipher_len > envelope_len - overhead || overhead + cipher_len != envelope_len) return FALSE;
 
     BOOL ok = FALSE;
     BCRYPT_ALG_HANDLE alg = NULL;
@@ -174,19 +178,8 @@ cleanup:
     return ok;
 }
 
-static void write_u32_file(HANDLE h, DWORD v, BOOL *ok) {
-    DWORD written = 0;
-    if (!*ok) return;
-    *ok = WriteFile(h, &v, sizeof(v), &written, NULL) && written == sizeof(v);
-}
-
-static void write_bytes_file(HANDLE h, const void *data, DWORD len, BOOL *ok) {
-    DWORD written = 0;
-    if (!*ok) return;
-    *ok = WriteFile(h, data, len, &written, NULL) && written == len;
-}
-
 BOOL read_u32_mem(const BYTE **p, const BYTE *end, DWORD *out) {
+    if (!p || !*p || !end || !out || *p > end) return FALSE;
     if ((size_t)(end - *p) < sizeof(DWORD)) return FALSE;
     CopyMemory(out, *p, sizeof(DWORD));
     *p += sizeof(DWORD);
@@ -194,6 +187,7 @@ BOOL read_u32_mem(const BYTE **p, const BYTE *end, DWORD *out) {
 }
 
 BOOL read_bytes_mem(const BYTE **p, const BYTE *end, void *out, DWORD len) {
+    if (!p || !*p || !end || (!out && len) || *p > end) return FALSE;
     if ((size_t)(end - *p) < len) return FALSE;
     CopyMemory(out, *p, len);
     *p += len;

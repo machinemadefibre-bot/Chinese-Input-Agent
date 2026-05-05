@@ -54,10 +54,18 @@ void set_error(WCHAR *buf, size_t cch, const WCHAR *fmt, ...) {
 }
 
 BOOL strb_reserve(STRB *b, size_t extra) {
+    if (!b) return FALSE;
+    if (b->len > SIZE_MAX - 1 || extra > SIZE_MAX - b->len - 1) return FALSE;
     size_t need = b->len + extra + 1;
     if (need <= b->cap) return TRUE;
     size_t cap = b->cap ? b->cap : 256;
-    while (cap < need) cap *= 2;
+    while (cap < need) {
+        if (cap > SIZE_MAX / 2) {
+            cap = need;
+            break;
+        }
+        cap *= 2;
+    }
     char *p = (char *)xrealloc(b->data, cap);
     if (!p) return FALSE;
     b->data = p;
@@ -66,6 +74,7 @@ BOOL strb_reserve(STRB *b, size_t extra) {
 }
 
 BOOL strb_append_n(STRB *b, const char *s, size_t n) {
+    if (!b || (!s && n)) return FALSE;
     if (!strb_reserve(b, n)) return FALSE;
     CopyMemory(b->data + b->len, s, n);
     b->len += n;
@@ -74,7 +83,7 @@ BOOL strb_append_n(STRB *b, const char *s, size_t n) {
 }
 
 BOOL strb_append(STRB *b, const char *s) {
-    return strb_append_n(b, s, strlen(s));
+    return strb_append_n(b, s ? s : "", s ? strlen(s) : 0);
 }
 
 BOOL strb_appendf(STRB *b, const char *fmt, ...) {
@@ -102,10 +111,19 @@ void strb_secure_free(STRB *b) {
 }
 
 BOOL wstrb_reserve(WSTRB *b, size_t extra) {
+    if (!b) return FALSE;
+    if (b->len > SIZE_MAX - 1 || extra > SIZE_MAX - b->len - 1) return FALSE;
     size_t need = b->len + extra + 1;
     if (need <= b->cap) return TRUE;
     size_t cap = b->cap ? b->cap : 128;
-    while (cap < need) cap *= 2;
+    while (cap < need) {
+        if (cap > SIZE_MAX / 2) {
+            cap = need;
+            break;
+        }
+        cap *= 2;
+    }
+    if (cap > SIZE_MAX / sizeof(WCHAR)) return FALSE;
     WCHAR *p = (WCHAR *)xrealloc(b->data, cap * sizeof(WCHAR));
     if (!p) return FALSE;
     b->data = p;
@@ -114,6 +132,7 @@ BOOL wstrb_reserve(WSTRB *b, size_t extra) {
 }
 
 BOOL wstrb_append_n(WSTRB *b, const WCHAR *s, size_t n) {
+    if (!b || (!s && n)) return FALSE;
     if (!wstrb_reserve(b, n)) return FALSE;
     CopyMemory(b->data + b->len, s, n * sizeof(WCHAR));
     b->len += n;
@@ -122,7 +141,7 @@ BOOL wstrb_append_n(WSTRB *b, const WCHAR *s, size_t n) {
 }
 
 BOOL wstrb_append(WSTRB *b, const WCHAR *s) {
-    return wstrb_append_n(b, s, wcslen(s));
+    return wstrb_append_n(b, s ? s : L"", s ? wcslen(s) : 0);
 }
 
 BOOL wstrb_append_char(WSTRB *b, WCHAR ch) {
@@ -212,16 +231,6 @@ BOOL append_json_escaped_wide(STRB *b, const WCHAR *ws) {
     return ok;
 }
 
-static BOOL add_unique_hanzi(WCHAR *pool, size_t *count, size_t cap, WCHAR ch) {
-    if (!ch) return TRUE;
-    for (size_t i = 0; i < *count; ++i) {
-        if (pool[i] == ch) return TRUE;
-    }
-    if (*count >= cap) return FALSE;
-    pool[(*count)++] = ch;
-    return TRUE;
-}
-
 void strip_last_path_component_early(WCHAR *path) {
     if (!path) return;
     size_t len = wcslen(path);
@@ -233,7 +242,21 @@ void strip_last_path_component_early(WCHAR *path) {
 }
 
 BOOL get_app_dir(WCHAR *path, size_t cch) {
+    if (!path || cch == 0) return FALSE;
     WCHAR exe[MAX_PATH];
+    DWORD env_len = GetEnvironmentVariableW(L"CIA_DATA_DIR", path, (DWORD)cch);
+    if (env_len > 0) {
+        if (env_len >= cch) {
+            path[0] = L'\0';
+            return FALSE;
+        }
+        if (dir_exists_w(path) || CreateDirectoryW(path, NULL) || GetLastError() == ERROR_ALREADY_EXISTS) {
+            return TRUE;
+        }
+        path[0] = L'\0';
+        return FALSE;
+    }
+
     if (GetModuleFileNameW(NULL, exe, ARRAYSIZE(exe))) {
         strip_last_path_component_early(exe);
         WCHAR portable[MAX_PATH];
@@ -244,18 +267,8 @@ BOOL get_app_dir(WCHAR *path, size_t cch) {
             }
         }
     }
-
-    DWORD env_len = GetEnvironmentVariableW(L"CIA_DATA_DIR", path, (DWORD)cch);
-    if (env_len > 0 && env_len < cch) {
-        CreateDirectoryW(path, NULL);
-        return TRUE;
-    }
-
-    WCHAR base[MAX_PATH];
-    if (FAILED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, SHGFP_TYPE_CURRENT, base))) return FALSE;
-    if (FAILED(StringCchPrintfW(path, cch, L"%s\\%s", base, APP_DIR_NAME))) return FALSE;
-    CreateDirectoryW(path, NULL);
-    return TRUE;
+    path[0] = L'\0';
+    return FALSE;
 }
 
 BOOL get_app_file(WCHAR *path, size_t cch, const WCHAR *name) {
@@ -326,7 +339,7 @@ BOOL write_text_utf8_file(const WCHAR *path, const WCHAR *text) {
     int len = 0;
     if (!wide_to_utf8(text ? text : L"", &utf8, &len)) return FALSE;
     BOOL ok = write_file_bytes(path, (const BYTE *)utf8, (DWORD)len);
-    secure_free(utf8, len + 1);
+    secure_free(utf8, (SIZE_T)len + 1);
     return ok;
 }
 
@@ -395,7 +408,7 @@ BOOL find_local_worker(WCHAR *script, size_t script_cch, WCHAR *workdir, size_t 
                               WCHAR *python, size_t python_cch, WCHAR *err, size_t err_cch) {
     WCHAR exe[MAX_PATH];
     if (!GetModuleFileNameW(NULL, exe, ARRAYSIZE(exe))) {
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Unable to locate the current executable path.");
         return FALSE;
     }
 
@@ -441,7 +454,7 @@ void secure_delete_file(const WCHAR *path) {
             SetFilePointerEx(h, pos, NULL, FILE_BEGIN);
             LONGLONG left = size.QuadPart;
             while (left > 0) {
-                DWORD chunk = (DWORD)((left > (LONGLONG)sizeof(zeros)) ? sizeof(zeros) : left);
+                DWORD chunk = (DWORD)((left > (LONGLONG)sizeof(zeros)) ? (LONGLONG)sizeof(zeros) : left);
                 DWORD written = 0;
                 if (!WriteFile(h, zeros, chunk, &written, NULL) || written != chunk) break;
                 left -= chunk;
@@ -506,19 +519,3 @@ BOOL write_all_handle(HANDLE h, const void *data, DWORD len) {
     }
     return TRUE;
 }
-
-static BOOL read_line_handle(HANDLE h, STRB *line) {
-    ZeroMemory(line, sizeof(*line));
-    for (;;) {
-        char ch = 0;
-        DWORD read = 0;
-        if (!ReadFile(h, &ch, 1, &read, NULL) || read != 1) {
-            return line->len > 0;
-        }
-        if (ch == '\n') return TRUE;
-        if (ch == '\r') continue;
-        if (line->len > 1024 * 1024) return FALSE;
-        if (!strb_append_n(line, &ch, 1)) return FALSE;
-    }
-}
-

@@ -66,21 +66,29 @@ static void xfree(void *ptr) {
 
 static WCHAR *dup_wide(const WCHAR *text) {
     size_t len = wcslen(text ? text : L"");
+    if (len > SIZE_MAX / sizeof(WCHAR) - 1) return NULL;
     WCHAR *copy = (WCHAR *)xalloc((len + 1) * sizeof(WCHAR));
     if (copy) CopyMemory(copy, text ? text : L"", (len + 1) * sizeof(WCHAR));
     return copy;
 }
 
 static void set_font(HWND hwnd) {
+    if (!hwnd) return;
     SendMessageW(hwnd, WM_SETFONT, (WPARAM)g_font, TRUE);
 }
 
 static void post_status(int pos, const WCHAR *text) {
-    PostMessageW(GetParent(g_status), WM_APP_INSTALL_STATUS, (WPARAM)pos, (LPARAM)dup_wide(text ? text : L""));
+    WCHAR *copy = dup_wide(text ? text : L"");
+    if (!copy || !PostMessageW(GetParent(g_status), WM_APP_INSTALL_STATUS, (WPARAM)pos, (LPARAM)copy)) {
+        xfree(copy);
+    }
 }
 
 static void post_done(BOOL ok, const WCHAR *text) {
-    PostMessageW(GetParent(g_status), WM_APP_INSTALL_DONE, (WPARAM)ok, (LPARAM)dup_wide(text ? text : L""));
+    WCHAR *copy = dup_wide(text ? text : L"");
+    if (!copy || !PostMessageW(GetParent(g_status), WM_APP_INSTALL_DONE, (WPARAM)ok, (LPARAM)copy)) {
+        xfree(copy);
+    }
 }
 
 static BOOL join_path(WCHAR *out, size_t cch, const WCHAR *base, const WCHAR *leaf) {
@@ -139,6 +147,8 @@ static BOOL read_payload_trailer(FILE *self, int64_t file_size, PAYLOAD_TRAILER 
     if (fread(trailer, 1, sizeof(*trailer), self) != sizeof(*trailer)) return FALSE;
     if (memcmp(trailer->magic, PAYLOAD_MAGIC, sizeof(PAYLOAD_MAGIC)) != 0) return FALSE;
     if (trailer->offset > (uint64_t)file_size || trailer->size > (uint64_t)file_size) return FALSE;
+    if (trailer->offset > UINT64_MAX - trailer->size ||
+        trailer->offset + trailer->size > UINT64_MAX - sizeof(*trailer)) return FALSE;
     if (trailer->offset + trailer->size + sizeof(*trailer) != (uint64_t)file_size) return FALSE;
     return TRUE;
 }
@@ -217,6 +227,7 @@ static WCHAR *ps_single_quote(const WCHAR *path) {
         if (*p == L'\'') extra++;
     }
     size_t len = wcslen(path ? path : L"");
+    if (len > SIZE_MAX - extra - 3) return NULL;
     WCHAR *out = (WCHAR *)xalloc((len + extra + 3) * sizeof(WCHAR));
     if (!out) return NULL;
     WCHAR *w = out;
@@ -261,8 +272,9 @@ static BOOL write_expand_script(const WCHAR *script_path, const WCHAR *zip_path,
     }
     WORD bom = 0xFEFF;
     DWORD written = 0;
-    BOOL ok = WriteFile(h, &bom, sizeof(bom), &written, NULL) &&
-              WriteFile(h, content, (DWORD)(wcslen(content) * sizeof(WCHAR)), &written, NULL);
+    DWORD content_bytes = (DWORD)(wcslen(content) * sizeof(WCHAR));
+    BOOL ok = WriteFile(h, &bom, sizeof(bom), &written, NULL) && written == sizeof(bom) &&
+              WriteFile(h, content, content_bytes, &written, NULL) && written == content_bytes;
     CloseHandle(h);
     if (!ok) StringCchCopyW(err, err_cch, L"写入临时解压脚本失败。");
     return ok;
@@ -307,9 +319,9 @@ static BOOL run_powershell_script(const WCHAR *script_path, WCHAR *err, size_t e
 static DWORD WINAPI install_thread_proc(LPVOID param) {
     INSTALL_CTX *ctx = (INSTALL_CTX *)param;
     WCHAR err[512] = L"";
-    WCHAR zip_path[MAX_PATH];
-    WCHAR ps1_path[MAX_PATH];
-    WCHAR exe_path[MAX_PATH];
+    WCHAR zip_path[MAX_PATH] = L"";
+    WCHAR ps1_path[MAX_PATH] = L"";
+    WCHAR exe_path[MAX_PATH] = L"";
 
     post_status(3, L"正在创建安装目录...");
     if (!ensure_directory(ctx->target, err, ARRAYSIZE(err))) goto fail;
@@ -474,7 +486,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
         break;
     case WM_APP_INSTALL_STATUS: {
         WCHAR *text = (WCHAR *)lparam;
-        SendMessageW(g_progress, PBM_SETPOS, (int)wparam, 0);
+        SendMessageW(g_progress, PBM_SETPOS, wparam, 0);
         SetWindowTextW(g_status, text ? text : L"");
         xfree(text);
         break;

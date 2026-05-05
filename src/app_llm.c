@@ -29,10 +29,11 @@ static APP_LLM_CANCEL_FN g_cancel_fn;
 static APP_LLM_PROGRESS_FN g_progress_fn;
 
 static WCHAR *llm_dup_wide(const WCHAR *s) {
-    size_t n = wcslen(s);
+    size_t n = wcslen(s ? s : L"");
+    if (n > SIZE_MAX / sizeof(WCHAR) - 1) return NULL;
     WCHAR *p = (WCHAR *)xalloc((n + 1) * sizeof(WCHAR));
     if (!p) return NULL;
-    CopyMemory(p, s, (n + 1) * sizeof(WCHAR));
+    CopyMemory(p, s ? s : L"", (n + 1) * sizeof(WCHAR));
     return p;
 }
 
@@ -119,14 +120,14 @@ static BOOL response_json_ok(const char *line) {
 static BOOL json_line_has_string(const char *line, const char *name, const char *value) {
     if (!line || !name || !value) return FALSE;
     char pattern[96];
-    sprintf(pattern, "\"%s\":\"%s\"", name, value);
+    if (FAILED(StringCchPrintfA(pattern, ARRAYSIZE(pattern), "\"%s\":\"%s\"", name, value))) return FALSE;
     return strstr(line, pattern) != NULL;
 }
 
 static BOOL json_get_size_t_field(const char *line, const char *name, size_t *out) {
     if (!line || !name || !out) return FALSE;
     char pattern[64];
-    sprintf(pattern, "\"%s\":", name);
+    if (FAILED(StringCchPrintfA(pattern, ARRAYSIZE(pattern), "\"%s\":", name))) return FALSE;
     const char *p = strstr(line, pattern);
     if (!p) return FALSE;
     p += strlen(pattern);
@@ -135,6 +136,7 @@ static BOOL json_get_size_t_field(const char *line, const char *name, size_t *ou
     BOOL any = FALSE;
     while (*p >= '0' && *p <= '9') {
         any = TRUE;
+        if (value > (SIZE_MAX - (size_t)(*p - '0')) / 10) return FALSE;
         value = value * 10 + (size_t)(*p - '0');
         ++p;
     }
@@ -146,7 +148,7 @@ static BOOL json_get_size_t_field(const char *line, const char *name, size_t *ou
 static BOOL json_get_double_field(const char *line, const char *name, double *out) {
     if (!line || !name || !out) return FALSE;
     char pattern[64];
-    sprintf(pattern, "\"%s\":", name);
+    if (FAILED(StringCchPrintfA(pattern, ARRAYSIZE(pattern), "\"%s\":", name))) return FALSE;
     const char *p = strstr(line, pattern);
     if (!p) return FALSE;
     p += strlen(pattern);
@@ -185,7 +187,7 @@ static BOOL json_get_wide_string_field(const char *line, const char *name, WCHAR
     *out = NULL;
     if (!line || !name) return FALSE;
     char pattern[96];
-    sprintf(pattern, "\"%s\":\"", name);
+    if (FAILED(StringCchPrintfA(pattern, ARRAYSIZE(pattern), "\"%s\":\"", name))) return FALSE;
     const char *p = strstr(line, pattern);
     if (!p) return FALSE;
     p += strlen(pattern);
@@ -207,6 +209,7 @@ static BOOL json_get_wide_string_field(const char *line, const char *name, WCHAR
             case 'u': {
                 unsigned cp = 0;
                 for (int i = 0; i < 4; ++i) {
+                    if (!p[1 + i]) { ok = FALSE; break; }
                     int h = hex_value(p[1 + i]);
                     if (h < 0) { ok = FALSE; break; }
                     cp = (cp << 4) | (unsigned)h;
@@ -360,7 +363,8 @@ static BOOL start_local_llm_worker_locked(WCHAR *err, size_t err_cch) {
                                   NULL, workdir, &si, &pi);
     secure_free_wide(mutable_cmd);
     if (!started) {
-        set_error(err, err_cch, L"", (unsigned long)GetLastError());
+        set_error(err, err_cch, L"Failed to start local top-k worker process. Windows error: %lu",
+                  (unsigned long)GetLastError());
         goto fail;
     }
     if (ensure_local_llm_job()) {
@@ -416,6 +420,7 @@ static BOOL local_llm_worker_request(const char *cmd, const WCHAR *payload_path,
                                      const WCHAR *topic_path, const WCHAR *seed, const WCHAR *out_path,
                                      int tail_tokens, HWND progress_target, WCHAR *err, size_t err_cch) {
     if (!g_llm_worker.lock_ready) {
+        set_error(err, err_cch, L"Local top-k worker manager is not initialized.");
         return FALSE;
     }
     BOOL ok = FALSE;
@@ -439,14 +444,15 @@ static BOOL local_llm_worker_request(const char *cmd, const WCHAR *payload_path,
     STRB request = {0};
     if (!build_worker_request_json(&request, id, cmd, payload_path, text_path, topic_path, seed, out_path, tail_tokens)) {
         strb_free(&request);
-        set_error(err, err_cch, L"\u5df2\u505c\u6b62\u3002");
+        set_error(err, err_cch, L"Failed to build local top-k worker request.");
         LeaveCriticalSection(&g_llm_worker.lock);
         return FALSE;
     }
-    if (!write_all_handle(g_llm_worker.stdin_write, request.data, (DWORD)request.len)) {
+    if (request.len > 0xffffffffu ||
+        !write_all_handle(g_llm_worker.stdin_write, request.data, (DWORD)request.len)) {
         strb_free(&request);
         close_local_llm_worker_locked(TRUE);
-        set_error(err, err_cch, L"\u5df2\u505c\u6b62\u3002");
+        set_error(err, err_cch, L"Failed to send request to local top-k worker.");
         LeaveCriticalSection(&g_llm_worker.lock);
         return FALSE;
     }
@@ -543,6 +549,10 @@ BOOL local_topk_encode_payload(const BYTE *payload, DWORD payload_len, const WCH
                                       const WCHAR *prefix, int tail_tokens, HWND progress_target,
                                       WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
+    if ((!payload && payload_len) || !seed || !seed[0]) {
+        set_error(err, err_cch, L"Invalid local top-k encode request.");
+        return FALSE;
+    }
 
     WCHAR payload_path[MAX_PATH] = L"";
     WCHAR topic_path[MAX_PATH] = L"";
@@ -607,6 +617,10 @@ BOOL local_topk_decode_payload(const WCHAR *carrier, const WCHAR *seed, BYTE **o
                                      WCHAR *err, size_t err_cch) {
     *out = NULL;
     *out_len = 0;
+    if (!carrier || !carrier[0] || !seed || !seed[0]) {
+        set_error(err, err_cch, L"Invalid local top-k decode request.");
+        return FALSE;
+    }
 
     WCHAR text_path[MAX_PATH] = L"";
     WCHAR out_path[MAX_PATH] = L"";

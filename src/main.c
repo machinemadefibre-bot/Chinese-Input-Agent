@@ -133,7 +133,7 @@ static BOOL format_topk_seed_from_public_key(WCHAR *seed, size_t seed_cch, const
     BOOL ok = SUCCEEDED(StringCchCopyW(seed, seed_cch, prefix)) &&
               append_hex_bytes(seed, seed_cch, prefix_len, public_key, public_key_len);
     if (!ok) {
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Failed to build top-k seed from contact public key.");
         return FALSE;
     }
     return TRUE;
@@ -176,6 +176,7 @@ static BOOL activate_profile(int index, HWND owner, WCHAR *err, size_t err_cch) 
 
 static WCHAR *dup_wide(const WCHAR *s) {
     size_t len = wcslen(s ? s : L"");
+    if (len > SIZE_MAX / sizeof(WCHAR) - 1) return NULL;
     WCHAR *copy = (WCHAR *)xalloc((len + 1) * sizeof(WCHAR));
     if (copy) CopyMemory(copy, s ? s : L"", (len + 1) * sizeof(WCHAR));
     return copy;
@@ -324,7 +325,7 @@ static BOOL post_work_text_kind(UINT msg, HWND target_textbox, const WCHAR *text
         return FALSE;
     }
     if (!PostMessageW(g_main_window, msg, 0, (LPARAM)m)) {
-        xfree(m->text);
+        secure_free_wide(m->text);
         xfree(m);
         return FALSE;
     }
@@ -550,6 +551,11 @@ static BOOL get_clipboard_text(HWND owner, WCHAR **out) {
         return FALSE;
     }
     size_t len = wcslen(src);
+    if (len > SIZE_MAX / sizeof(WCHAR) - 1) {
+        GlobalUnlock(h);
+        CloseClipboard();
+        return FALSE;
+    }
     WCHAR *copy = (WCHAR *)xalloc((len + 1) * sizeof(WCHAR));
     if (copy) CopyMemory(copy, src, (len + 1) * sizeof(WCHAR));
     GlobalUnlock(h);
@@ -574,15 +580,15 @@ static void free_work_ctx(WORK_CTX *ctx) {
     xfree(ctx);
 }
 
-static void post_worker_error(HWND target, const WCHAR *message) {
-    post_work_text(WM_APP_WORK_ERROR, target, message ? message : L"\u540e\u53f0\u4efb\u52a1\u5931\u8d25\u3002");
-}
-
 static BOOL worker_encrypt(WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
+    if (!ctx || !ctx->input) {
+        set_error(err, err_cch, L"Invalid encryption request.");
+        return FALSE;
+    }
     size_t plain_chars = ctx->input ? wcslen(ctx->input) : 0;
     if (plain_chars > (((DWORD)0xffffffffu) / sizeof(WCHAR))) {
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Plaintext is too large to encrypt.");
         return FALSE;
     }
     DWORD plain_len = (DWORD)(plain_chars * sizeof(WCHAR));
@@ -621,7 +627,7 @@ static BOOL worker_export_key(WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err
         !wstrb_append(&prefix, KEY_PACKAGE_PREFIX_END)) {
         secure_free(pkg, pkg_len);
         wstrb_free(&prefix);
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Failed to build key package prefix.");
         return FALSE;
     }
     BOOL ok = local_topk_encode_payload(pkg, pkg_len, KEY_PACKAGE_TOPK_SEED, KEY_PACKAGE_TOPIC,
@@ -700,7 +706,7 @@ static BOOL worker_import_key(WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err
 static BOOL worker_decrypt(WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
     if (!ctx || !ctx->input || !ctx->input[0]) {
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Clipboard text is empty.");
         return FALSE;
     }
     return decrypt_clip_auto_profile(ctx->owner, ctx->input, out, err, err_cch);
@@ -721,7 +727,7 @@ static DWORD WINAPI work_thread_proc(LPVOID param) {
     } else if (ctx->kind == WORK_KIND_DECRYPT) {
         ok = worker_decrypt(ctx, &result, err, ARRAYSIZE(err));
     } else {
-        set_error(err, ARRAYSIZE(err), L"");
+        set_error(err, ARRAYSIZE(err), L"Unknown background work kind.");
     }
 
     if (ok && !work_cancelled()) {
@@ -814,14 +820,14 @@ static BOOL decrypt_sealed_with_current_profile(const BYTE *sealed, DWORD sealed
 
     if ((plain_len % sizeof(WCHAR)) != 0) {
         secure_free(plain, plain_len);
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Decrypted plaintext has an invalid UTF-16 length.");
         return FALSE;
     }
     size_t plain_chars = plain_len / sizeof(WCHAR);
     WCHAR *plain_w = (WCHAR *)xalloc((plain_chars + 1) * sizeof(WCHAR));
     if (!plain_w) {
         secure_free(plain, plain_len);
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Out of memory while decoding plaintext.");
         return FALSE;
     }
     CopyMemory(plain_w, plain, plain_len);
@@ -843,7 +849,7 @@ static BOOL decrypt_clip_auto_profile(HWND hwnd, const WCHAR *clip, WCHAR **plai
     int count = profiles_count();
     for (int pass = 0; pass < count; ++pass) {
         if (work_cancelled()) {
-            set_error(err, err_cch, L"");
+            set_error(err, err_cch, L"\u5df2\u505c\u6b62\u3002");
             return FALSE;
         }
         int index;
@@ -875,7 +881,7 @@ static BOOL decrypt_clip_auto_profile(HWND hwnd, const WCHAR *clip, WCHAR **plai
                     saw_local_decode_error = TRUE;
                     StringCchCopyW(local_err, ARRAYSIZE(local_err), local_decode_err);
                 } else {
-                    StringCchCopyW(local_err, ARRAYSIZE(local_err), L"");
+                    StringCchCopyW(local_err, ARRAYSIZE(local_err), L"Local top-k decode failed without a diagnostic message.");
                 }
             }
         }
@@ -897,12 +903,12 @@ static BOOL decrypt_clip_auto_profile(HWND hwnd, const WCHAR *clip, WCHAR **plai
 
     if (saw_local_decode_error && !saw_local_payload && local_decode_err[0]) {
         set_error(err, err_cch,
-                  L"",
+                  L"Local top-k decode failed before decryption: %s",
                   local_decode_err);
     } else if (last_err[0]) {
         set_error(err, err_cch, L"\u6ca1\u6709\u627e\u5230\u80fd\u89e3\u5bc6\u8fd9\u6bb5\u6587\u5b57\u7684\u5bc6\u94a5\u3002\u6700\u540e\u9519\u8bef\uff1a%s", last_err);
     } else {
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"No profile was able to decode or decrypt the clipboard text.");
     }
     return FALSE;
 }

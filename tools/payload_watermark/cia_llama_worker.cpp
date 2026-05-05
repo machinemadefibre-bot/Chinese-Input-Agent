@@ -30,6 +30,7 @@
 namespace fs = std::filesystem;
 
 static constexpr int DEFAULT_RADIX = 4;
+static constexpr uintmax_t MAX_WORKER_FILE_BYTES = 128ull * 1024ull * 1024ull;
 static const std::string SELF_INTRO_TOPIC_UTF8 =
     "\xE8\x87\xAA" "\xE6\x88\x91" "\xE4\xBB\x8B" "\xE7\xBB\x8D";
 static const std::string TOPK_PROMPT =
@@ -184,9 +185,21 @@ static std::array<uint8_t, 32> topk_generation_seed_digest(const std::string & s
 }
 
 static std::vector<uint8_t> read_binary(const std::string & path) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) throw std::runtime_error("无法打开输入文件：" + path);
-    return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::streampos end = f.tellg();
+    if (end < 0) throw std::runtime_error("无法读取输入文件大小：" + path);
+    uintmax_t size = static_cast<uintmax_t>(end);
+    if (size > MAX_WORKER_FILE_BYTES) throw std::runtime_error("输入文件过大，已拒绝读取：" + path);
+    if (size > static_cast<uintmax_t>(std::numeric_limits<std::streamsize>::max())) {
+        throw std::runtime_error("输入文件超过当前运行时可读取范围：" + path);
+    }
+    std::vector<uint8_t> out(static_cast<size_t>(size));
+    f.seekg(0, std::ios::beg);
+    if (!out.empty() && !f.read(reinterpret_cast<char *>(out.data()), static_cast<std::streamsize>(out.size()))) {
+        throw std::runtime_error("读取输入文件失败或文件被截断：" + path);
+    }
+    return out;
 }
 
 static std::string read_text(const std::string & path) {
@@ -197,13 +210,23 @@ static std::string read_text(const std::string & path) {
 static void write_binary(const std::string & path, const std::vector<uint8_t> & data) {
     std::ofstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("无法打开输出文件：" + path);
-    f.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
+    if (data.size() > static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
+        throw std::runtime_error("输出文件过大：" + path);
+    }
+    if (!data.empty() && !f.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()))) {
+        throw std::runtime_error("写入输出文件失败：" + path);
+    }
 }
 
 static void write_text_file(const std::string & path, const std::string & text) {
     std::ofstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("无法打开输出文件：" + path);
-    f.write(text.data(), static_cast<std::streamsize>(text.size()));
+    if (text.size() > static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
+        throw std::runtime_error("输出文本过大：" + path);
+    }
+    if (!text.empty() && !f.write(text.data(), static_cast<std::streamsize>(text.size()))) {
+        throw std::runtime_error("写入输出文件失败：" + path);
+    }
 }
 
 static void append_utf8(std::string & out, uint32_t cp) {
@@ -402,19 +425,31 @@ static bool json_get_string(const std::string & json, const std::string & key, s
     return false;
 }
 
-static int json_get_int(const std::string & json, const std::string & key, int fallback = 0) {
+static bool json_has_key(const std::string & json, const std::string & key) {
+    return json.find("\"" + key + "\"") != std::string::npos;
+}
+
+static bool json_get_int_strict(const std::string & json, const std::string & key, int & out) {
     std::string pat = "\"" + key + "\"";
     size_t p = json.find(pat);
-    if (p == std::string::npos) return fallback;
+    if (p == std::string::npos) return false;
     p = json.find(':', p + pat.size());
-    if (p == std::string::npos) return fallback;
+    if (p == std::string::npos) return false;
     ++p;
     while (p < json.size() && std::isspace(static_cast<unsigned char>(json[p]))) ++p;
     int sign = 1;
     if (p < json.size() && json[p] == '-') { sign = -1; ++p; }
-    int v = 0; bool any = false;
-    while (p < json.size() && std::isdigit(static_cast<unsigned char>(json[p]))) { any = true; v = v * 10 + (json[p++] - '0'); }
-    return any ? sign * v : fallback;
+    int64_t v = 0; bool any = false;
+    const int64_t limit = sign < 0 ? int64_t(INT32_MAX) + 1 : int64_t(INT32_MAX);
+    while (p < json.size() && std::isdigit(static_cast<unsigned char>(json[p]))) {
+        any = true;
+        int digit = json[p++] - '0';
+        if (v > (limit - digit) / 10) return false;
+        v = v * 10 + digit;
+    }
+    if (!any) return false;
+    out = static_cast<int>(sign < 0 ? -v : v);
+    return true;
 }
 
 static std::vector<int> tokenize(const llama_vocab * vocab, const std::string & text, bool add_special, bool parse_special) {
@@ -487,10 +522,10 @@ static TokenTable build_token_table(const llama_vocab * vocab, const std::string
     for (int token = 0; token < n_vocab; ++token) {
         if (llama_vocab_is_control(vocab, token) || llama_vocab_is_eog(vocab, token)) continue;
         std::string text;
-        try { text = token_piece(vocab, token); } catch (...) { continue; }
+        try { text = token_piece(vocab, token); } catch (const std::exception &) { continue; }
         if (text.find("<think") != std::string::npos || text.find("</think") != std::string::npos) continue;
         if (contains_bracket(text)) continue;
-        try { if (!stable_token(vocab, token, text)) continue; } catch (...) { continue; }
+        try { if (!stable_token(vocab, token, text)) continue; } catch (const std::exception &) { continue; }
         if (!is_social_stable_text(text) && !is_punctuation_only_text(text)) continue;
         if (contains_punctuation(text)) {
             if (is_punctuation_only_text(text) || is_social_stable_text(text)) {
@@ -1184,7 +1219,9 @@ public:
         if (!model) throw std::runtime_error("无法加载 GGUF 模型：" + model_path);
         vocab = llama_model_get_vocab(model);
         if (!vocab) throw std::runtime_error("已加载模型不包含 tokenizer 词表");
-        if (!adapter_path.empty() && fs::exists(adapter_path)) {
+        if (!adapter_path.empty()) {
+            std::error_code ec;
+            if (!fs::exists(adapter_path, ec) || ec) throw std::runtime_error("LoRA adapter 文件不存在：" + adapter_path);
             adapter = llama_adapter_lora_init(model, adapter_path.c_str());
             if (!adapter) throw std::runtime_error("无法加载 LoRA adapter：" + adapter_path);
         }
@@ -1201,10 +1238,18 @@ public:
         auto params = llama_sampler_chain_default_params();
         params.no_perf = true;
         llama_sampler * smpl = llama_sampler_chain_init(params);
-        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k));
-        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, 1));
-        llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature));
-        llama_sampler_chain_add(smpl, llama_sampler_init_dist(seed));
+        if (!smpl) throw std::runtime_error("无法初始化 llama.cpp 采样器");
+        auto add_sampler = [&](llama_sampler * child, const char * name) {
+            if (!child) {
+                llama_sampler_free(smpl);
+                throw std::runtime_error(std::string("无法初始化 llama.cpp 采样器组件：") + name);
+            }
+            llama_sampler_chain_add(smpl, child);
+        };
+        add_sampler(llama_sampler_init_top_k(top_k), "top-k");
+        add_sampler(llama_sampler_init_top_p(top_p, 1), "top-p");
+        add_sampler(llama_sampler_init_temp(temperature), "temperature");
+        add_sampler(llama_sampler_init_dist(seed), "distribution");
         return smpl;
     }
 
@@ -1292,7 +1337,7 @@ public:
             auto tx = table.token_text.find(id);
             std::string piece = tx == table.token_text.end() ? token_piece(vocab, id) : tx->second;
             bool stable = false;
-            try { stable = stable_append_tail(vocab, tail_text, tail_tokens, id, piece); } catch (...) { stable = false; }
+            try { stable = stable_append_tail(vocab, tail_text, tail_tokens, id, piece); } catch (const std::exception &) { stable = false; }
             if (!stable) continue;
             float score = logits[id];
             if (!contains_sentence_break(piece)) score += since_punc >= 26 ? 1.1f : 0.2f;
@@ -1361,7 +1406,7 @@ public:
         for (const auto & s : scored) {
             if (tested++ >= test_limit && out.size() >= std::min<size_t>(limit, 8)) break;
             bool stable = false;
-            try { stable = stable_append_tail(vocab, tail_text, tail_tokens, s.token, s.text); } catch (...) { stable = false; }
+            try { stable = stable_append_tail(vocab, tail_text, tail_tokens, s.token, s.text); } catch (const std::exception &) { stable = false; }
             if (!stable) continue;
             out.push_back(s);
             if (out.size() >= limit) break;
@@ -1555,22 +1600,32 @@ public:
     }
 };
 
-static fs::path exe_dir_path(char ** argv) {
-    try { return fs::absolute(fs::path(argv[0])).parent_path(); }
-    catch (...) { return fs::current_path(); }
+static fs::path current_path_noexcept() {
+    std::error_code ec;
+    fs::path cwd = fs::current_path(ec);
+    return ec ? fs::path(".") : cwd;
 }
 
-static std::string default_model_path(char ** argv) {
+static bool path_exists_noexcept(const fs::path & path) {
+    std::error_code ec;
+    bool ok = fs::exists(path, ec);
+    return ok && !ec;
+}
+
+static fs::path exe_dir_path(int argc, char ** argv) {
+    if (argc <= 0 || !argv || !argv[0] || !argv[0][0]) return current_path_noexcept();
+    std::error_code ec;
+    fs::path abs = fs::absolute(fs::path(argv[0]), ec);
+    return ec ? current_path_noexcept() : abs.parent_path();
+}
+
+static std::string default_model_path(int argc, char ** argv) {
     std::vector<fs::path> candidates;
-    fs::path cwd = fs::current_path();
-    fs::path exe_dir = exe_dir_path(argv);
+    fs::path cwd = current_path_noexcept();
+    fs::path exe_dir = exe_dir_path(argc, argv);
     const char * names[] = {
         "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
         "qwen3-4b-instruct-2507-q4_k_m.gguf",
-        "Qwen_Qwen3.5-4B-Q4_K_M.gguf",
-        "qwen3.5-4b-instruct-Q4_K_M.gguf",
-        "Qwen3.5-4B-Q4_K_M.gguf",
-        "base_model.gguf",
     };
     auto add_dir = [&](const fs::path & dir) {
         for (const char * name : names) candidates.push_back(dir / name);
@@ -1587,8 +1642,14 @@ static std::string default_model_path(char ** argv) {
     add_dir(exe_dir / "..");
     add_dir(exe_dir / ".." / ".." / "models");
     add_dir(exe_dir / ".." / "..");
-    for (const auto & p : candidates) if (fs::exists(p)) return fs::absolute(p).string();
-    return fs::absolute(candidates.front()).string();
+    for (const auto & p : candidates) {
+        if (path_exists_noexcept(p)) {
+            std::error_code ec;
+            fs::path abs = fs::absolute(p, ec);
+            return (ec ? p : abs).string();
+        }
+    }
+    throw std::runtime_error("未找到默认 GGUF 模型文件 Qwen3-4B-Instruct-2507-Q4_K_M.gguf。请把模型放在 models 目录，或使用 --model 指定。");
 }
 
 static std::string default_adapter_path(char ** argv) {
@@ -1596,16 +1657,15 @@ static std::string default_adapter_path(char ** argv) {
     if (env_path && env_path[0]) {
         std::string p = env_path;
         if (ascii_lower(p) == "none" || ascii_lower(p) == "off" || ascii_lower(p) == "disabled") return "";
-        if (fs::exists(p)) return fs::absolute(fs::path(p)).string();
+        if (path_exists_noexcept(fs::path(p))) {
+            std::error_code ec;
+            fs::path abs = fs::absolute(fs::path(p), ec);
+            return (ec ? fs::path(p) : abs).string();
+        }
         return p;
     }
     (void) argv;
     return "";
-}
-
-static std::string get_string_or(const std::string & json, const std::string & key, const std::string & fallback) {
-    std::string out;
-    return json_get_string(json, key, out) ? out : fallback;
 }
 
 static void emit_json(const std::string & line) {
@@ -1624,28 +1684,31 @@ static std::string err_response(int id, const std::string & error) {
 int main(int argc, char ** argv) {
     std::setlocale(LC_ALL, "C.UTF-8");
     LlamaPayloadWorker worker;
-    worker.model_path = default_model_path(argv);
-    worker.adapter_path = default_adapter_path(argv);
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        auto need = [&](const char * name) -> const char * {
-            if (i + 1 >= argc) throw std::runtime_error(std::string("缺少命令行参数值：") + name);
-            return argv[++i];
-        };
-        if (a == "--model") worker.model_path = need("--model");
-        else if (a == "--adapter") worker.adapter_path = need("--adapter");
-        else if (a == "--radix") worker.radix = std::stoi(need("--radix"));
-        else if (a == "--gpu-layers") worker.n_gpu_layers = std::stoi(need("--gpu-layers"));
-        else if (a == "--ctx") worker.n_ctx = std::stoi(need("--ctx"));
-        else if (a == "--threads") worker.n_threads = std::stoi(need("--threads"));
-        else if (a == "--free-tail-tokens") worker.free_tail_tokens = std::stoi(need("--free-tail-tokens"));
-        else if (a == "--temperature") worker.temperature = std::stof(need("--temperature"));
-        else if (a == "--top-p") worker.top_p = std::stof(need("--top-p"));
-        else if (a == "--top-k") worker.top_k = std::stoi(need("--top-k"));
-        else if (a == "--backend") worker.backend_preference = need("--backend");
-    }
-
     try {
+        worker.model_path = default_model_path(argc, argv);
+        worker.adapter_path = default_adapter_path(argv);
+        for (int i = 1; i < argc; ++i) {
+            std::string a = argv[i];
+            auto need = [&](const char * name) -> const char * {
+                if (i + 1 >= argc) throw std::runtime_error(std::string("缺少命令行参数值：") + name);
+                return argv[++i];
+            };
+            if (a == "--model") worker.model_path = need("--model");
+            else if (a == "--adapter") worker.adapter_path = need("--adapter");
+            else if (a == "--radix") worker.radix = std::stoi(need("--radix"));
+            else if (a == "--gpu-layers") worker.n_gpu_layers = std::stoi(need("--gpu-layers"));
+            else if (a == "--ctx") worker.n_ctx = std::stoi(need("--ctx"));
+            else if (a == "--threads") worker.n_threads = std::stoi(need("--threads"));
+            else if (a == "--free-tail-tokens") worker.free_tail_tokens = std::stoi(need("--free-tail-tokens"));
+            else if (a == "--temperature") worker.temperature = std::stof(need("--temperature"));
+            else if (a == "--top-p") worker.top_p = std::stof(need("--top-p"));
+            else if (a == "--top-k") worker.top_k = std::stoi(need("--top-k"));
+            else if (a == "--backend") worker.backend_preference = need("--backend");
+            else throw std::runtime_error("未知命令行参数：" + a);
+        }
+        if (!is_power_of_two_radix(worker.radix)) throw std::runtime_error("top-k 载荷进制必须是 2、4、8 或 16");
+        if (worker.n_ctx < 512 || worker.n_threads <= 0 || worker.top_k <= 0) throw std::runtime_error("worker 运行参数不合法");
+        if (worker.temperature <= 0.0f || worker.top_p <= 0.0f || worker.top_p > 1.0f) throw std::runtime_error("worker 采样参数不合法");
         worker.load();
         emit_json("{\"type\":\"ready\",\"ok\":true,\"backend\":\"llama.cpp\",\"backend_detail\":\"" + json_escape(worker.backend_used) + "\",\"model\":\"" + json_escape(worker.model_path) + "\",\"adapter\":\"" + json_escape(worker.adapter_path) + "\",\"adapter_loaded\":" + std::string(worker.adapter ? "true" : "false") + ",\"radix\":" + std::to_string(worker.radix) + "}");
     } catch (const std::exception & e) {
@@ -1656,9 +1719,14 @@ int main(int argc, char ** argv) {
     std::string line;
     while (std::getline(std::cin, line)) {
         if (line.empty()) continue;
-        int id = json_get_int(line, "id", 0);
+        int id = 0;
+        if (!json_get_int_strict(line, "id", id)) {
+            emit_json(err_response(0, "worker 请求缺少有效 id 字段"));
+            continue;
+        }
         try {
-            std::string cmd = get_string_or(line, "cmd", "");
+            std::string cmd;
+            if (!json_get_string(line, "cmd", cmd) || cmd.empty()) throw std::runtime_error("worker 请求缺少 cmd 字段");
             if (cmd == "shutdown") {
                 emit_json(ok_response(id, ",\"bye\":true"));
                 break;
@@ -1669,8 +1737,10 @@ int main(int argc, char ** argv) {
                 std::string topic_path;
                 if (json_get_string(line, "topic_file", topic_path)) topic = read_text(topic_path);
                 else json_get_string(line, "topic", topic);
-                std::string seed = get_string_or(line, "seed", "ChineseInputAgent key-exchange top-k payload v1");
-                int tail_tokens = json_get_int(line, "tail_tokens", -1);
+                std::string seed;
+                if (!json_get_string(line, "seed", seed) || seed.empty()) throw std::runtime_error("top-k 编码请求缺少 seed 字段");
+                int tail_tokens = -1;
+                if (json_has_key(line, "tail_tokens") && !json_get_int_strict(line, "tail_tokens", tail_tokens)) throw std::runtime_error("top-k 编码请求 tail_tokens 字段无效");
                 std::string outline_out_path;
                 bool write_outline = json_get_string(line, "outline_out", outline_out_path);
                 auto payload = read_binary(payload_path);
@@ -1692,7 +1762,8 @@ int main(int argc, char ** argv) {
             } else if (cmd == "decode") {
                 std::string text_path, out_path;
                 if (!json_get_string(line, "text", text_path) || !json_get_string(line, "out", out_path)) throw std::runtime_error("top-k 解码请求缺少 text 或 out 字段");
-                std::string seed = get_string_or(line, "seed", "ChineseInputAgent key-exchange top-k payload v1");
+                std::string seed;
+                if (!json_get_string(line, "seed", seed) || seed.empty()) throw std::runtime_error("top-k 解码请求缺少 seed 字段");
                 std::string text = read_text(text_path);
                 auto payload = worker.decode_payload(seed, text);
                 write_binary(out_path, payload);

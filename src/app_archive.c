@@ -14,10 +14,12 @@
 #include "app_shared.h"
 #include "app_storage.h"
 #include <strsafe.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 static WCHAR *archive_dup_wide(const WCHAR *s) {
     size_t len = wcslen(s ? s : L"");
+    if (len > SIZE_MAX / sizeof(WCHAR) - 1) return NULL;
     WCHAR *copy = (WCHAR *)xalloc((len + 1) * sizeof(WCHAR));
     if (copy) CopyMemory(copy, s ? s : L"", (len + 1) * sizeof(WCHAR));
     return copy;
@@ -155,21 +157,19 @@ static BOOL archive_text_oldest_first(const WCHAR *text, WCHAR **out) {
 BOOL archive_append_text(const KEY_PROFILE *profile, const WCHAR *plain, WCHAR *err, size_t err_cch) {
     WCHAR path[MAX_PATH];
     if (!profiles_get_archive_path(profile, path, ARRAYSIZE(path))) {
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Archive path is not available.");
         return FALSE;
     }
-    WCHAR legacy_path[MAX_PATH];
-    profiles_get_legacy_archive_path(profile, legacy_path, ARRAYSIZE(legacy_path));
     WCHAR *record = NULL;
     if (!build_archive_record(profile, plain, &record)) {
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Failed to build archive record.");
         return FALSE;
     }
     char *record_utf8 = NULL;
     int record_len = 0;
     if (!wide_to_utf8(record, &record_utf8, &record_len)) {
         secure_free_wide(record);
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Failed to encode archive record as UTF-8.");
         return FALSE;
     }
     secure_free_wide(record);
@@ -178,24 +178,33 @@ BOOL archive_append_text(const KEY_PROFILE *profile, const WCHAR *plain, WCHAR *
     DWORD file_len = 0;
     BYTE *old = NULL;
     DWORD old_len = 0;
+    BOOL archive_exists = file_exists_w(path);
     if (read_file_bytes(path, &file, &file_len)) {
         if (!local_aes_gcm_decrypt(profile->master_key, file, file_len, &old, &old_len)) {
             xfree(file);
             secure_free_str(record_utf8);
-            set_error(err, err_cch, L"");
+            set_error(err, err_cch, L"Archive file exists but could not be decrypted.");
             return FALSE;
         }
         xfree(file);
-    } else if (legacy_path[0]) {
-        read_file_bytes(legacy_path, &old, &old_len);
+    } else if (archive_exists) {
+        secure_free_str(record_utf8);
+        set_error(err, err_cch, L"Archive file exists but could not be read.");
+        return FALSE;
     }
 
+    if (record_len < 0 || (DWORD)record_len > 0xffffffffu - old_len) {
+        secure_free_str(record_utf8);
+        secure_free(old, old_len);
+        set_error(err, err_cch, L"Archive data is too large.");
+        return FALSE;
+    }
     DWORD total = old_len + (DWORD)record_len;
     BYTE *merged = (BYTE *)xalloc(total ? total : 1);
     if (!merged) {
         secure_free_str(record_utf8);
         secure_free(old, old_len);
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Out of memory while updating archive.");
         return FALSE;
     }
     if (old && old_len) CopyMemory(merged, old, old_len);
@@ -204,13 +213,12 @@ BOOL archive_append_text(const KEY_PROFILE *profile, const WCHAR *plain, WCHAR *
     DWORD protected_len = 0;
     BOOL ok = local_aes_gcm_encrypt(profile->master_key, merged, total, &protected_blob, &protected_len) &&
               write_file_bytes(path, protected_blob, protected_len);
-    if (ok && legacy_path[0]) DeleteFileW(legacy_path);
     secure_free(protected_blob, protected_len);
     secure_free_str(record_utf8);
     secure_free(old, old_len);
     secure_free(merged, total);
     if (!ok) {
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Failed to encrypt or write archive.");
         return FALSE;
     }
     return TRUE;
@@ -220,35 +228,15 @@ BOOL archive_load_text(const KEY_PROFILE *profile, WCHAR **out, WCHAR *err, size
     *out = NULL;
     WCHAR path[MAX_PATH];
     if (!profiles_get_archive_path(profile, path, ARRAYSIZE(path))) {
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Archive path is not available.");
         return FALSE;
     }
     BYTE *data = NULL;
     DWORD data_len = 0;
     if (!read_file_bytes(path, &data, &data_len)) {
-        WCHAR legacy_path[MAX_PATH];
-        if (profiles_get_legacy_archive_path(profile, legacy_path, ARRAYSIZE(legacy_path)) &&
-            read_file_bytes(legacy_path, &data, &data_len)) {
-            BOOL ok = utf8_to_wide_n((const char *)data, (int)data_len, out);
-            if (ok) {
-                WCHAR *ordered = NULL;
-                if (archive_text_oldest_first(*out, &ordered)) {
-                    secure_free_wide(*out);
-                    *out = ordered;
-                }
-            }
-            if (ok) {
-                BYTE *protected_blob = NULL;
-                DWORD protected_len = 0;
-                if (local_aes_gcm_encrypt(profile->master_key, data, data_len, &protected_blob, &protected_len) &&
-                    write_file_bytes(path, protected_blob, protected_len)) {
-                    DeleteFileW(legacy_path);
-                }
-                secure_free(protected_blob, protected_len);
-            }
-            secure_free(data, data_len);
-            if (!ok) set_error(err, err_cch, L"");
-            return ok;
+        if (file_exists_w(path)) {
+            set_error(err, err_cch, L"Archive file exists but could not be read.");
+            return FALSE;
         }
         *out = archive_dup_wide(L"");
         return *out != NULL;
@@ -267,7 +255,7 @@ BOOL archive_load_text(const KEY_PROFILE *profile, WCHAR **out, WCHAR *err, size
     xfree(data);
     secure_free(plain, plain_len);
     if (!ok) {
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Archive file could not be decrypted or decoded.");
         return FALSE;
     }
     return TRUE;

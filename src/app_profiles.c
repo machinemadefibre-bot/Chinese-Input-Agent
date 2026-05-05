@@ -34,6 +34,7 @@ static BOOL get_profiles_path(WCHAR *path, size_t cch) {
 
 BOOL profiles_get_state_path(const KEY_PROFILE *profile, WCHAR *path, size_t cch) {
     WCHAR name[80];
+    if (!profile || !profile->id[0]) return FALSE;
     if (FAILED(StringCchPrintfW(name, ARRAYSIZE(name), L"state_%s.dat", profile->id))) return FALSE;
     return get_app_file(path, cch, name);
 }
@@ -228,9 +229,13 @@ BOOL profiles_save(void) {
 }
 
 BOOL profiles_create_from_master(const WCHAR *name, const BYTE master_key[MASTER_KEY_BYTES], KEY_PROFILE *out, WCHAR *err, size_t err_cch) {
+    if (!out || !master_key) {
+        set_error(err, err_cch, L"Invalid profile creation request.");
+        return FALSE;
+    }
     ZeroMemory(out, sizeof(*out));
     if (!generate_profile_id(out->id)) {
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Random generation failed while creating profile id.");
         return FALSE;
     }
     StringCchCopyW(out->name, ARRAYSIZE(out->name), name && name[0] ? name : L"");
@@ -244,10 +249,13 @@ BOOL profiles_create_from_master(const WCHAR *name, const BYTE master_key[MASTER
 }
 
 static BOOL create_default_profile(WCHAR *err, size_t err_cch) {
-    if (g_profile_count >= MAX_PROFILES) return FALSE;
+    if (g_profile_count >= MAX_PROFILES) {
+        set_error(err, err_cch, L"Profile limit reached.");
+        return FALSE;
+    }
     BYTE master[MASTER_KEY_BYTES];
     if (BCryptGenRandom(NULL, master, sizeof(master), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Random generation failed while creating the default profile.");
         return FALSE;
     }
     BOOL ok = profiles_create_from_master(L"\u9ed8\u8ba4\u5bc6\u94a5", master, &g_profiles[0], err, err_cch);
@@ -264,21 +272,28 @@ static BOOL create_default_profile(WCHAR *err, size_t err_cch) {
 BOOL profiles_load(WCHAR *err, size_t err_cch) {
     WCHAR path[MAX_PATH];
     if (!get_profiles_path(path, ARRAYSIZE(path))) {
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Profile data directory is not available.");
         return FALSE;
     }
+    BOOL profile_file_exists = file_exists_w(path);
     BYTE *data = NULL;
     DWORD data_len = 0;
     if (!read_file_bytes(path, &data, &data_len)) {
+        if (profile_file_exists) {
+            set_error(err, err_cch, L"Profile database exists but could not be read.");
+            return FALSE;
+        }
         return create_default_profile(err, err_cch);
     }
     BYTE *plain = NULL;
     DWORD plain_len = 0;
-    BOOL protected_file = dpapi_unprotect(data, data_len, &plain, &plain_len);
-    const BYTE *source = protected_file ? plain : data;
-    DWORD source_len = protected_file ? plain_len : data_len;
-    const BYTE *p = source;
-    const BYTE *end = source + source_len;
+    if (!dpapi_unprotect(data, data_len, &plain, &plain_len)) {
+        secure_free(data, data_len);
+        set_error(err, err_cch, L"Profile database could not be decrypted. The file may belong to another Windows account or be corrupted.");
+        return FALSE;
+    }
+    const BYTE *p = plain;
+    const BYTE *end = plain + plain_len;
     DWORD magic = 0, version = 0, count = 0;
     WCHAR active_id[33] = L"";
     BOOL ok = read_u32_mem(&p, end, &magic) &&
@@ -291,7 +306,7 @@ BOOL profiles_load(WCHAR *err, size_t err_cch) {
     if (!ok) {
         secure_free(data, data_len);
         secure_free(plain, plain_len);
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Profile database header is invalid or unsupported.");
         return FALSE;
     }
     profiles_clear_all();
@@ -318,7 +333,7 @@ BOOL profiles_load(WCHAR *err, size_t err_cch) {
     secure_free(plain, plain_len);
     if (!ok || !consumed_all) {
         profiles_clear_all();
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Profile database is truncated or contains invalid records.");
         return FALSE;
     }
     g_profile_count = (int)count;
@@ -330,13 +345,12 @@ BOOL profiles_load(WCHAR *err, size_t err_cch) {
         }
     }
     if (g_profile_count == 0) return create_default_profile(err, err_cch);
-    if (!protected_file) profiles_save();
     return TRUE;
 }
 
 BOOL profiles_activate(int index, WCHAR *err, size_t err_cch) {
     if (index < 0 || index >= g_profile_count) {
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Requested profile index is out of range.");
         return FALSE;
     }
     if (!unwrap_profile_master_key(&g_profiles[index], err, err_cch)) return FALSE;
@@ -346,7 +360,7 @@ BOOL profiles_activate(int index, WCHAR *err, size_t err_cch) {
     }
     WCHAR state_path[MAX_PATH];
     if (!profiles_get_state_path(&g_profiles[index], state_path, ARRAYSIZE(state_path))) {
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"Profile state path is not available.");
         return FALSE;
     }
     if (!crypto_box_init(g_profiles[index].master_key, state_path, err, err_cch)) return FALSE;
@@ -379,7 +393,7 @@ BOOL profiles_build_key_package(BYTE **out, DWORD *out_len, WCHAR *err, size_t e
     *out = NULL;
     *out_len = 0;
     if (g_active_profile < 0 || g_active_profile >= g_profile_count) {
-        set_error(err, err_cch, L"");
+        set_error(err, err_cch, L"No active profile is selected.");
         return FALSE;
     }
     KEY_PROFILE *profile = &g_profiles[g_active_profile];

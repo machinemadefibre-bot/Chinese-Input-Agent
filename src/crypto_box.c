@@ -125,10 +125,18 @@ static void buf_clear(BOX_BUF *buf) {
 }
 
 static BOOL builder_reserve(BYTE_BUILDER *b, size_t extra) {
+    if (!b) return FALSE;
+    if (extra > SIZE_MAX - b->len) return FALSE;
     size_t need = b->len + extra;
     if (need <= b->cap) return TRUE;
     size_t cap = b->cap ? b->cap : 256;
-    while (cap < need) cap *= 2;
+    while (cap < need) {
+        if (cap > SIZE_MAX / 2) {
+            cap = need;
+            break;
+        }
+        cap *= 2;
+    }
     uint8_t *p = b->data ?
         (uint8_t *)HeapReAlloc(GetProcessHeap(), 0, b->data, cap) :
         (uint8_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, cap);
@@ -139,6 +147,7 @@ static BOOL builder_reserve(BYTE_BUILDER *b, size_t extra) {
 }
 
 static BOOL builder_append(BYTE_BUILDER *b, const void *data, size_t len) {
+    if (!b || (!data && len)) return FALSE;
     if (!builder_reserve(b, len)) return FALSE;
     if (len) memcpy(b->data + b->len, data, len);
     b->len += len;
@@ -165,7 +174,7 @@ static void builder_free(BYTE_BUILDER *b) {
 }
 
 static BOOL read_u32(READ_CURSOR *c, uint32_t *out) {
-    if (c->pos + 4 > c->len) return FALSE;
+    if (!c || !out || c->pos > c->len || c->len - c->pos < 4) return FALSE;
     const uint8_t *p = c->data + c->pos;
     *out = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
     c->pos += 4;
@@ -174,7 +183,7 @@ static BOOL read_u32(READ_CURSOR *c, uint32_t *out) {
 
 static BOOL read_blob_ref(READ_CURSOR *c, const uint8_t **data, size_t *len) {
     uint32_t n = 0;
-    if (!read_u32(c, &n) || c->pos + n > c->len) return FALSE;
+    if (!data || !len || !read_u32(c, &n) || c->pos > c->len || (size_t)n > c->len - c->pos) return FALSE;
     *data = c->data + c->pos;
     *len = n;
     c->pos += n;
@@ -210,12 +219,19 @@ static BOOL read_file_all(const WCHAR *path, uint8_t **out, DWORD *out_len) {
 }
 
 static BOOL write_file_all(const WCHAR *path, const uint8_t *data, DWORD len) {
+    if (!path || (!data && len)) return FALSE;
     HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return FALSE;
     DWORD wrote = 0;
     BOOL ok = WriteFile(h, data, len, &wrote, NULL) && wrote == len;
     CloseHandle(h);
     return ok;
+}
+
+static BOOL box_file_exists(const WCHAR *path) {
+    if (!path || !path[0]) return FALSE;
+    DWORD attrs = GetFileAttributesW(path);
+    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
 }
 
 static BOOL hmac_sha256_segments(const uint8_t *key, DWORD key_len,
@@ -426,9 +442,11 @@ static BOOL contact_fingerprint_from_public(const uint8_t pub[X25519_KEY_BYTES],
 static BOOL protect_state(const uint8_t *plain, DWORD plain_len, uint8_t **out, DWORD *out_len) {
     *out = NULL;
     *out_len = 0;
+    const DWORD overhead = STATE_HEADER_BYTES + STATE_NONCE_BYTES + STATE_TAG_BYTES;
+    if ((!plain && plain_len) || plain_len > 0xffffffffu - overhead) return FALSE;
     uint8_t nonce[STATE_NONCE_BYTES];
     uint8_t *env = NULL;
-    DWORD total = STATE_HEADER_BYTES + STATE_NONCE_BYTES + STATE_TAG_BYTES + plain_len;
+    DWORD total = overhead + plain_len;
     BOOL ok = FALSE;
 
     if (BCryptGenRandom(NULL, nonce, sizeof(nonce), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) return FALSE;
@@ -463,13 +481,15 @@ cleanup:
 static BOOL unprotect_state(const uint8_t *env, DWORD env_len, uint8_t **out, DWORD *out_len) {
     *out = NULL;
     *out_len = 0;
-    if (env_len < STATE_HEADER_BYTES + STATE_NONCE_BYTES + STATE_TAG_BYTES ||
+    const DWORD overhead = STATE_HEADER_BYTES + STATE_NONCE_BYTES + STATE_TAG_BYTES;
+    if (!env ||
+        env_len < overhead ||
         memcmp(env, "CIST", 4) != 0 ||
         env[4] != STATE_VERSION ||
         env[5] != STATE_NONCE_BYTES ||
         env[6] != STATE_TAG_BYTES) return FALSE;
     DWORD plain_len = (DWORD)env[8] | ((DWORD)env[9] << 8) | ((DWORD)env[10] << 16) | ((DWORD)env[11] << 24);
-    if (STATE_HEADER_BYTES + STATE_NONCE_BYTES + STATE_TAG_BYTES + plain_len != env_len) return FALSE;
+    if (plain_len > env_len - overhead || overhead + plain_len != env_len) return FALSE;
     uint8_t *plain = (uint8_t *)box_alloc(plain_len ? plain_len : 1);
     if (!plain) return FALSE;
     if (!aes_gcm_decrypt_raw(g_master_key, env, STATE_HEADER_BYTES,
@@ -554,6 +574,10 @@ cleanup:
 }
 
 BOOL crypto_box_init(const BYTE master_key[32], const WCHAR *state_path, WCHAR *err, size_t err_cch) {
+    if (!master_key) {
+        set_box_error(err, err_cch, L"Master key is not ready.");
+        return FALSE;
+    }
     memcpy(g_master_key, master_key, MASTER_KEY_BYTES);
     if (state_path && state_path[0]) StringCchCopyW(g_state_path, ARRAYSIZE(g_state_path), state_path);
     else g_state_path[0] = L'\0';
@@ -561,7 +585,12 @@ BOOL crypto_box_init(const BYTE master_key[32], const WCHAR *state_path, WCHAR *
         InitializeCriticalSection(&g_lock);
         g_lock_ready = TRUE;
     }
-    load_state();
+    BOOL state_exists = box_file_exists(g_state_path);
+    if (state_exists && !load_state()) {
+        set_box_error(err, err_cch, L"Key state file exists but could not be decrypted or parsed.");
+        crypto_box_shutdown();
+        return FALSE;
+    }
     if (!g_public_key.data || !g_private_key.data) {
         if (!generate_identity() || !save_state()) {
             set_box_error(err, err_cch, L"X25519 key init failed.");
@@ -698,7 +727,7 @@ cleanup:
 }
 
 BOOL crypto_box_import_contact_package(const BYTE *pkg, DWORD pkg_len, WCHAR *err, size_t err_cch) {
-    if (pkg_len != CONTACT_COMPACT_PACKAGE_BYTES) {
+    if (!pkg || pkg_len != CONTACT_COMPACT_PACKAGE_BYTES) {
         set_box_error(err, err_cch, L"Invalid compact contact package length.");
         return FALSE;
     }
@@ -727,6 +756,10 @@ BOOL crypto_box_encrypt(const BYTE *plain, DWORD plain_len, BYTE **out, DWORD *o
                         WCHAR *err, size_t err_cch) {
     *out = NULL;
     *out_len = 0;
+    if (!plain && plain_len) {
+        set_box_error(err, err_cch, L"Invalid plaintext buffer.");
+        return FALSE;
+    }
     const uint8_t *recipient_pub = g_remote_public_key.data ? g_remote_public_key.data : g_public_key.data;
     size_t recipient_len = g_remote_public_key.data ? g_remote_public_key.len : g_public_key.len;
     uint8_t eph_priv[X25519_KEY_BYTES];
@@ -769,6 +802,10 @@ BOOL crypto_box_encrypt(const BYTE *plain, DWORD plain_len, BYTE **out, DWORD *o
         goto cleanup;
     }
     DWORD aad_len = X25519_KEY_BYTES + MESSAGE_NONCE_BYTES;
+    if (plain_len > 0xffffffffu - aad_len - MESSAGE_TAG_BYTES) {
+        set_box_error(err, err_cch, L"Plaintext is too large.");
+        goto cleanup;
+    }
     message_len = aad_len + MESSAGE_TAG_BYTES + plain_len;
     message = (uint8_t *)box_alloc(message_len ? message_len : 1);
     if (!message) {
@@ -802,6 +839,10 @@ BOOL crypto_box_decrypt(const BYTE *message, DWORD message_len, BYTE **out, DWOR
                         WCHAR *err, size_t err_cch) {
     *out = NULL;
     *out_len = 0;
+    if (!message && message_len) {
+        set_box_error(err, err_cch, L"Invalid encrypted message buffer.");
+        return FALSE;
+    }
     uint8_t shared[X25519_KEY_BYTES];
     uint8_t key[32];
     uint8_t *plain = NULL;
