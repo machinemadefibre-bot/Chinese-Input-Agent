@@ -14,6 +14,7 @@
 
 #include <windows.h>
 #include <stddef.h>
+#include "crypto_box.h"
 
 #define APP_PROFILE_MASTER_KEY_BYTES 32
 #define APP_PROFILE_MAX_PROFILES 64
@@ -44,6 +45,6 @@ BOOL profiles_create_from_master(const WCHAR *name, const BYTE master_key[APP_PR
                                  KEY_PROFILE *out, WCHAR *err, size_t err_cch);
 BOOL profiles_append_imported(KEY_PROFILE *profile, int *index_out, WCHAR *err, size_t err_cch);
 void profiles_remove_at(int index);
-BOOL profiles_build_key_package(BYTE **out, DWORD *out_len, WCHAR *err, size_t err_cch);
+BOOL profiles_open_crypto(int index, CRYPTO_BOX **out, WCHAR *err, size_t err_cch);
 
 #endif

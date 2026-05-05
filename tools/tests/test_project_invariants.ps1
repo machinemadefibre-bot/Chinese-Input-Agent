@@ -17,6 +17,19 @@ function Assert-True {
     }
 }
 
+function Get-RepoSlice {
+    param(
+        [string]$Text,
+        [string]$Start,
+        [string]$End
+    )
+    $startIndex = $Text.IndexOf($Start)
+    Assert-True ($startIndex -ge 0) "start marker not found: $Start"
+    $endIndex = $Text.IndexOf($End, $startIndex + $Start.Length)
+    Assert-True ($endIndex -gt $startIndex) "end marker not found after: $Start"
+    return $Text.Substring($startIndex, $endIndex - $startIndex)
+}
+
 function Test-PackagedModelNameIsWorkerDefault {
     $packageBat = Read-RepoFile "package-mingw.bat"
     $workerCpp = Read-RepoFile "tools\payload_watermark\cia_llama_worker.cpp"
@@ -62,10 +75,95 @@ function Test-WorkerResponseIdIsChecked {
     Assert-True $appLlm.Contains("wrong request") "app_llm.c should emit a diagnostic for mismatched worker response ids"
 }
 
+function Test-CryptoBoxUsesOpaqueContext {
+    $header = Read-RepoFile "src\crypto_box.h"
+    $impl = Read-RepoFile "src\crypto_box.c"
+
+    Assert-True $header.Contains("typedef struct CRYPTO_BOX CRYPTO_BOX;") "crypto_box.h should expose CRYPTO_BOX as an opaque context"
+    Assert-True $header.Contains("crypto_box_open(") "crypto_box.h should expose crypto_box_open"
+    Assert-True $header.Contains("crypto_box_close(") "crypto_box.h should expose crypto_box_close"
+    Assert-True $header.Contains("crypto_box_encrypt(CRYPTO_BOX *box") "crypto_box_encrypt should take an explicit context"
+    Assert-True $header.Contains("crypto_box_decrypt(CRYPTO_BOX *box") "crypto_box_decrypt should take an explicit context"
+    Assert-True (-not $header.Contains("crypto_box_init(")) "crypto_box_init should not remain in the public API"
+    Assert-True (-not $header.Contains("crypto_box_shutdown(")) "crypto_box_shutdown should not remain in the public API"
+    Assert-True $impl.Contains("struct CRYPTO_BOX") "crypto_box.c should own the CRYPTO_BOX layout"
+    Assert-True (-not $impl.Contains("static BYTE g_master_key")) "crypto_box.c should not keep a global master key"
+    Assert-True (-not $impl.Contains("static WCHAR g_state_path")) "crypto_box.c should not keep a global state path"
+}
+
+function Test-ProfilesDoNotManageCryptoLifecycle {
+    $profiles = Read-RepoFile "src\app_profiles.c"
+    $activate = Get-RepoSlice $profiles "BOOL profiles_activate" "int profiles_count"
+
+    Assert-True $profiles.Contains("profiles_open_crypto(") "app_profiles.c should expose profiles_open_crypto"
+    Assert-True (-not $activate.Contains("crypto_box_init")) "profiles_activate should not initialize crypto_box"
+    Assert-True (-not $activate.Contains("crypto_box_shutdown")) "profiles_activate should not shut down crypto_box"
+    Assert-True (-not $activate.Contains("crypto_box_export_contact_package")) "profiles_activate should not export crypto material"
+    Assert-True (-not $profiles.Contains("profiles_build_key_package")) "profile layer should not build key packages"
+}
+
+function Test-KeyPersistenceUsesAtomicWrites {
+    $shared = Read-RepoFile "src\app_shared.c"
+    $profiles = Read-RepoFile "src\app_profiles.c"
+    $archive = Read-RepoFile "src\app_archive.c"
+    $crypto = Read-RepoFile "src\crypto_box.c"
+
+    Assert-True $shared.Contains("write_file_bytes_atomic") "app_shared.c should implement write_file_bytes_atomic"
+    Assert-True $shared.Contains("MoveFileExW") "atomic writes should replace via MoveFileExW"
+    Assert-True $shared.Contains("MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH") "atomic writes should use replace and write-through"
+    Assert-True (Get-RepoSlice $profiles "BOOL profiles_save" "BOOL profiles_create_from_master").Contains("write_file_bytes_atomic") "profiles_save should use atomic writes"
+    Assert-True (Get-RepoSlice $archive "BOOL archive_append_text" "BOOL archive_load_text").Contains("write_file_bytes_atomic") "archive rewrite should use atomic writes"
+    Assert-True (Get-RepoSlice $crypto "static BOOL write_file_all" "static BOOL box_file_exists").Contains("write_file_bytes_atomic") "crypto state save should use atomic writes"
+}
+
+function Test-AppFlowOwnsCryptoBusinessFlow {
+    $main = Read-RepoFile "src\main.c"
+    $flow = Read-RepoFile "src\app_flow.c"
+    $header = Read-RepoFile "src\app_flow.h"
+
+    foreach ($call in @(
+        "crypto_box_encrypt(",
+        "crypto_box_decrypt(",
+        "crypto_box_import_contact_package(",
+        "crypto_box_export_contact_package(",
+        "crypto_box_get_public_key(",
+        "crypto_box_get_remote_public_key(",
+        "crypto_box_get_public_fingerprint(",
+        "crypto_box_contact_package_fingerprint(",
+        "local_topk_encode_payload(",
+        "local_topk_decode_payload("
+    )) {
+        Assert-True (-not $main.Contains($call)) "main.c should not directly call business flow API: $call"
+    }
+    Assert-True $main.Contains("app_flow_encrypt_message(") "main.c should dispatch encryption through app_flow"
+    Assert-True $main.Contains("app_flow_decrypt_clip_auto_profile(") "main.c should dispatch decryption through app_flow"
+    Assert-True $main.Contains("CRYPTO_BOX *g_active_box") "main.c should hold the active crypto context"
+    Assert-True $flow.Contains("crypto_box_encrypt(") "app_flow.c should own encryption orchestration"
+    Assert-True $flow.Contains("local_topk_decode_payload(") "app_flow.c should own top-k decode orchestration"
+    Assert-True $header.Contains("app_flow_import_key(") "app_flow.h should expose import flow"
+}
+
+function Test-TopLevelCMakeBuildTargets {
+    $cmake = Read-RepoFile "CMakeLists.txt"
+    $mingw = Read-RepoFile "build-mingw.bat"
+    $msvc = Read-RepoFile "build.bat"
+
+    Assert-True $cmake.Contains("add_executable(ChineseInputAgent") "CMakeLists should define ChineseInputAgent"
+    Assert-True $cmake.Contains("add_executable(ChineseInputAgentInstallerStub") "CMakeLists should define installer stub"
+    Assert-True $cmake.Contains("src/app_flow.c") "CMakeLists should include app_flow.c"
+    Assert-True $mingw.Contains("cmake.exe -S") "build-mingw.bat should be a CMake wrapper"
+    Assert-True $msvc.Contains("cmake.exe -S") "build.bat should be a CMake wrapper"
+}
+
 $tests = @(
     "Test-PackagedModelNameIsWorkerDefault",
     "Test-DocsDoNotOverstateForwardSecrecy",
-    "Test-WorkerResponseIdIsChecked"
+    "Test-WorkerResponseIdIsChecked",
+    "Test-CryptoBoxUsesOpaqueContext",
+    "Test-ProfilesDoNotManageCryptoLifecycle",
+    "Test-KeyPersistenceUsesAtomicWrites",
+    "Test-AppFlowOwnsCryptoBusinessFlow",
+    "Test-TopLevelCMakeBuildTargets"
 )
 
 foreach ($test in $tests) {

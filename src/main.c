@@ -20,7 +20,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 
-#include "crypto_box.h"
+#include "app_flow.h"
 #include "app_shared.h"
 #include "app_llm.h"
 #include "app_storage.h"
@@ -60,11 +60,6 @@
 #define EM_SETCUEBANNER 0x1501
 #endif
 
-static const WCHAR KEY_PACKAGE_PREFIX_START[] = L"\u4f60\u597d\uff0c\u6211\u662f\u7f16\u53f7";
-static const WCHAR KEY_PACKAGE_PREFIX_END[] = L"\uff0c\u8fd9\u662f\u6211\u7684\u81ea\u6211\u4ecb\u7ecd\u3002";
-static const WCHAR KEY_PACKAGE_TOPK_SEED[] = L"ChineseInputAgent key-exchange top-k payload v1";
-static const WCHAR KEY_PACKAGE_TOPIC[] = L"\u81ea\u6211\u4ecb\u7ecd";
-
 typedef struct WORK_CTX {
     int kind;
     HWND owner;
@@ -92,6 +87,7 @@ static HFONT g_ui_font;
 static volatile LONG g_work_active;
 static volatile LONG g_cancel_work;
 static BOOL g_archive_mode;
+static CRYPTO_BOX *g_active_box;
 
 static void set_control_font(HWND hwnd);
 static WCHAR *get_window_text_alloc(HWND hwnd);
@@ -106,56 +102,10 @@ static void set_textbox_overlay(HWND textbox, const WCHAR *text, BOOL show);
 static BOOL start_background_work(WORK_CTX *ctx);
 static WCHAR *get_required_topic_text(HWND owner, HWND topic_edit);
 static DWORD WINAPI work_thread_proc(LPVOID param);
-static BOOL get_message_topk_seed(WCHAR *seed, size_t seed_cch, BOOL prefer_remote, WCHAR *err, size_t err_cch);
-static BOOL decrypt_clip_auto_profile(HWND hwnd, const WCHAR *clip, WCHAR **plain_w_out,
-                                      WCHAR *err, size_t err_cch);
 static void post_llm_stream_progress(HWND target_textbox, const WCHAR *partial, size_t done, size_t total, double tps);
 static BOOL work_cancelled(void);
 static void free_work_ctx(WORK_CTX *ctx);
 static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
-
-static BOOL append_hex_bytes(WCHAR *dst, size_t dst_cch, size_t offset, const BYTE *data, DWORD len) {
-    static const WCHAR hex[] = L"0123456789abcdef";
-    if (!dst || !data || dst_cch <= offset || (dst_cch - offset) < (size_t)len * 2 + 1) return FALSE;
-    WCHAR *p = dst + offset;
-    for (DWORD i = 0; i < len; ++i) {
-        p[i * 2] = hex[(data[i] >> 4) & 0xf];
-        p[i * 2 + 1] = hex[data[i] & 0xf];
-    }
-    p[(size_t)len * 2] = L'\0';
-    return TRUE;
-}
-
-static BOOL format_topk_seed_from_public_key(WCHAR *seed, size_t seed_cch, const BYTE *public_key,
-                                                DWORD public_key_len, WCHAR *err, size_t err_cch) {
-    const WCHAR prefix[] = L"ChineseInputAgent top-k payload seed v1:";
-    size_t prefix_len = wcslen(prefix);
-    BOOL ok = SUCCEEDED(StringCchCopyW(seed, seed_cch, prefix)) &&
-              append_hex_bytes(seed, seed_cch, prefix_len, public_key, public_key_len);
-    if (!ok) {
-        set_error(err, err_cch, L"Failed to build top-k seed from contact public key.");
-        return FALSE;
-    }
-    return TRUE;
-}
-
-static BOOL get_message_topk_seed(WCHAR *seed, size_t seed_cch, BOOL prefer_remote, WCHAR *err, size_t err_cch) {
-    BYTE *public_key = NULL;
-    DWORD public_key_len = 0;
-    WCHAR local_err[256] = L"";
-    if (prefer_remote &&
-        crypto_box_get_remote_public_key(&public_key, &public_key_len, local_err, ARRAYSIZE(local_err))) {
-        BOOL ok = format_topk_seed_from_public_key(seed, seed_cch, public_key, public_key_len, err, err_cch);
-        xfree(public_key);
-        return ok;
-    }
-    if (!crypto_box_get_public_key(&public_key, &public_key_len, err, err_cch)) {
-        return FALSE;
-    }
-    BOOL ok = format_topk_seed_from_public_key(seed, seed_cch, public_key, public_key_len, err, err_cch);
-    xfree(public_key);
-    return ok;
-}
 
 static void refresh_key_combo(void) {
     if (!g_key_select) return;
@@ -167,11 +117,37 @@ static void refresh_key_combo(void) {
     if (profiles_active_index() >= 0) SendMessageW(g_key_select, CB_SETCURSEL, (WPARAM)profiles_active_index(), 0);
 }
 
+static void close_active_crypto(void) {
+    crypto_box_close(g_active_box);
+    g_active_box = NULL;
+}
+
+static BOOL reload_active_crypto(WCHAR *err, size_t err_cch) {
+    int index = profiles_active_index();
+    if (index < 0) {
+        set_error(err, err_cch, L"No active profile is selected.");
+        return FALSE;
+    }
+    CRYPTO_BOX *new_box = NULL;
+    if (!profiles_open_crypto(index, &new_box, err, err_cch)) return FALSE;
+    close_active_crypto();
+    g_active_box = new_box;
+    if (g_key_select) SendMessageW(g_key_select, CB_SETCURSEL, (WPARAM)index, 0);
+    return TRUE;
+}
+
 static BOOL activate_profile(int index, HWND owner, WCHAR *err, size_t err_cch) {
     (void)owner;
-    BOOL ok = profiles_activate(index, err, err_cch);
-    if (ok && g_key_select) SendMessageW(g_key_select, CB_SETCURSEL, (WPARAM)index, 0);
-    return ok;
+    CRYPTO_BOX *new_box = NULL;
+    if (!profiles_open_crypto(index, &new_box, err, err_cch)) return FALSE;
+    if (!profiles_activate(index, err, err_cch)) {
+        crypto_box_close(new_box);
+        return FALSE;
+    }
+    close_active_crypto();
+    g_active_box = new_box;
+    if (g_key_select) SendMessageW(g_key_select, CB_SETCURSEL, (WPARAM)index, 0);
+    return TRUE;
 }
 
 static WCHAR *dup_wide(const WCHAR *s) {
@@ -477,32 +453,29 @@ static void do_import_key(HWND hwnd, HWND source_textbox) {
         show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
         return;
     }
-    WCHAR *start = wcsstr(text, KEY_PACKAGE_PREFIX_START);
-    if (!start) {
+    WCHAR *body = NULL;
+    WCHAR err[256] = L"";
+    if (!app_flow_extract_key_package_body(text, &body, err, ARRAYSIZE(err))) {
         xfree(text);
-        show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
+        show_error(hwnd, err[0] ? err : L"\u64cd\u4f5c\u5931\u8d25\u3002");
         return;
     }
-    WCHAR *body = wcsstr(start, KEY_PACKAGE_PREFIX_END);
-    if (!body) {
-        xfree(text);
-        show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
-        return;
-    }
-    body += wcslen(KEY_PACKAGE_PREFIX_END);
     if (profiles_count() >= MAX_PROFILES) {
+        secure_free_wide(body);
         xfree(text);
         show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
         return;
     }
     WCHAR name[128];
     if (!prompt_key_name(hwnd, name, ARRAYSIZE(name))) {
+        secure_free_wide(body);
         xfree(text);
         return;
     }
 
     WORK_CTX *ctx = (WORK_CTX *)xalloc(sizeof(WORK_CTX));
     if (!ctx) {
+        secure_free_wide(body);
         xfree(text);
         show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
         return;
@@ -510,9 +483,9 @@ static void do_import_key(HWND hwnd, HWND source_textbox) {
     ctx->kind = WORK_KIND_IMPORT_KEY;
     ctx->owner = hwnd;
     ctx->target_textbox = source_textbox;
-    ctx->input = dup_wide(body);
+    ctx->input = body;
     ctx->name = dup_wide(name);
-    if (!ctx->input || !ctx->name) {
+    if (!ctx->name) {
         free_work_ctx(ctx);
         xfree(text);
         show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
@@ -582,126 +555,28 @@ static void free_work_ctx(WORK_CTX *ctx) {
 
 static BOOL worker_encrypt(WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
-    if (!ctx || !ctx->input) {
-        set_error(err, err_cch, L"Invalid encryption request.");
+    if (!g_active_box) {
+        set_error(err, err_cch, L"No active crypto context is open.");
         return FALSE;
     }
-    size_t plain_chars = ctx->input ? wcslen(ctx->input) : 0;
-    if (plain_chars > (((DWORD)0xffffffffu) / sizeof(WCHAR))) {
-        set_error(err, err_cch, L"Plaintext is too large to encrypt.");
-        return FALSE;
-    }
-    DWORD plain_len = (DWORD)(plain_chars * sizeof(WCHAR));
-
-    BYTE *sealed = NULL;
-    DWORD sealed_len = 0;
-    if (!crypto_box_encrypt((const BYTE *)ctx->input, plain_len, &sealed, &sealed_len, err, err_cch)) {
-        return FALSE;
-    }
-
-    WCHAR seed[256] = L"";
-    if (!get_message_topk_seed(seed, ARRAYSIZE(seed), TRUE, err, err_cch)) {
-        secure_free(sealed, sealed_len);
-        return FALSE;
-    }
-
-    BOOL ok = local_topk_encode_payload(sealed, sealed_len, seed, ctx->topic, NULL, -1, ctx->target_textbox, out, err, err_cch);
-    secure_free(sealed, sealed_len);
-    return ok;
+    return app_flow_encrypt_message(g_active_box, ctx ? ctx->input : NULL, ctx ? ctx->topic : NULL,
+                                    ctx ? ctx->target_textbox : NULL, out, err, err_cch);
 }
 
 static BOOL worker_export_key(WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
-    BYTE *pkg = NULL;
-    DWORD pkg_len = 0;
-    if (!profiles_build_key_package(&pkg, &pkg_len, err, err_cch)) return FALSE;
-
-    WCHAR fingerprint[32] = L"";
-    if (!crypto_box_get_public_fingerprint(fingerprint, ARRAYSIZE(fingerprint), err, err_cch)) {
-        secure_free(pkg, pkg_len);
+    if (!g_active_box) {
+        set_error(err, err_cch, L"No active crypto context is open.");
         return FALSE;
     }
-    WSTRB prefix = {0};
-    if (!wstrb_append(&prefix, KEY_PACKAGE_PREFIX_START) ||
-        !wstrb_append(&prefix, fingerprint) ||
-        !wstrb_append(&prefix, KEY_PACKAGE_PREFIX_END)) {
-        secure_free(pkg, pkg_len);
-        wstrb_free(&prefix);
-        set_error(err, err_cch, L"Failed to build key package prefix.");
-        return FALSE;
-    }
-    BOOL ok = local_topk_encode_payload(pkg, pkg_len, KEY_PACKAGE_TOPK_SEED, KEY_PACKAGE_TOPIC,
-                                        prefix.data, 0, ctx->target_textbox, out, err, err_cch);
-    wstrb_free(&prefix);
-    secure_free(pkg, pkg_len);
-    return ok;
+    return app_flow_export_key(g_active_box, ctx ? ctx->target_textbox : NULL, out, err, err_cch);
 }
 
 static BOOL worker_import_key(WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
-    BYTE *pkg = NULL;
-    DWORD pkg_len = 0;
-    if (!local_topk_decode_payload(ctx->input, KEY_PACKAGE_TOPK_SEED, &pkg, &pkg_len, err, err_cch)) {
-        return FALSE;
-    }
-    WCHAR fingerprint[32] = L"";
-    if (!crypto_box_contact_package_fingerprint(pkg, pkg_len, fingerprint, ARRAYSIZE(fingerprint), err, err_cch)) {
-        secure_free(pkg, pkg_len);
-        return FALSE;
-    }
-    if (profiles_count() >= MAX_PROFILES) {
-        secure_free(pkg, pkg_len);
-        set_error(err, err_cch, L"\u5bc6\u94a5\u6570\u91cf\u5df2\u8fbe\u5230\u4e0a\u9650\u3002");
-        return FALSE;
-    }
-
-    BYTE master[MASTER_KEY_BYTES];
-    if (BCryptGenRandom(NULL, master, sizeof(master), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
-        secure_free(pkg, pkg_len);
-        set_error(err, err_cch, L"\u65e0\u6cd5\u751f\u6210\u672c\u5730\u968f\u673a\u5bc6\u94a5\u3002");
-        return FALSE;
-    }
-    KEY_PROFILE imported;
-    if (!profiles_create_from_master(ctx->name, master, &imported, err, err_cch)) {
-        SecureZeroMemory(master, sizeof(master));
-        secure_free(pkg, pkg_len);
-        return FALSE;
-    }
-    SecureZeroMemory(master, sizeof(master));
-
-    int original = profiles_active_index();
     int imported_index = -1;
-    if (!profiles_append_imported(&imported, &imported_index, err, err_cch)) {
-        profiles_clear_profile(&imported);
-        secure_free(pkg, pkg_len);
-        return FALSE;
-    }
-    BOOL ok = profiles_save() &&
-              activate_profile(imported_index, ctx->owner, err, err_cch) &&
-              crypto_box_import_contact_package(pkg, pkg_len, err, err_cch) &&
-              profiles_save();
-    secure_free(pkg, pkg_len);
-    if (!ok) {
-        WCHAR state_path[MAX_PATH];
-        KEY_PROFILE *failed_profile = profiles_get(imported_index);
-        if (failed_profile && profiles_get_state_path(failed_profile, state_path, ARRAYSIZE(state_path))) {
-            secure_delete_file(state_path);
-        }
-        profiles_remove_at(imported_index);
-        if (original >= 0 && original < profiles_count()) {
-            WCHAR restore_err[256] = L"";
-            activate_profile(original, ctx->owner, restore_err, ARRAYSIZE(restore_err));
-        }
-        return FALSE;
-    }
-
-    WSTRB msg = {0};
-    if (!wstrb_appendf(&msg, L"\u8054\u7cfb\u4eba\u516c\u94a5\u5df2\u5bfc\u5165\u3002\r\n\r\n\u8bf7\u81ea\u884c\u786e\u8ba4\u6307\u7eb9\u662f\u5426\u4e0e\u660e\u6587\u76f8\u540c\uff1a%s", fingerprint)) {
-        set_error(err, err_cch, L"\u5bfc\u5165\u7ed3\u679c\u6d88\u606f\u6784\u9020\u5931\u8d25\u3002");
-        return FALSE;
-    }
-    *out = msg.data;
-    return TRUE;
+    return app_flow_import_key(ctx ? ctx->input : NULL, ctx ? ctx->name : NULL,
+                               &imported_index, out, err, err_cch);
 }
 static BOOL worker_decrypt(WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
@@ -709,7 +584,7 @@ static BOOL worker_decrypt(WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cc
         set_error(err, err_cch, L"Clipboard text is empty.");
         return FALSE;
     }
-    return decrypt_clip_auto_profile(ctx->owner, ctx->input, out, err, err_cch);
+    return app_flow_decrypt_clip_auto_profile(ctx->input, work_cancelled, out, err, err_cch);
 }
 
 static DWORD WINAPI work_thread_proc(LPVOID param) {
@@ -807,110 +682,6 @@ static void do_decrypt(HWND hwnd) {
         xfree(clip);
         xfree(ctx);
     }
-}
-
-static BOOL decrypt_sealed_with_current_profile(const BYTE *sealed, DWORD sealed_len,
-                                                WCHAR **plain_w_out, WCHAR *err, size_t err_cch) {
-    *plain_w_out = NULL;
-    BYTE *plain = NULL;
-    DWORD plain_len = 0;
-    if (!crypto_box_decrypt(sealed, sealed_len, &plain, &plain_len, err, err_cch)) {
-        return FALSE;
-    }
-
-    if ((plain_len % sizeof(WCHAR)) != 0) {
-        secure_free(plain, plain_len);
-        set_error(err, err_cch, L"Decrypted plaintext has an invalid UTF-16 length.");
-        return FALSE;
-    }
-    size_t plain_chars = plain_len / sizeof(WCHAR);
-    WCHAR *plain_w = (WCHAR *)xalloc((plain_chars + 1) * sizeof(WCHAR));
-    if (!plain_w) {
-        secure_free(plain, plain_len);
-        set_error(err, err_cch, L"Out of memory while decoding plaintext.");
-        return FALSE;
-    }
-    CopyMemory(plain_w, plain, plain_len);
-    plain_w[plain_chars] = L'\0';
-    secure_free(plain, plain_len);
-    *plain_w_out = plain_w;
-    return TRUE;
-}
-
-static BOOL decrypt_clip_auto_profile(HWND hwnd, const WCHAR *clip, WCHAR **plain_w_out,
-                                      WCHAR *err, size_t err_cch) {
-    *plain_w_out = NULL;
-    int original = profiles_active_index();
-    WCHAR last_err[768] = L"";
-    WCHAR local_decode_err[768] = L"";
-    BOOL saw_local_decode_error = FALSE;
-    BOOL saw_local_payload = FALSE;
-
-    int count = profiles_count();
-    for (int pass = 0; pass < count; ++pass) {
-        if (work_cancelled()) {
-            set_error(err, err_cch, L"\u5df2\u505c\u6b62\u3002");
-            return FALSE;
-        }
-        int index;
-        if (original >= 0 && original < count && pass == count - 1) {
-            index = original;
-        } else {
-            index = pass;
-            if (original >= 0 && original < count && index >= original) index++;
-        }
-        if (index < 0 || index >= count) continue;
-
-        WCHAR local_err[768] = L"";
-        if (index != profiles_active_index() &&
-            !activate_profile(index, hwnd, local_err, ARRAYSIZE(local_err))) {
-            StringCchCopyW(last_err, ARRAYSIZE(last_err), local_err[0] ? local_err : L"");
-            continue;
-        }
-
-        WCHAR *plain_w = NULL;
-        WCHAR seed[256] = L"";
-        BYTE *local_sealed = NULL;
-        DWORD local_sealed_len = 0;
-        BOOL have_local_payload = FALSE;
-        if (get_message_topk_seed(seed, ARRAYSIZE(seed), FALSE, local_err, ARRAYSIZE(local_err))) {
-            have_local_payload = local_topk_decode_payload(clip, seed, &local_sealed, &local_sealed_len,
-                                                          local_decode_err, ARRAYSIZE(local_decode_err));
-            if (!have_local_payload) {
-                if (local_decode_err[0]) {
-                    saw_local_decode_error = TRUE;
-                    StringCchCopyW(local_err, ARRAYSIZE(local_err), local_decode_err);
-                } else {
-                    StringCchCopyW(local_err, ARRAYSIZE(local_err), L"Local top-k decode failed without a diagnostic message.");
-                }
-            }
-        }
-        if (have_local_payload) saw_local_payload = TRUE;
-        BOOL ok = have_local_payload &&
-            decrypt_sealed_with_current_profile(local_sealed, local_sealed_len, &plain_w, local_err, ARRAYSIZE(local_err));
-        secure_free(local_sealed, local_sealed_len);
-        if (ok) {
-            *plain_w_out = plain_w;
-            return TRUE;
-        }
-        StringCchCopyW(last_err, ARRAYSIZE(last_err), local_err[0] ? local_err : L"");
-    }
-
-    if (original >= 0 && original < profiles_count()) {
-        WCHAR restore_err[256] = L"";
-        activate_profile(original, hwnd, restore_err, ARRAYSIZE(restore_err));
-    }
-
-    if (saw_local_decode_error && !saw_local_payload && local_decode_err[0]) {
-        set_error(err, err_cch,
-                  L"Local top-k decode failed before decryption: %s",
-                  local_decode_err);
-    } else if (last_err[0]) {
-        set_error(err, err_cch, L"\u6ca1\u6709\u627e\u5230\u80fd\u89e3\u5bc6\u8fd9\u6bb5\u6587\u5b57\u7684\u5bc6\u94a5\u3002\u6700\u540e\u9519\u8bef\uff1a%s", last_err);
-    } else {
-        set_error(err, err_cch, L"No profile was able to decode or decrypt the clipboard text.");
-    }
-    return FALSE;
 }
 
 static void layout_main(HWND hwnd, int width, int height) {
@@ -1153,6 +924,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                     set_textbox_overlay(m->target_textbox, NULL, FALSE);
                     SetWindowTextW(m->target_textbox, m->text ? m->text : L"");
                     if (m->kind == WORK_KIND_IMPORT_KEY) {
+                        WCHAR err[256] = L"";
+                        if (!reload_active_crypto(err, ARRAYSIZE(err))) {
+                            show_error(hwnd, err[0] ? err : L"\u5bc6\u94a5\u5bfc\u5165\u540e\u5237\u65b0\u52a0\u5bc6\u72b6\u6001\u5931\u8d25\u3002");
+                        }
                         refresh_key_combo();
                         if (m->text && m->text[0]) {
                             MessageBoxW(hwnd, m->text, L"\u8054\u7cfb\u4eba\u6307\u7eb9\u786e\u8ba4", MB_OK | MB_ICONINFORMATION);
@@ -1336,6 +1111,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
         return 1;
     }
     if (!register_windows()) {
+        close_active_crypto();
         profiles_shutdown();
         MessageBoxW(NULL, L"Window initialization failed.", APP_TITLE, MB_ICONERROR | MB_OK);
         app_llm_cleanup();
@@ -1347,6 +1123,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
                                     CW_USEDEFAULT, CW_USEDEFAULT, 760, 520,
                                     NULL, NULL, instance, NULL);
     if (!g_main_window) {
+        close_active_crypto();
         profiles_shutdown();
         MessageBoxW(NULL, L"Window initialization failed.", APP_TITLE, MB_ICONERROR | MB_OK);
         app_llm_cleanup();
@@ -1365,6 +1142,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     }
 
     app_llm_cleanup();
+    close_active_crypto();
     profiles_shutdown();
     if (g_ui_font) DeleteObject(g_ui_font);
     return (int)msg.wParam;

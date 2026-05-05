@@ -1,15 +1,11 @@
 @echo off
 setlocal
+set "ROOT=%~dp0"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
-where x86_64-w64-mingw32-gcc.exe >nul 2>nul
+where cmake.exe >nul 2>nul
 if errorlevel 1 (
-    echo x86_64-w64-mingw32-gcc.exe not found. Install MSYS2 UCRT64 MinGW-w64.
-    exit /b 1
-)
-
-where windres.exe >nul 2>nul
-if errorlevel 1 (
-    echo windres.exe not found. Install MSYS2 UCRT64 MinGW-w64.
+    echo cmake.exe not found. Install CMake or add it to PATH.
     exit /b 1
 )
 
@@ -19,16 +15,7 @@ if not exist "%PY%" set PY=python.exe
 call "%~dp0package-mingw.bat"
 if errorlevel 1 exit /b 1
 
-if not exist build mkdir build
-
-windres.exe src\installer.rc -O coff -o build\installer_mingw.res
-if errorlevel 1 exit /b 1
-
-x86_64-w64-mingw32-gcc.exe -municode -mwindows -O2 -w -static -static-libgcc ^
-  -o build\ChineseInputAgentInstallerStub.exe ^
-  -D_WINDOWS ^
-  src\installer.c build\installer_mingw.res ^
-  -luser32 -lgdi32 -lcomctl32 -lshell32 -lole32
+cmake.exe --build "%ROOT%\build\cmake-mingw" --target ChineseInputAgentInstallerStub --config Release
 if errorlevel 1 exit /b 1
 
 "%PY%" tools\packaging\make_installer_archive.py "dist\ChineseInputAgent" "build\ChineseInputAgentPortable.zip"

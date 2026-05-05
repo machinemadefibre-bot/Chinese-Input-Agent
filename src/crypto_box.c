@@ -10,6 +10,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "crypto_box.h"
+#include "app_shared.h"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -52,13 +53,13 @@ typedef struct READ_CURSOR {
     size_t pos;
 } READ_CURSOR;
 
-static BYTE g_master_key[MASTER_KEY_BYTES];
-static WCHAR g_state_path[MAX_PATH];
-static BOX_BUF g_public_key;
-static BOX_BUF g_private_key;
-static BOX_BUF g_remote_public_key;
-static CRITICAL_SECTION g_lock;
-static BOOL g_lock_ready;
+struct CRYPTO_BOX {
+    BYTE master_key[MASTER_KEY_BYTES];
+    WCHAR state_path[MAX_PATH];
+    BOX_BUF public_key;
+    BOX_BUF private_key;
+    BOX_BUF remote_public_key;
+};
 
 static void set_box_error(WCHAR *buf, size_t cch, const WCHAR *fmt, ...) {
     if (!buf || cch == 0) return;
@@ -219,13 +220,7 @@ static BOOL read_file_all(const WCHAR *path, uint8_t **out, DWORD *out_len) {
 }
 
 static BOOL write_file_all(const WCHAR *path, const uint8_t *data, DWORD len) {
-    if (!path || (!data && len)) return FALSE;
-    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return FALSE;
-    DWORD wrote = 0;
-    BOOL ok = WriteFile(h, data, len, &wrote, NULL) && wrote == len;
-    CloseHandle(h);
-    return ok;
+    return write_file_bytes_atomic(path, data, len);
 }
 
 static BOOL box_file_exists(const WCHAR *path) {
@@ -439,11 +434,11 @@ static BOOL contact_fingerprint_from_public(const uint8_t pub[X25519_KEY_BYTES],
     return TRUE;
 }
 
-static BOOL protect_state(const uint8_t *plain, DWORD plain_len, uint8_t **out, DWORD *out_len) {
+static BOOL protect_state(CRYPTO_BOX *box, const uint8_t *plain, DWORD plain_len, uint8_t **out, DWORD *out_len) {
     *out = NULL;
     *out_len = 0;
     const DWORD overhead = STATE_HEADER_BYTES + STATE_NONCE_BYTES + STATE_TAG_BYTES;
-    if ((!plain && plain_len) || plain_len > 0xffffffffu - overhead) return FALSE;
+    if (!box || (!plain && plain_len) || plain_len > 0xffffffffu - overhead) return FALSE;
     uint8_t nonce[STATE_NONCE_BYTES];
     uint8_t *env = NULL;
     DWORD total = overhead + plain_len;
@@ -462,7 +457,7 @@ static BOOL protect_state(const uint8_t *plain, DWORD plain_len, uint8_t **out, 
     env[10] = (uint8_t)((plain_len >> 16) & 0xff);
     env[11] = (uint8_t)((plain_len >> 24) & 0xff);
     memcpy(env + STATE_HEADER_BYTES, nonce, sizeof(nonce));
-    if (!aes_gcm_encrypt_raw(g_master_key, env, STATE_HEADER_BYTES,
+    if (!aes_gcm_encrypt_raw(box->master_key, env, STATE_HEADER_BYTES,
                              nonce, sizeof(nonce),
                              plain, plain_len,
                              env + STATE_HEADER_BYTES + STATE_NONCE_BYTES,
@@ -478,11 +473,12 @@ cleanup:
     return ok;
 }
 
-static BOOL unprotect_state(const uint8_t *env, DWORD env_len, uint8_t **out, DWORD *out_len) {
+static BOOL unprotect_state(CRYPTO_BOX *box, const uint8_t *env, DWORD env_len, uint8_t **out, DWORD *out_len) {
     *out = NULL;
     *out_len = 0;
     const DWORD overhead = STATE_HEADER_BYTES + STATE_NONCE_BYTES + STATE_TAG_BYTES;
-    if (!env ||
+    if (!box ||
+        !env ||
         env_len < overhead ||
         memcmp(env, "CIST", 4) != 0 ||
         env[4] != STATE_VERSION ||
@@ -492,7 +488,7 @@ static BOOL unprotect_state(const uint8_t *env, DWORD env_len, uint8_t **out, DW
     if (plain_len > env_len - overhead || overhead + plain_len != env_len) return FALSE;
     uint8_t *plain = (uint8_t *)box_alloc(plain_len ? plain_len : 1);
     if (!plain) return FALSE;
-    if (!aes_gcm_decrypt_raw(g_master_key, env, STATE_HEADER_BYTES,
+    if (!aes_gcm_decrypt_raw(box->master_key, env, STATE_HEADER_BYTES,
                              env + STATE_HEADER_BYTES, STATE_NONCE_BYTES,
                              env + STATE_HEADER_BYTES + STATE_NONCE_BYTES, STATE_TAG_BYTES,
                              env + STATE_HEADER_BYTES + STATE_NONCE_BYTES + STATE_TAG_BYTES,
@@ -505,33 +501,33 @@ static BOOL unprotect_state(const uint8_t *env, DWORD env_len, uint8_t **out, DW
     return TRUE;
 }
 
-static BOOL save_state(void) {
-    if (!g_state_path[0]) return TRUE;
+static BOOL save_state(CRYPTO_BOX *box) {
+    if (!box || !box->state_path[0]) return TRUE;
     BYTE_BUILDER b = {0};
     uint8_t *protected_blob = NULL;
     DWORD protected_len = 0;
     BOOL ok = FALSE;
     if (!builder_u32(&b, STATE_MAGIC) ||
         !builder_u32(&b, STATE_VERSION) ||
-        !builder_blob(&b, g_public_key.data, g_public_key.len) ||
-        !builder_blob(&b, g_private_key.data, g_private_key.len) ||
-        !builder_blob(&b, g_remote_public_key.data, g_remote_public_key.len)) goto cleanup;
-    if (!protect_state(b.data, (DWORD)b.len, &protected_blob, &protected_len)) goto cleanup;
-    ok = write_file_all(g_state_path, protected_blob, protected_len);
+        !builder_blob(&b, box->public_key.data, box->public_key.len) ||
+        !builder_blob(&b, box->private_key.data, box->private_key.len) ||
+        !builder_blob(&b, box->remote_public_key.data, box->remote_public_key.len)) goto cleanup;
+    if (!protect_state(box, b.data, (DWORD)b.len, &protected_blob, &protected_len)) goto cleanup;
+    ok = write_file_all(box->state_path, protected_blob, protected_len);
 cleanup:
     builder_free(&b);
     box_secure_free(protected_blob, protected_len);
     return ok;
 }
 
-static BOOL load_state(void) {
+static BOOL load_state(CRYPTO_BOX *box) {
     uint8_t *file = NULL;
     DWORD file_len = 0;
     uint8_t *plain = NULL;
     DWORD plain_len = 0;
     BOOL ok = FALSE;
-    if (!g_state_path[0] || !read_file_all(g_state_path, &file, &file_len)) return FALSE;
-    if (!unprotect_state(file, file_len, &plain, &plain_len)) goto cleanup;
+    if (!box || !box->state_path[0] || !read_file_all(box->state_path, &file, &file_len)) return FALSE;
+    if (!unprotect_state(box, file, file_len, &plain, &plain_len)) goto cleanup;
     READ_CURSOR c = { plain, plain_len, 0 };
     uint32_t magic = 0, version = 0;
     const uint8_t *pub = NULL, *priv = NULL, *remote = NULL;
@@ -546,9 +542,9 @@ static BOOL load_state(void) {
         !validate_public_key_blob(pub, pub_len) ||
         !validate_private_key_blob(priv, priv_len)) goto cleanup;
     if (c.pos != c.len || (remote_len && !validate_public_key_blob(remote, remote_len))) goto cleanup;
-    if (!buf_set(&g_public_key, pub, pub_len) ||
-        !buf_set(&g_private_key, priv, priv_len) ||
-        !buf_set(&g_remote_public_key, remote, remote_len)) goto cleanup;
+    if (!buf_set(&box->public_key, pub, pub_len) ||
+        !buf_set(&box->private_key, priv, priv_len) ||
+        !buf_set(&box->remote_public_key, remote, remote_len)) goto cleanup;
     ok = TRUE;
 cleanup:
     box_secure_free(file, file_len);
@@ -556,7 +552,7 @@ cleanup:
     return ok;
 }
 
-static BOOL generate_identity(void) {
+static BOOL generate_identity(CRYPTO_BOX *box) {
     uint8_t priv[X25519_KEY_BYTES];
     uint8_t pub[X25519_KEY_BYTES];
     BOOL ok = FALSE;
@@ -565,96 +561,100 @@ static BOOL generate_identity(void) {
     if (BCryptGenRandom(NULL, priv, sizeof(priv), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) goto cleanup;
     x25519_clamp_private(priv);
     if (!x25519_public_from_private(priv, pub)) goto cleanup;
-    ok = buf_set(&g_public_key, pub, sizeof(pub)) &&
-         buf_set(&g_private_key, priv, sizeof(priv));
+    ok = box &&
+         buf_set(&box->public_key, pub, sizeof(pub)) &&
+         buf_set(&box->private_key, priv, sizeof(priv));
 cleanup:
     SecureZeroMemory(priv, sizeof(priv));
     SecureZeroMemory(pub, sizeof(pub));
     return ok;
 }
 
-BOOL crypto_box_init(const BYTE master_key[32], const WCHAR *state_path, WCHAR *err, size_t err_cch) {
+BOOL crypto_box_open(const BYTE master_key[32], const WCHAR *state_path, CRYPTO_BOX **out,
+                     WCHAR *err, size_t err_cch) {
+    if (out) *out = NULL;
+    if (!out) return FALSE;
     if (!master_key) {
         set_box_error(err, err_cch, L"Master key is not ready.");
         return FALSE;
     }
-    memcpy(g_master_key, master_key, MASTER_KEY_BYTES);
-    if (state_path && state_path[0]) StringCchCopyW(g_state_path, ARRAYSIZE(g_state_path), state_path);
-    else g_state_path[0] = L'\0';
-    if (!g_lock_ready) {
-        InitializeCriticalSection(&g_lock);
-        g_lock_ready = TRUE;
-    }
-    BOOL state_exists = box_file_exists(g_state_path);
-    if (state_exists && !load_state()) {
-        set_box_error(err, err_cch, L"Key state file exists but could not be decrypted or parsed.");
-        crypto_box_shutdown();
+    CRYPTO_BOX *box = (CRYPTO_BOX *)box_alloc(sizeof(CRYPTO_BOX));
+    if (!box) {
+        set_box_error(err, err_cch, L"Out of memory.");
         return FALSE;
     }
-    if (!g_public_key.data || !g_private_key.data) {
-        if (!generate_identity() || !save_state()) {
+    memcpy(box->master_key, master_key, MASTER_KEY_BYTES);
+    if (state_path && state_path[0]) StringCchCopyW(box->state_path, ARRAYSIZE(box->state_path), state_path);
+    else box->state_path[0] = L'\0';
+    BOOL state_exists = box_file_exists(box->state_path);
+    if (state_exists && !load_state(box)) {
+        set_box_error(err, err_cch, L"Key state file exists but could not be decrypted or parsed.");
+        crypto_box_close(box);
+        return FALSE;
+    }
+    if (!box->public_key.data || !box->private_key.data) {
+        if (!generate_identity(box) || !save_state(box)) {
             set_box_error(err, err_cch, L"X25519 key init failed.");
-            crypto_box_shutdown();
+            crypto_box_close(box);
             return FALSE;
         }
     }
+    *out = box;
     return TRUE;
 }
 
-void crypto_box_shutdown(void) {
-    buf_clear(&g_public_key);
-    buf_clear(&g_private_key);
-    buf_clear(&g_remote_public_key);
-    if (g_lock_ready) {
-        DeleteCriticalSection(&g_lock);
-        g_lock_ready = FALSE;
-    }
-    SecureZeroMemory(g_master_key, sizeof(g_master_key));
-    SecureZeroMemory(g_state_path, sizeof(g_state_path));
+void crypto_box_close(CRYPTO_BOX *box) {
+    if (!box) return;
+    buf_clear(&box->public_key);
+    buf_clear(&box->private_key);
+    buf_clear(&box->remote_public_key);
+    SecureZeroMemory(box->master_key, sizeof(box->master_key));
+    SecureZeroMemory(box->state_path, sizeof(box->state_path));
+    box_secure_free(box, sizeof(*box));
 }
 
-BOOL crypto_box_get_public_key(BYTE **out, DWORD *out_len, WCHAR *err, size_t err_cch) {
+BOOL crypto_box_get_public_key(CRYPTO_BOX *box, BYTE **out, DWORD *out_len, WCHAR *err, size_t err_cch) {
     *out = NULL;
     *out_len = 0;
-    if (!validate_public_key_blob(g_public_key.data, g_public_key.len)) {
+    if (!box || !validate_public_key_blob(box->public_key.data, box->public_key.len)) {
         set_box_error(err, err_cch, L"Local public key is not ready.");
         return FALSE;
     }
-    BYTE *copy = (BYTE *)box_alloc(g_public_key.len);
+    BYTE *copy = (BYTE *)box_alloc(box->public_key.len);
     if (!copy) {
         set_box_error(err, err_cch, L"Out of memory.");
         return FALSE;
     }
-    memcpy(copy, g_public_key.data, g_public_key.len);
+    memcpy(copy, box->public_key.data, box->public_key.len);
     *out = copy;
-    *out_len = (DWORD)g_public_key.len;
+    *out_len = (DWORD)box->public_key.len;
     return TRUE;
 }
 
-BOOL crypto_box_get_remote_public_key(BYTE **out, DWORD *out_len, WCHAR *err, size_t err_cch) {
+BOOL crypto_box_get_remote_public_key(CRYPTO_BOX *box, BYTE **out, DWORD *out_len, WCHAR *err, size_t err_cch) {
     *out = NULL;
     *out_len = 0;
-    if (!validate_public_key_blob(g_remote_public_key.data, g_remote_public_key.len)) {
+    if (!box || !validate_public_key_blob(box->remote_public_key.data, box->remote_public_key.len)) {
         set_box_error(err, err_cch, L"No imported contact public key.");
         return FALSE;
     }
-    BYTE *copy = (BYTE *)box_alloc(g_remote_public_key.len);
+    BYTE *copy = (BYTE *)box_alloc(box->remote_public_key.len);
     if (!copy) {
         set_box_error(err, err_cch, L"Out of memory.");
         return FALSE;
     }
-    memcpy(copy, g_remote_public_key.data, g_remote_public_key.len);
+    memcpy(copy, box->remote_public_key.data, box->remote_public_key.len);
     *out = copy;
-    *out_len = (DWORD)g_remote_public_key.len;
+    *out_len = (DWORD)box->remote_public_key.len;
     return TRUE;
 }
 
-BOOL crypto_box_get_public_fingerprint(WCHAR *out, size_t cch, WCHAR *err, size_t err_cch) {
-    if (!validate_public_key_blob(g_public_key.data, g_public_key.len)) {
+BOOL crypto_box_get_public_fingerprint(CRYPTO_BOX *box, WCHAR *out, size_t cch, WCHAR *err, size_t err_cch) {
+    if (!box || !validate_public_key_blob(box->public_key.data, box->public_key.len)) {
         set_box_error(err, err_cch, L"Local public key is not ready.");
         return FALSE;
     }
-    if (!contact_fingerprint_from_public(g_public_key.data, out, cch)) {
+    if (!contact_fingerprint_from_public(box->public_key.data, out, cch)) {
         set_box_error(err, err_cch, L"Contact fingerprint generation failed.");
         return FALSE;
     }
@@ -680,26 +680,26 @@ BOOL crypto_box_contact_package_fingerprint(const BYTE *pkg, DWORD pkg_len, WCHA
     return TRUE;
 }
 
-BOOL crypto_box_prepare_key_export(WCHAR *err, size_t err_cch) {
-    if (!save_state()) {
+BOOL crypto_box_prepare_key_export(CRYPTO_BOX *box, WCHAR *err, size_t err_cch) {
+    if (!save_state(box)) {
         set_box_error(err, err_cch, L"Key state save failed.");
         return FALSE;
     }
     return TRUE;
 }
 
-BOOL crypto_box_export_contact_package(BYTE **out, DWORD *out_len, WCHAR *err, size_t err_cch) {
+BOOL crypto_box_export_contact_package(CRYPTO_BOX *box, BYTE **out, DWORD *out_len, WCHAR *err, size_t err_cch) {
     *out = NULL;
     *out_len = 0;
     uint8_t checksum[CONTACT_CHECKSUM_BYTES];
     uint8_t *pkg = NULL;
     BOOL ok = FALSE;
     ZeroMemory(checksum, sizeof(checksum));
-    if (!validate_public_key_blob(g_public_key.data, g_public_key.len)) {
+    if (!box || !validate_public_key_blob(box->public_key.data, box->public_key.len)) {
         set_box_error(err, err_cch, L"Local public key is not ready.");
         goto cleanup;
     }
-    if (!contact_checksum(g_public_key.data, checksum)) {
+    if (!contact_checksum(box->public_key.data, checksum)) {
         set_box_error(err, err_cch, L"Contact package checksum failed.");
         goto cleanup;
     }
@@ -709,7 +709,7 @@ BOOL crypto_box_export_contact_package(BYTE **out, DWORD *out_len, WCHAR *err, s
         goto cleanup;
     }
     uint8_t *p = pkg;
-    memcpy(p, g_public_key.data, X25519_KEY_BYTES); p += X25519_KEY_BYTES;
+    memcpy(p, box->public_key.data, X25519_KEY_BYTES); p += X25519_KEY_BYTES;
     memcpy(p, checksum, CONTACT_CHECKSUM_BYTES);
     *out = pkg;
     *out_len = CONTACT_COMPACT_PACKAGE_BYTES;
@@ -726,8 +726,8 @@ cleanup:
     return ok;
 }
 
-BOOL crypto_box_import_contact_package(const BYTE *pkg, DWORD pkg_len, WCHAR *err, size_t err_cch) {
-    if (!pkg || pkg_len != CONTACT_COMPACT_PACKAGE_BYTES) {
+BOOL crypto_box_import_contact_package(CRYPTO_BOX *box, const BYTE *pkg, DWORD pkg_len, WCHAR *err, size_t err_cch) {
+    if (!box || !pkg || pkg_len != CONTACT_COMPACT_PACKAGE_BYTES) {
         set_box_error(err, err_cch, L"Invalid compact contact package length.");
         return FALSE;
     }
@@ -745,23 +745,23 @@ BOOL crypto_box_import_contact_package(const BYTE *pkg, DWORD pkg_len, WCHAR *er
         set_box_error(err, err_cch, L"Invalid compact contact package checksum.");
         return FALSE;
     }
-    if (!buf_set(&g_remote_public_key, pub, X25519_KEY_BYTES) || !save_state()) {
+    if (!buf_set(&box->remote_public_key, pub, X25519_KEY_BYTES) || !save_state(box)) {
         set_box_error(err, err_cch, L"Contact package save failed.");
         return FALSE;
     }
     return TRUE;
 }
 
-BOOL crypto_box_encrypt(const BYTE *plain, DWORD plain_len, BYTE **out, DWORD *out_len,
+BOOL crypto_box_encrypt(CRYPTO_BOX *box, const BYTE *plain, DWORD plain_len, BYTE **out, DWORD *out_len,
                         WCHAR *err, size_t err_cch) {
     *out = NULL;
     *out_len = 0;
-    if (!plain && plain_len) {
+    if (!box || (!plain && plain_len)) {
         set_box_error(err, err_cch, L"Invalid plaintext buffer.");
         return FALSE;
     }
-    const uint8_t *recipient_pub = g_remote_public_key.data ? g_remote_public_key.data : g_public_key.data;
-    size_t recipient_len = g_remote_public_key.data ? g_remote_public_key.len : g_public_key.len;
+    const uint8_t *recipient_pub = box->remote_public_key.data ? box->remote_public_key.data : box->public_key.data;
+    size_t recipient_len = box->remote_public_key.data ? box->remote_public_key.len : box->public_key.len;
     uint8_t eph_priv[X25519_KEY_BYTES];
     uint8_t eph_pub[X25519_KEY_BYTES];
     uint8_t shared[X25519_KEY_BYTES];
@@ -835,11 +835,11 @@ cleanup:
     return ok;
 }
 
-BOOL crypto_box_decrypt(const BYTE *message, DWORD message_len, BYTE **out, DWORD *out_len,
+BOOL crypto_box_decrypt(CRYPTO_BOX *box, const BYTE *message, DWORD message_len, BYTE **out, DWORD *out_len,
                         WCHAR *err, size_t err_cch) {
     *out = NULL;
     *out_len = 0;
-    if (!message && message_len) {
+    if (!box || (!message && message_len)) {
         set_box_error(err, err_cch, L"Invalid encrypted message buffer.");
         return FALSE;
     }
@@ -858,20 +858,20 @@ BOOL crypto_box_decrypt(const BYTE *message, DWORD message_len, BYTE **out, DWOR
         goto cleanup;
     }
     cipher_len = message_len - aad_len - MESSAGE_TAG_BYTES;
-    if (!validate_private_key_blob(g_private_key.data, g_private_key.len) ||
-        !validate_public_key_blob(g_public_key.data, g_public_key.len)) {
+    if (!validate_private_key_blob(box->private_key.data, box->private_key.len) ||
+        !validate_public_key_blob(box->public_key.data, box->public_key.len)) {
         set_box_error(err, err_cch, L"Local private key is not ready.");
         goto cleanup;
     }
     const uint8_t *eph_pub = message;
     if (!validate_public_key_blob(eph_pub, X25519_KEY_BYTES) ||
-        !x25519_shared_secret(g_private_key.data, eph_pub, shared)) {
+        !x25519_shared_secret(box->private_key.data, eph_pub, shared)) {
         set_box_error(err, err_cch, L"X25519 key agreement failed.");
         goto cleanup;
     }
     if (!derive_message_key(shared, sizeof(shared),
                             eph_pub, X25519_KEY_BYTES,
-                            g_public_key.data, (DWORD)g_public_key.len, key)) {
+                            box->public_key.data, (DWORD)box->public_key.len, key)) {
         set_box_error(err, err_cch, L"Message key derivation failed.");
         goto cleanup;
     }

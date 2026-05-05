@@ -212,7 +212,7 @@ BOOL archive_append_text(const KEY_PROFILE *profile, const WCHAR *plain, WCHAR *
     BYTE *protected_blob = NULL;
     DWORD protected_len = 0;
     BOOL ok = local_aes_gcm_encrypt(profile->master_key, merged, total, &protected_blob, &protected_len) &&
-              write_file_bytes(path, protected_blob, protected_len);
+              write_file_bytes_atomic(path, protected_blob, protected_len);
     secure_free(protected_blob, protected_len);
     secure_free_str(record_utf8);
     secure_free(old, old_len);

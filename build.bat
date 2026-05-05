@@ -1,5 +1,19 @@
 @echo off
 setlocal
+set "ROOT=%~dp0"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
+
+where cmake.exe >nul 2>nul
+if errorlevel 1 (
+    echo cmake.exe not found. Install CMake or add it to PATH.
+    exit /b 1
+)
+
+where ninja.exe >nul 2>nul
+if errorlevel 1 (
+    echo ninja.exe not found. Install Ninja or add it to PATH.
+    exit /b 1
+)
 
 where cl.exe >nul 2>nul
 if errorlevel 1 (
@@ -13,13 +27,10 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist build mkdir build
-
-rc.exe /nologo /fo build\app.res src\app.rc
+cmake.exe -S "%ROOT%" -B "%ROOT%\build\cmake-msvc" -G Ninja -DCMAKE_BUILD_TYPE=Release
 if errorlevel 1 exit /b 1
 
-cl.exe /nologo /W3 /O2 /utf-8 /D_WINDOWS /DHAVE_SECUREZEROMEMORY=1 ^
-  /Fe:build\ChineseInputAgent.exe src\main.c src\app_shared.c src\app_storage.c src\app_profiles.c src\app_archive.c src\app_llm.c src\crypto_box.c third_party\curve25519-donna\curve25519-donna.c build\app.res ^
-  user32.lib gdi32.lib comctl32.lib advapi32.lib crypt32.lib bcrypt.lib ncrypt.lib shell32.lib
+cmake.exe --build "%ROOT%\build\cmake-msvc" --target ChineseInputAgent --config Release
+if errorlevel 1 exit /b 1
 
 endlocal

@@ -326,11 +326,39 @@ BOOL read_file_bytes(const WCHAR *path, BYTE **out, DWORD *out_len) {
 }
 
 BOOL write_file_bytes(const WCHAR *path, const BYTE *data, DWORD len) {
+    if (!path || !path[0] || (!data && len)) return FALSE;
     HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return FALSE;
     DWORD written = 0;
     BOOL ok = WriteFile(h, data, len, &written, NULL) && written == len;
     CloseHandle(h);
+    return ok;
+}
+
+BOOL write_file_bytes_atomic(const WCHAR *path, const BYTE *data, DWORD len) {
+    if (!path || !path[0] || (!data && len)) return FALSE;
+
+    WCHAR dir[MAX_PATH];
+    WCHAR tmp[MAX_PATH];
+    if (FAILED(StringCchCopyW(dir, ARRAYSIZE(dir), path))) return FALSE;
+    strip_last_path_component(dir);
+    if (!dir[0]) return FALSE;
+    if (!GetTempFileNameW(dir, L"cia", 0, tmp)) return FALSE;
+
+    HANDLE h = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        DeleteFileW(tmp);
+        return FALSE;
+    }
+
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, data, len, &written, NULL) && written == len && FlushFileBuffers(h);
+    CloseHandle(h);
+    if (ok) {
+        ok = MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    }
+    if (!ok) DeleteFileW(tmp);
     return ok;
 }
 

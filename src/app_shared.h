@@ -62,6 +62,7 @@ BOOL get_app_file(WCHAR *path, size_t cch, const WCHAR *name);
 BOOL get_scoped_wrap_key_name(const WCHAR *label, WCHAR *out, size_t cch);
 BOOL read_file_bytes(const WCHAR *path, BYTE **out, DWORD *out_len);
 BOOL write_file_bytes(const WCHAR *path, const BYTE *data, DWORD len);
+BOOL write_file_bytes_atomic(const WCHAR *path, const BYTE *data, DWORD len);
 BOOL write_text_utf8_file(const WCHAR *path, const WCHAR *text);
 BOOL read_utf8_text_file(const WCHAR *path, WCHAR **out);
 BOOL file_exists_w(const WCHAR *path);

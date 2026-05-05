@@ -12,7 +12,6 @@
 #include "app_profiles.h"
 #include "app_shared.h"
 #include "app_storage.h"
-#include "crypto_box.h"
 #include <bcrypt.h>
 #include <ncrypt.h>
 #include <strsafe.h>
@@ -20,11 +19,9 @@
 #define PROFILES_MAGIC 0x31505348u
 #define PROFILES_VERSION 1u
 
-static BYTE g_active_master_key[APP_PROFILE_MASTER_KEY_BYTES];
 static KEY_PROFILE g_profiles[APP_PROFILE_MAX_PROFILES];
 static int g_profile_count;
 static int g_active_profile = -1;
-static BOOL g_crypto_ready;
 
 #define MASTER_KEY_BYTES APP_PROFILE_MASTER_KEY_BYTES
 #define MAX_PROFILES APP_PROFILE_MAX_PROFILES
@@ -63,7 +60,6 @@ void profiles_clear_all(void) {
     for (int i = 0; i < g_profile_count; ++i) profiles_clear_profile(&g_profiles[i]);
     g_profile_count = 0;
     g_active_profile = -1;
-    SecureZeroMemory(g_active_master_key, sizeof(g_active_master_key));
 }
 
 static BOOL generate_profile_id(WCHAR id[33]) {
@@ -221,7 +217,7 @@ BOOL profiles_save(void) {
         BYTE *protected_blob = NULL;
         DWORD protected_len = 0;
         ok = dpapi_protect((const BYTE *)plain.data, (DWORD)plain.len, &protected_blob, &protected_len) &&
-             write_file_bytes(path, protected_blob, protected_len);
+             write_file_bytes_atomic(path, protected_blob, protected_len);
         secure_free(protected_blob, protected_len);
     }
     strb_secure_free(&plain);
@@ -354,21 +350,8 @@ BOOL profiles_activate(int index, WCHAR *err, size_t err_cch) {
         return FALSE;
     }
     if (!unwrap_profile_master_key(&g_profiles[index], err, err_cch)) return FALSE;
-    if (g_crypto_ready) {
-        crypto_box_shutdown();
-        g_crypto_ready = FALSE;
-    }
-    WCHAR state_path[MAX_PATH];
-    if (!profiles_get_state_path(&g_profiles[index], state_path, ARRAYSIZE(state_path))) {
-        set_error(err, err_cch, L"Profile state path is not available.");
-        return FALSE;
-    }
-    if (!crypto_box_init(g_profiles[index].master_key, state_path, err, err_cch)) return FALSE;
-    g_crypto_ready = TRUE;
     g_active_profile = index;
-    CopyMemory(g_active_master_key, g_profiles[index].master_key, MASTER_KEY_BYTES);
-    profiles_save();
-    return TRUE;
+    return profiles_save();
 }
 
 
@@ -389,16 +372,24 @@ KEY_PROFILE *profiles_active(void) {
     return profiles_get(g_active_profile);
 }
 
-BOOL profiles_build_key_package(BYTE **out, DWORD *out_len, WCHAR *err, size_t err_cch) {
-    *out = NULL;
-    *out_len = 0;
-    if (g_active_profile < 0 || g_active_profile >= g_profile_count) {
-        set_error(err, err_cch, L"No active profile is selected.");
+BOOL profiles_open_crypto(int index, CRYPTO_BOX **out, WCHAR *err, size_t err_cch) {
+    if (!out) {
+        set_error(err, err_cch, L"Invalid crypto context output.");
         return FALSE;
     }
-    KEY_PROFILE *profile = &g_profiles[g_active_profile];
+    *out = NULL;
+    if (index < 0 || index >= g_profile_count) {
+        set_error(err, err_cch, L"Requested profile index is out of range.");
+        return FALSE;
+    }
+    KEY_PROFILE *profile = &g_profiles[index];
     if (!profile->master_loaded && !unwrap_profile_master_key(profile, err, err_cch)) return FALSE;
-    return crypto_box_export_contact_package(out, out_len, err, err_cch);
+    WCHAR state_path[MAX_PATH];
+    if (!profiles_get_state_path(profile, state_path, ARRAYSIZE(state_path))) {
+        set_error(err, err_cch, L"Profile state path is not available.");
+        return FALSE;
+    }
+    return crypto_box_open(profile->master_key, state_path, out, err, err_cch);
 }
 
 BOOL profiles_append_imported(KEY_PROFILE *profile, int *index_out, WCHAR *err, size_t err_cch) {
@@ -427,9 +418,5 @@ void profiles_remove_at(int index) {
 }
 
 void profiles_shutdown(void) {
-    if (g_crypto_ready) {
-        crypto_box_shutdown();
-        g_crypto_ready = FALSE;
-    }
     profiles_clear_all();
 }
