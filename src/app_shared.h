@@ -35,34 +35,34 @@ void xfree(void *ptr);
 void secure_free(void *ptr, SIZE_T bytes);
 void secure_free_wide(WCHAR *ptr);
 void secure_free_str(char *ptr);
-void set_error(WCHAR *buf, size_t cch, const WCHAR *fmt, ...);
+void set_error(WCHAR *error_buffer, size_t cch, const WCHAR *fmt, ...);
 
-BOOL strb_reserve(STRB *b, size_t extra);
-BOOL strb_append_n(STRB *b, const char *s, size_t n);
-BOOL strb_append(STRB *b, const char *s);
-BOOL strb_appendf(STRB *b, const char *fmt, ...);
-void strb_free(STRB *b);
-void strb_secure_free(STRB *b);
+BOOL strb_reserve(STRB *builder, size_t extra);
+BOOL strb_append_n(STRB *builder, const char *s, size_t n);
+BOOL strb_append(STRB *builder, const char *s);
+BOOL strb_appendf(STRB *builder, const char *fmt, ...);
+void strb_free(STRB *builder);
+void strb_secure_free(STRB *builder);
 
-BOOL wstrb_reserve(WSTRB *b, size_t extra);
-BOOL wstrb_append_n(WSTRB *b, const WCHAR *s, size_t n);
-BOOL wstrb_append(WSTRB *b, const WCHAR *s);
-BOOL wstrb_append_char(WSTRB *b, WCHAR ch);
-BOOL wstrb_appendf(WSTRB *b, const WCHAR *fmt, ...);
-void wstrb_free(WSTRB *b);
-void wstrb_secure_free(WSTRB *b);
+BOOL wstrb_reserve(WSTRB *builder, size_t extra);
+BOOL wstrb_append_n(WSTRB *builder, const WCHAR *s, size_t n);
+BOOL wstrb_append(WSTRB *builder, const WCHAR *s);
+BOOL wstrb_append_char(WSTRB *builder, WCHAR ch);
+BOOL wstrb_appendf(WSTRB *builder, const WCHAR *fmt, ...);
+void wstrb_free(WSTRB *builder);
+void wstrb_secure_free(WSTRB *builder);
 
 BOOL wide_to_utf8(const WCHAR *ws, char **out, int *out_len);
 BOOL utf8_to_wide_n(const char *s, int len, WCHAR **out);
-BOOL append_json_escaped_wide(STRB *b, const WCHAR *ws);
+BOOL append_json_escaped_wide(STRB *json_builder, const WCHAR *ws);
 
 void strip_last_path_component_early(WCHAR *path);
 BOOL get_app_dir(WCHAR *path, size_t cch);
 BOOL get_app_file(WCHAR *path, size_t cch, const WCHAR *name);
 BOOL get_scoped_wrap_key_name(const WCHAR *label, WCHAR *out, size_t cch);
 BOOL read_file_bytes(const WCHAR *path, BYTE **out, DWORD *out_len);
-BOOL write_file_bytes(const WCHAR *path, const BYTE *data, DWORD len);
-BOOL write_file_bytes_atomic(const WCHAR *path, const BYTE *data, DWORD len);
+BOOL write_file_bytes(const WCHAR *path, const BYTE *bytes, DWORD len);
+BOOL write_file_bytes_atomic(const WCHAR *path, const BYTE *bytes, DWORD len);
 BOOL write_text_utf8_file(const WCHAR *path, const WCHAR *text);
 BOOL read_utf8_text_file(const WCHAR *path, WCHAR **out);
 BOOL file_exists_w(const WCHAR *path);
@@ -75,6 +75,6 @@ BOOL make_temp_path(WCHAR *path, size_t cch);
 void secure_delete_file(const WCHAR *path);
 BOOL append_quoted_arg(WSTRB *cmd, const WCHAR *arg);
 BOOL append_process_log(WCHAR *err, size_t err_cch, const WCHAR *prefix, const WCHAR *log_path);
-BOOL write_all_handle(HANDLE h, const void *data, DWORD len);
+BOOL write_all_handle(HANDLE h, const void *bytes, DWORD len);
 
 #endif

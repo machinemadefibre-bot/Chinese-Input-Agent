@@ -84,9 +84,9 @@ static void post_status(int pos, const WCHAR *text) {
     }
 }
 
-static void post_done(BOOL ok, const WCHAR *text) {
+static void post_done(BOOL install_succeeded, const WCHAR *text) {
     WCHAR *copy = dup_wide(text ? text : L"");
-    if (!copy || !PostMessageW(GetParent(g_status), WM_APP_INSTALL_DONE, (WPARAM)ok, (LPARAM)copy)) {
+    if (!copy || !PostMessageW(GetParent(g_status), WM_APP_INSTALL_DONE, (WPARAM)install_succeeded, (LPARAM)copy)) {
         xfree(copy);
     }
 }
@@ -106,9 +106,9 @@ static void default_install_path(WCHAR *out, size_t cch) {
         StringCchCopyW(out, cch, L"C:\\ChineseInputAgent");
         return;
     }
-    WCHAR tmp[MAX_PATH];
-    StringCchCopyW(tmp, ARRAYSIZE(tmp), out);
-    join_path(out, cch, tmp, L"ChineseInputAgent");
+    WCHAR base_path[MAX_PATH];
+    StringCchCopyW(base_path, ARRAYSIZE(base_path), out);
+    join_path(out, cch, base_path, L"ChineseInputAgent");
 }
 
 static BOOL directory_has_anything(const WCHAR *path) {
@@ -187,8 +187,8 @@ static BOOL extract_embedded_zip(const WCHAR *zip_path, WCHAR *err, size_t err_c
         return FALSE;
     }
 
-    BYTE *buf = (BYTE *)xalloc(1024 * 1024);
-    if (!buf) {
+    BYTE *copy_buffer = (BYTE *)xalloc(1024 * 1024);
+    if (!copy_buffer) {
         fclose(zip);
         fclose(self);
         StringCchCopyW(err, err_cch, L"内存不足。");
@@ -196,26 +196,26 @@ static BOOL extract_embedded_zip(const WCHAR *zip_path, WCHAR *err, size_t err_c
     }
 
     uint64_t left = trailer.size;
-    uint64_t done = 0;
+    uint64_t bytes_copied = 0;
     while (left > 0) {
         size_t chunk = left > 1024 * 1024 ? 1024 * 1024 : (size_t)left;
-        size_t read = fread(buf, 1, chunk, self);
-        if (read != chunk || fwrite(buf, 1, chunk, zip) != chunk) {
-            xfree(buf);
+        size_t bytes_read = fread(copy_buffer, 1, chunk, self);
+        if (bytes_read != chunk || fwrite(copy_buffer, 1, chunk, zip) != chunk) {
+            xfree(copy_buffer);
             fclose(zip);
             fclose(self);
             StringCchCopyW(err, err_cch, L"写出临时压缩包失败。");
             return FALSE;
         }
         left -= chunk;
-        done += chunk;
+        bytes_copied += chunk;
         if (trailer.size > 0) {
-            int pos = 5 + (int)((done * 25) / trailer.size);
+            int pos = 5 + (int)((bytes_copied * 25) / trailer.size);
             post_status(pos, L"正在准备内嵌 portable 包...");
         }
     }
 
-    xfree(buf);
+    xfree(copy_buffer);
     fclose(zip);
     fclose(self);
     return TRUE;
@@ -273,11 +273,11 @@ static BOOL write_expand_script(const WCHAR *script_path, const WCHAR *zip_path,
     WORD bom = 0xFEFF;
     DWORD written = 0;
     DWORD content_bytes = (DWORD)(wcslen(content) * sizeof(WCHAR));
-    BOOL ok = WriteFile(h, &bom, sizeof(bom), &written, NULL) && written == sizeof(bom) &&
-              WriteFile(h, content, content_bytes, &written, NULL) && written == content_bytes;
+    BOOL write_succeeded = WriteFile(h, &bom, sizeof(bom), &written, NULL) && written == sizeof(bom) &&
+                           WriteFile(h, content, content_bytes, &written, NULL) && written == content_bytes;
     CloseHandle(h);
-    if (!ok) StringCchCopyW(err, err_cch, L"写入临时解压脚本失败。");
-    return ok;
+    if (!write_succeeded) StringCchCopyW(err, err_cch, L"写入临时解压脚本失败。");
+    return write_succeeded;
 }
 
 static BOOL run_powershell_script(const WCHAR *script_path, WCHAR *err, size_t err_cch) {
@@ -493,11 +493,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
     }
     case WM_APP_INSTALL_DONE: {
         WCHAR *text = (WCHAR *)lparam;
-        BOOL ok = (BOOL)wparam;
+        BOOL install_succeeded = (BOOL)wparam;
         EnableWindow(g_install_button, TRUE);
         EnableWindow(g_close_button, TRUE);
         EnableWindow(g_path_edit, TRUE);
-        if (ok) {
+        if (install_succeeded) {
             SetWindowTextW(g_status, L"安装完成。");
             SendMessageW(g_progress, PBM_SETPOS, 100, 0);
             if (Button_GetCheck(g_launch_check) == BST_CHECKED && text && text[0]) {

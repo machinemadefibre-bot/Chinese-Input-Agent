@@ -89,28 +89,28 @@ static BOOL read_line_handle_cancelable(HANDLE h, HANDLE process, STRB *line, BO
     }
 }
 
-static BOOL append_json_wide_field(STRB *b, const char *name, const WCHAR *value, BOOL comma) {
-    if (comma && !strb_append(b, ",")) return FALSE;
-    return strb_append(b, "\"") &&
-           strb_append(b, name) &&
-           strb_append(b, "\":\"") &&
-           append_json_escaped_wide(b, value ? value : L"") &&
-           strb_append(b, "\"");
+static BOOL append_json_wide_field(STRB *request_builder, const char *name, const WCHAR *value, BOOL comma) {
+    if (comma && !strb_append(request_builder, ",")) return FALSE;
+    return strb_append(request_builder, "\"") &&
+           strb_append(request_builder, name) &&
+           strb_append(request_builder, "\":\"") &&
+           append_json_escaped_wide(request_builder, value ? value : L"") &&
+           strb_append(request_builder, "\"");
 }
 
-static BOOL build_worker_request_json(STRB *b, DWORD id, const char *cmd,
+static BOOL build_worker_request_json(STRB *request_builder, DWORD id, const char *cmd,
                                       const WCHAR *payload_path, const WCHAR *text_path,
                                       const WCHAR *topic_path, const WCHAR *seed,
                                       const WCHAR *out_path, int tail_tokens) {
-    ZeroMemory(b, sizeof(*b));
-    if (!strb_appendf(b, "{\"id\":%lu,\"cmd\":\"%s\"", (unsigned long)id, cmd)) return FALSE;
-    if (payload_path && !append_json_wide_field(b, "payload", payload_path, TRUE)) return FALSE;
-    if (text_path && !append_json_wide_field(b, "text", text_path, TRUE)) return FALSE;
-    if (topic_path && !append_json_wide_field(b, "topic_file", topic_path, TRUE)) return FALSE;
-    if (seed && !append_json_wide_field(b, "seed", seed, TRUE)) return FALSE;
-    if (out_path && !append_json_wide_field(b, "out", out_path, TRUE)) return FALSE;
-    if (tail_tokens >= 0 && !strb_appendf(b, ",\"tail_tokens\":%d", tail_tokens)) return FALSE;
-    return strb_append(b, "}\n");
+    ZeroMemory(request_builder, sizeof(*request_builder));
+    if (!strb_appendf(request_builder, "{\"id\":%lu,\"cmd\":\"%s\"", (unsigned long)id, cmd)) return FALSE;
+    if (payload_path && !append_json_wide_field(request_builder, "payload", payload_path, TRUE)) return FALSE;
+    if (text_path && !append_json_wide_field(request_builder, "text", text_path, TRUE)) return FALSE;
+    if (topic_path && !append_json_wide_field(request_builder, "topic_file", topic_path, TRUE)) return FALSE;
+    if (seed && !append_json_wide_field(request_builder, "seed", seed, TRUE)) return FALSE;
+    if (out_path && !append_json_wide_field(request_builder, "out", out_path, TRUE)) return FALSE;
+    if (tail_tokens >= 0 && !strb_appendf(request_builder, ",\"tail_tokens\":%d", tail_tokens)) return FALSE;
+    return strb_append(request_builder, "}\n");
 }
 
 static BOOL response_json_ok(const char *line) {
@@ -167,20 +167,20 @@ static int hex_value(char ch) {
     return -1;
 }
 
-static BOOL strb_append_utf8_codepoint(STRB *b, unsigned cp) {
-    char tmp[4];
-    size_t n = 0;
+static BOOL strb_append_utf8_codepoint(STRB *utf8_builder, unsigned cp) {
+    char utf8_chunk[4];
+    size_t chunk_len = 0;
     if (cp <= 0x7f) {
-        tmp[n++] = (char)cp;
+        utf8_chunk[chunk_len++] = (char)cp;
     } else if (cp <= 0x7ff) {
-        tmp[n++] = (char)(0xc0 | (cp >> 6));
-        tmp[n++] = (char)(0x80 | (cp & 0x3f));
+        utf8_chunk[chunk_len++] = (char)(0xc0 | (cp >> 6));
+        utf8_chunk[chunk_len++] = (char)(0x80 | (cp & 0x3f));
     } else {
-        tmp[n++] = (char)(0xe0 | (cp >> 12));
-        tmp[n++] = (char)(0x80 | ((cp >> 6) & 0x3f));
-        tmp[n++] = (char)(0x80 | (cp & 0x3f));
+        utf8_chunk[chunk_len++] = (char)(0xe0 | (cp >> 12));
+        utf8_chunk[chunk_len++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        utf8_chunk[chunk_len++] = (char)(0x80 | (cp & 0x3f));
     }
-    return strb_append_n(b, tmp, n);
+    return strb_append_n(utf8_builder, utf8_chunk, chunk_len);
 }
 
 static BOOL json_get_wide_string_field(const char *line, const char *name, WCHAR **out) {
@@ -191,58 +191,58 @@ static BOOL json_get_wide_string_field(const char *line, const char *name, WCHAR
     const char *p = strstr(line, pattern);
     if (!p) return FALSE;
     p += strlen(pattern);
-    STRB utf8 = {0};
-    BOOL ok = TRUE;
+    STRB utf8_builder = {0};
+    BOOL parse_succeeded = TRUE;
     while (*p && *p != '"') {
         if (*p == '\\') {
             ++p;
-            if (!*p) { ok = FALSE; break; }
+            if (!*p) { parse_succeeded = FALSE; break; }
             switch (*p) {
-            case '"': ok = strb_append_n(&utf8, "\"", 1); break;
-            case '\\': ok = strb_append_n(&utf8, "\\", 1); break;
-            case '/': ok = strb_append_n(&utf8, "/", 1); break;
-            case 'b': ok = strb_append_n(&utf8, "\b", 1); break;
-            case 'f': ok = strb_append_n(&utf8, "\f", 1); break;
-            case 'n': ok = strb_append_n(&utf8, "\n", 1); break;
-            case 'r': ok = strb_append_n(&utf8, "\r", 1); break;
-            case 't': ok = strb_append_n(&utf8, "\t", 1); break;
+            case '"': parse_succeeded = strb_append_n(&utf8_builder, "\"", 1); break;
+            case '\\': parse_succeeded = strb_append_n(&utf8_builder, "\\", 1); break;
+            case '/': parse_succeeded = strb_append_n(&utf8_builder, "/", 1); break;
+            case 'b': parse_succeeded = strb_append_n(&utf8_builder, "\b", 1); break;
+            case 'f': parse_succeeded = strb_append_n(&utf8_builder, "\f", 1); break;
+            case 'n': parse_succeeded = strb_append_n(&utf8_builder, "\n", 1); break;
+            case 'r': parse_succeeded = strb_append_n(&utf8_builder, "\r", 1); break;
+            case 't': parse_succeeded = strb_append_n(&utf8_builder, "\t", 1); break;
             case 'u': {
                 unsigned cp = 0;
                 for (int i = 0; i < 4; ++i) {
-                    if (!p[1 + i]) { ok = FALSE; break; }
+                    if (!p[1 + i]) { parse_succeeded = FALSE; break; }
                     int h = hex_value(p[1 + i]);
-                    if (h < 0) { ok = FALSE; break; }
+                    if (h < 0) { parse_succeeded = FALSE; break; }
                     cp = (cp << 4) | (unsigned)h;
                 }
-                if (ok) {
-                    ok = strb_append_utf8_codepoint(&utf8, cp);
+                if (parse_succeeded) {
+                    parse_succeeded = strb_append_utf8_codepoint(&utf8_builder, cp);
                     p += 4;
                 }
                 break;
             }
             default:
-                ok = FALSE;
+                parse_succeeded = FALSE;
                 break;
             }
-            if (!ok) break;
+            if (!parse_succeeded) break;
             ++p;
             continue;
         }
-        ok = strb_append_n(&utf8, p, 1);
-        if (!ok) break;
+        parse_succeeded = strb_append_n(&utf8_builder, p, 1);
+        if (!parse_succeeded) break;
         ++p;
     }
-    if (ok && *p != '"') ok = FALSE;
-    if (ok) {
-        if (utf8.len == 0) {
+    if (parse_succeeded && *p != '"') parse_succeeded = FALSE;
+    if (parse_succeeded) {
+        if (utf8_builder.len == 0) {
             *out = llm_dup_wide(L"");
-            ok = *out != NULL;
+            parse_succeeded = *out != NULL;
         } else {
-            ok = utf8_to_wide_n(utf8.data, (int)utf8.len, out);
+            parse_succeeded = utf8_to_wide_n(utf8_builder.data, (int)utf8_builder.len, out);
         }
     }
-    strb_free(&utf8);
-    return ok;
+    strb_free(&utf8_builder);
+    return parse_succeeded;
 }
 
 static BOOL ensure_local_llm_job(void) {
@@ -423,7 +423,7 @@ static BOOL local_llm_worker_request(const char *cmd, const WCHAR *payload_path,
         set_error(err, err_cch, L"Local top-k worker manager is not initialized.");
         return FALSE;
     }
-    BOOL ok = FALSE;
+    BOOL request_succeeded = FALSE;
     EnterCriticalSection(&g_llm_worker.lock);
     if (app_llm_cancelled()) {
         set_error(err, err_cch, L"\u5df2\u505c\u6b62\u3002");
@@ -477,14 +477,14 @@ static BOOL local_llm_worker_request(const char *cmd, const WCHAR *payload_path,
         }
         if (json_line_has_string(response.data, "type", "progress")) {
             if (progress_target && IsWindow(progress_target)) {
-                size_t done = 0, total = 0;
+                size_t tokens_done = 0, tokens_total = 0;
                 double tps = 0.0;
                 WCHAR *partial = NULL;
-                json_get_size_t_field(response.data, "done", &done);
-                json_get_size_t_field(response.data, "total", &total);
+                json_get_size_t_field(response.data, "done", &tokens_done);
+                json_get_size_t_field(response.data, "total", &tokens_total);
                 json_get_double_field(response.data, "tps", &tps);
                 if (json_get_wide_string_field(response.data, "text", &partial)) {
-                    if (g_progress_fn) g_progress_fn(progress_target, partial, done, total, tps);
+                    if (g_progress_fn) g_progress_fn(progress_target, partial, tokens_done, tokens_total, tps);
                     secure_free_wide(partial);
                 }
             }
@@ -492,7 +492,7 @@ static BOOL local_llm_worker_request(const char *cmd, const WCHAR *payload_path,
             continue;
         }
         if (response_json_ok(response.data)) {
-            ok = TRUE;
+            request_succeeded = TRUE;
         } else {
             WCHAR *worker_error = NULL;
             WCHAR *response_w = NULL;
@@ -510,7 +510,7 @@ static BOOL local_llm_worker_request(const char *cmd, const WCHAR *payload_path,
         break;
     }
     LeaveCriticalSection(&g_llm_worker.lock);
-    return ok;
+    return request_succeeded;
 }
 
 static DWORD WINAPI local_llm_boot_thread_proc(LPVOID param) {
@@ -596,15 +596,16 @@ BOOL local_topk_encode_payload(const BYTE *payload, DWORD payload_len, const WCH
     }
 
     if (prefix && prefix[0]) {
-        WSTRB b = {0};
-        if (!wstrb_append(&b, prefix) || !wstrb_append(&b, carrier)) {
+        WSTRB carrier_builder = {0};
+        if (!wstrb_append(&carrier_builder, prefix) || !wstrb_append(&carrier_builder, carrier)) {
             secure_free_wide(carrier);
-            wstrb_free(&b);
+            wstrb_free(&carrier_builder);
             set_error(err, err_cch, L"Carrier text assembly failed.");
             goto fail;
         }
         secure_free_wide(carrier);
-        *out = b.data;
+        *out = carrier_builder.data;
+        carrier_builder.data = NULL;
     } else {
         *out = carrier;
     }

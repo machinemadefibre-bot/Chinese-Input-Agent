@@ -16,7 +16,7 @@
 #include <stddef.h>
 
 typedef BOOL (*APP_LLM_CANCEL_FN)(void);
-typedef void (*APP_LLM_PROGRESS_FN)(HWND target_textbox, const WCHAR *partial, size_t done, size_t total, double tps);
+typedef void (*APP_LLM_PROGRESS_FN)(HWND target_textbox, const WCHAR *partial, size_t tokens_done, size_t tokens_total, double tps);
 
 void app_llm_init(APP_LLM_CANCEL_FN cancel_fn, APP_LLM_PROGRESS_FN progress_fn);
 void app_llm_cleanup(void);

@@ -148,22 +148,22 @@ static BOOL wrap_profile_master_key(const BYTE master_key[MASTER_KEY_BYTES], BYT
         set_error(err, err_cch, L"\u4e3b\u5bc6\u94a5\u4fdd\u62a4\u5931\u8d25\u3002");
         return FALSE;
     }
-    BYTE *buf = (BYTE *)xalloc(cb);
-    if (!buf) {
+    BYTE *wrapped_key = (BYTE *)xalloc(cb);
+    if (!wrapped_key) {
         NCryptFreeObject(key);
         NCryptFreeObject(provider);
         set_error(err, err_cch, L"\u5185\u5b58\u4e0d\u8db3\u3002");
         return FALSE;
     }
-    ss = NCryptEncrypt(key, (PBYTE)master_key, MASTER_KEY_BYTES, &padding, buf, cb, &cb, NCRYPT_PAD_OAEP_FLAG);
+    ss = NCryptEncrypt(key, (PBYTE)master_key, MASTER_KEY_BYTES, &padding, wrapped_key, cb, &cb, NCRYPT_PAD_OAEP_FLAG);
     NCryptFreeObject(key);
     NCryptFreeObject(provider);
     if (ss != ERROR_SUCCESS) {
-        secure_free(buf, cb);
+        secure_free(wrapped_key, cb);
         set_error(err, err_cch, L"\u4e3b\u5bc6\u94a5\u4fdd\u62a4\u5931\u8d25\u3002");
         return FALSE;
     }
-    *out = buf;
+    *out = wrapped_key;
     *out_len = cb;
     return TRUE;
 }
@@ -193,35 +193,35 @@ static BOOL unwrap_profile_master_key(KEY_PROFILE *profile, WCHAR *err, size_t e
 BOOL profiles_save(void) {
     WCHAR path[MAX_PATH];
     if (!get_profiles_path(path, ARRAYSIZE(path))) return FALSE;
-    STRB plain = {0};
-    BOOL ok = TRUE;
+    STRB profile_db_plain = {0};
+    BYTE *protected_blob = NULL;
+    DWORD protected_len = 0;
+    BOOL profile_db_written = FALSE;
     DWORD v = PROFILES_MAGIC;
-    ok = ok && strb_append_n(&plain, (const char *)&v, sizeof(v));
+    if (!strb_append_n(&profile_db_plain, (const char *)&v, sizeof(v))) goto cleanup;
     v = PROFILES_VERSION;
-    ok = ok && strb_append_n(&plain, (const char *)&v, sizeof(v));
+    if (!strb_append_n(&profile_db_plain, (const char *)&v, sizeof(v))) goto cleanup;
     v = (DWORD)g_profile_count;
-    ok = ok && strb_append_n(&plain, (const char *)&v, sizeof(v));
+    if (!strb_append_n(&profile_db_plain, (const char *)&v, sizeof(v))) goto cleanup;
     WCHAR active_id[33] = L"";
     if (g_active_profile >= 0 && g_active_profile < g_profile_count) {
         StringCchCopyW(active_id, ARRAYSIZE(active_id), g_profiles[g_active_profile].id);
     }
-    ok = ok && strb_append_n(&plain, (const char *)active_id, sizeof(active_id));
-    for (int i = 0; i < g_profile_count && ok; ++i) {
-        ok = ok && strb_append_n(&plain, (const char *)g_profiles[i].id, sizeof(g_profiles[i].id));
-        ok = ok && strb_append_n(&plain, (const char *)g_profiles[i].name, sizeof(g_profiles[i].name));
-        v = g_profiles[i].wrapped_key_len;
-        ok = ok && strb_append_n(&plain, (const char *)&v, sizeof(v));
-        ok = ok && strb_append_n(&plain, (const char *)g_profiles[i].wrapped_key, g_profiles[i].wrapped_key_len);
+    if (!strb_append_n(&profile_db_plain, (const char *)active_id, sizeof(active_id))) goto cleanup;
+    for (int profile_idx = 0; profile_idx < g_profile_count; ++profile_idx) {
+        KEY_PROFILE *profile = &g_profiles[profile_idx];
+        if (!strb_append_n(&profile_db_plain, (const char *)profile->id, sizeof(profile->id))) goto cleanup;
+        if (!strb_append_n(&profile_db_plain, (const char *)profile->name, sizeof(profile->name))) goto cleanup;
+        v = profile->wrapped_key_len;
+        if (!strb_append_n(&profile_db_plain, (const char *)&v, sizeof(v))) goto cleanup;
+        if (!strb_append_n(&profile_db_plain, (const char *)profile->wrapped_key, profile->wrapped_key_len)) goto cleanup;
     }
-    if (ok) {
-        BYTE *protected_blob = NULL;
-        DWORD protected_len = 0;
-        ok = dpapi_protect((const BYTE *)plain.data, (DWORD)plain.len, &protected_blob, &protected_len) &&
-             write_file_bytes_atomic(path, protected_blob, protected_len);
-        secure_free(protected_blob, protected_len);
-    }
-    strb_secure_free(&plain);
-    return ok;
+    profile_db_written = dpapi_protect((const BYTE *)profile_db_plain.data, (DWORD)profile_db_plain.len, &protected_blob, &protected_len) &&
+                         write_file_bytes_atomic(path, protected_blob, protected_len);
+cleanup:
+    secure_free(protected_blob, protected_len);
+    strb_secure_free(&profile_db_plain);
+    return profile_db_written;
 }
 
 BOOL profiles_create_from_master(const WCHAR *name, const BYTE master_key[MASTER_KEY_BYTES], KEY_PROFILE *out, WCHAR *err, size_t err_cch) {
@@ -254,15 +254,15 @@ static BOOL create_default_profile(WCHAR *err, size_t err_cch) {
         set_error(err, err_cch, L"Random generation failed while creating the default profile.");
         return FALSE;
     }
-    BOOL ok = profiles_create_from_master(L"\u9ed8\u8ba4\u5bc6\u94a5", master, &g_profiles[0], err, err_cch);
+    BOOL default_profile_created = profiles_create_from_master(L"\u9ed8\u8ba4\u5bc6\u94a5", master, &g_profiles[0], err, err_cch);
     SecureZeroMemory(master, sizeof(master));
-    if (!ok) return FALSE;
+    if (!default_profile_created) return FALSE;
     g_profile_count = 1;
     g_active_profile = 0;
-    ok = profiles_save();
+    BOOL profile_db_saved = profiles_save();
     SecureZeroMemory(g_profiles[0].master_key, sizeof(g_profiles[0].master_key));
     g_profiles[0].master_loaded = FALSE;
-    return ok;
+    return profile_db_saved;
 }
 
 BOOL profiles_load(WCHAR *err, size_t err_cch) {
@@ -272,62 +272,64 @@ BOOL profiles_load(WCHAR *err, size_t err_cch) {
         return FALSE;
     }
     BOOL profile_file_exists = file_exists_w(path);
-    BYTE *data = NULL;
-    DWORD data_len = 0;
-    if (!read_file_bytes(path, &data, &data_len)) {
+    BYTE *profile_blob = NULL;
+    DWORD profile_blob_len = 0;
+    if (!read_file_bytes(path, &profile_blob, &profile_blob_len)) {
         if (profile_file_exists) {
             set_error(err, err_cch, L"Profile database exists but could not be read.");
             return FALSE;
         }
         return create_default_profile(err, err_cch);
     }
-    BYTE *plain = NULL;
-    DWORD plain_len = 0;
-    if (!dpapi_unprotect(data, data_len, &plain, &plain_len)) {
-        secure_free(data, data_len);
+    BYTE *profile_plain = NULL;
+    DWORD profile_plain_len = 0;
+    if (!dpapi_unprotect(profile_blob, profile_blob_len, &profile_plain, &profile_plain_len)) {
+        secure_free(profile_blob, profile_blob_len);
         set_error(err, err_cch, L"Profile database could not be decrypted. The file may belong to another Windows account or be corrupted.");
         return FALSE;
     }
-    const BYTE *p = plain;
-    const BYTE *end = plain + plain_len;
+    const BYTE *cursor = profile_plain;
+    const BYTE *plain_end = profile_plain + profile_plain_len;
     DWORD magic = 0, version = 0, count = 0;
     WCHAR active_id[33] = L"";
-    BOOL ok = read_u32_mem(&p, end, &magic) &&
-              read_u32_mem(&p, end, &version) &&
-              read_u32_mem(&p, end, &count) &&
-              read_bytes_mem(&p, end, active_id, sizeof(active_id)) &&
-              magic == PROFILES_MAGIC &&
-              version == PROFILES_VERSION &&
-              count <= MAX_PROFILES;
-    if (!ok) {
-        secure_free(data, data_len);
-        secure_free(plain, plain_len);
+    BOOL header_parsed = read_u32_mem(&cursor, plain_end, &magic) &&
+                         read_u32_mem(&cursor, plain_end, &version) &&
+                         read_u32_mem(&cursor, plain_end, &count) &&
+                         read_bytes_mem(&cursor, plain_end, active_id, sizeof(active_id)) &&
+                         magic == PROFILES_MAGIC &&
+                         version == PROFILES_VERSION &&
+                         count <= MAX_PROFILES;
+    if (!header_parsed) {
+        secure_free(profile_blob, profile_blob_len);
+        secure_free(profile_plain, profile_plain_len);
         set_error(err, err_cch, L"Profile database header is invalid or unsupported.");
         return FALSE;
     }
     profiles_clear_all();
-    for (DWORD i = 0; i < count; ++i) {
+    BOOL records_parsed = TRUE;
+    for (DWORD profile_idx = 0; profile_idx < count; ++profile_idx) {
         DWORD wrapped_len = 0;
-        ok = read_bytes_mem(&p, end, g_profiles[i].id, sizeof(g_profiles[i].id)) &&
-             read_bytes_mem(&p, end, g_profiles[i].name, sizeof(g_profiles[i].name)) &&
-             read_u32_mem(&p, end, &wrapped_len) &&
-             wrapped_len > 0 && (size_t)(end - p) >= wrapped_len;
-        if (!ok) break;
-        g_profiles[i].id[32] = L'\0';
-        g_profiles[i].name[ARRAYSIZE(g_profiles[i].name) - 1] = L'\0';
-        g_profiles[i].wrapped_key = (BYTE *)xalloc(wrapped_len);
-        if (!g_profiles[i].wrapped_key) {
-            ok = FALSE;
+        KEY_PROFILE *profile = &g_profiles[profile_idx];
+        records_parsed = read_bytes_mem(&cursor, plain_end, profile->id, sizeof(profile->id)) &&
+                         read_bytes_mem(&cursor, plain_end, profile->name, sizeof(profile->name)) &&
+                         read_u32_mem(&cursor, plain_end, &wrapped_len) &&
+                         wrapped_len > 0 && (size_t)(plain_end - cursor) >= wrapped_len;
+        if (!records_parsed) break;
+        profile->id[32] = L'\0';
+        profile->name[ARRAYSIZE(profile->name) - 1] = L'\0';
+        profile->wrapped_key = (BYTE *)xalloc(wrapped_len);
+        if (!profile->wrapped_key) {
+            records_parsed = FALSE;
             break;
         }
-        g_profiles[i].wrapped_key_len = wrapped_len;
-        CopyMemory(g_profiles[i].wrapped_key, p, wrapped_len);
-        p += wrapped_len;
+        profile->wrapped_key_len = wrapped_len;
+        CopyMemory(profile->wrapped_key, cursor, wrapped_len);
+        cursor += wrapped_len;
     }
-    BOOL consumed_all = (p == end);
-    secure_free(data, data_len);
-    secure_free(plain, plain_len);
-    if (!ok || !consumed_all) {
+    BOOL consumed_all_records = (cursor == plain_end);
+    secure_free(profile_blob, profile_blob_len);
+    secure_free(profile_plain, profile_plain_len);
+    if (!records_parsed || !consumed_all_records) {
         profiles_clear_all();
         set_error(err, err_cch, L"Profile database is truncated or contains invalid records.");
         return FALSE;

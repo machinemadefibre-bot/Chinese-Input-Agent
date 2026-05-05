@@ -35,13 +35,13 @@ static WCHAR *flow_dup_wide(const WCHAR *s) {
     return copy;
 }
 
-static BOOL append_hex_bytes(WCHAR *dst, size_t dst_cch, size_t offset, const BYTE *data, DWORD len) {
+static BOOL append_hex_bytes(WCHAR *dst, size_t dst_cch, size_t offset, const BYTE *bytes, DWORD len) {
     static const WCHAR hex[] = L"0123456789abcdef";
-    if (!dst || !data || dst_cch <= offset || (dst_cch - offset) < (size_t)len * 2 + 1) return FALSE;
+    if (!dst || !bytes || dst_cch <= offset || (dst_cch - offset) < (size_t)len * 2 + 1) return FALSE;
     WCHAR *p = dst + offset;
     for (DWORD i = 0; i < len; ++i) {
-        p[i * 2] = hex[(data[i] >> 4) & 0xf];
-        p[i * 2 + 1] = hex[data[i] & 0xf];
+        p[i * 2] = hex[(bytes[i] >> 4) & 0xf];
+        p[i * 2 + 1] = hex[bytes[i] & 0xf];
     }
     p[(size_t)len * 2] = L'\0';
     return TRUE;
@@ -51,9 +51,9 @@ static BOOL format_topk_seed_from_public_key(WCHAR *seed, size_t seed_cch, const
                                              DWORD public_key_len, WCHAR *err, size_t err_cch) {
     const WCHAR prefix[] = L"ChineseInputAgent top-k payload seed v1:";
     size_t prefix_len = wcslen(prefix);
-    BOOL ok = SUCCEEDED(StringCchCopyW(seed, seed_cch, prefix)) &&
-              append_hex_bytes(seed, seed_cch, prefix_len, public_key, public_key_len);
-    if (!ok) {
+    BOOL seed_built = SUCCEEDED(StringCchCopyW(seed, seed_cch, prefix)) &&
+                      append_hex_bytes(seed, seed_cch, prefix_len, public_key, public_key_len);
+    if (!seed_built) {
         set_error(err, err_cch, L"Failed to build top-k seed from contact public key.");
         return FALSE;
     }
@@ -67,16 +67,16 @@ static BOOL get_message_topk_seed(CRYPTO_BOX *box, WCHAR *seed, size_t seed_cch,
     WCHAR local_err[256] = L"";
     if (prefer_remote &&
         crypto_box_get_remote_public_key(box, &public_key, &public_key_len, local_err, ARRAYSIZE(local_err))) {
-        BOOL ok = format_topk_seed_from_public_key(seed, seed_cch, public_key, public_key_len, err, err_cch);
+        BOOL remote_seed_built = format_topk_seed_from_public_key(seed, seed_cch, public_key, public_key_len, err, err_cch);
         xfree(public_key);
-        return ok;
+        return remote_seed_built;
     }
     if (!crypto_box_get_public_key(box, &public_key, &public_key_len, err, err_cch)) {
         return FALSE;
     }
-    BOOL ok = format_topk_seed_from_public_key(seed, seed_cch, public_key, public_key_len, err, err_cch);
+    BOOL local_seed_built = format_topk_seed_from_public_key(seed, seed_cch, public_key, public_key_len, err, err_cch);
     xfree(public_key);
-    return ok;
+    return local_seed_built;
 }
 
 static BOOL decrypt_sealed_with_box(CRYPTO_BOX *box, const BYTE *sealed, DWORD sealed_len,
@@ -154,10 +154,10 @@ BOOL app_flow_encrypt_message(CRYPTO_BOX *box, const WCHAR *plain, const WCHAR *
         return FALSE;
     }
 
-    BOOL ok = local_topk_encode_payload(sealed, sealed_len, seed, topic, NULL, -1,
-                                        progress_target, out, err, err_cch);
+    BOOL carrier_encoded = local_topk_encode_payload(sealed, sealed_len, seed, topic, NULL, -1,
+                                                     progress_target, out, err, err_cch);
     secure_free(sealed, sealed_len);
-    return ok;
+    return carrier_encoded;
 }
 
 BOOL app_flow_export_key(CRYPTO_BOX *box, HWND progress_target, WCHAR **out, WCHAR *err, size_t err_cch) {
@@ -183,11 +183,11 @@ BOOL app_flow_export_key(CRYPTO_BOX *box, HWND progress_target, WCHAR **out, WCH
         set_error(err, err_cch, L"Failed to build key package prefix.");
         return FALSE;
     }
-    BOOL ok = local_topk_encode_payload(pkg, pkg_len, KEY_PACKAGE_TOPK_SEED, KEY_PACKAGE_TOPIC,
-                                        prefix.data, 0, progress_target, out, err, err_cch);
+    BOOL key_package_encoded = local_topk_encode_payload(pkg, pkg_len, KEY_PACKAGE_TOPK_SEED, KEY_PACKAGE_TOPIC,
+                                                         prefix.data, 0, progress_target, out, err, err_cch);
     wstrb_free(&prefix);
     secure_free(pkg, pkg_len);
-    return ok;
+    return key_package_encoded;
 }
 
 BOOL app_flow_import_key(const WCHAR *carrier, const WCHAR *name, int *active_index_out,
@@ -233,14 +233,14 @@ BOOL app_flow_import_key(const WCHAR *carrier, const WCHAR *name, int *active_in
     }
 
     CRYPTO_BOX *box = NULL;
-    BOOL ok = profiles_save() &&
-              profiles_open_crypto(imported_index, &box, err, err_cch) &&
-              crypto_box_import_contact_package(box, pkg, pkg_len, err, err_cch) &&
-              profiles_activate(imported_index, err, err_cch);
+    BOOL import_succeeded = profiles_save() &&
+                            profiles_open_crypto(imported_index, &box, err, err_cch) &&
+                            crypto_box_import_contact_package(box, pkg, pkg_len, err, err_cch) &&
+                            profiles_activate(imported_index, err, err_cch);
     crypto_box_close(box);
     secure_free(pkg, pkg_len);
 
-    if (!ok) {
+    if (!import_succeeded) {
         WCHAR state_path[MAX_PATH];
         KEY_PROFILE *failed_profile = profiles_get(imported_index);
         if (failed_profile && profiles_get_state_path(failed_profile, state_path, ARRAYSIZE(state_path))) {
@@ -263,6 +263,7 @@ BOOL app_flow_import_key(const WCHAR *carrier, const WCHAR *name, int *active_in
         return FALSE;
     }
     *out_message = msg.data;
+    msg.data = NULL;
     return TRUE;
 }
 
@@ -315,11 +316,11 @@ BOOL app_flow_decrypt_clip_auto_profile(const WCHAR *clip, APP_FLOW_CANCEL_FN ca
             }
         }
         if (have_local_payload) saw_local_payload = TRUE;
-        BOOL ok = have_local_payload &&
+        BOOL decrypt_succeeded = have_local_payload &&
             decrypt_sealed_with_box(box, local_sealed, local_sealed_len, &plain_w, local_err, ARRAYSIZE(local_err));
         crypto_box_close(box);
         secure_free(local_sealed, local_sealed_len);
-        if (ok) {
+        if (decrypt_succeeded) {
             *plain_w_out = plain_w;
             return TRUE;
         }

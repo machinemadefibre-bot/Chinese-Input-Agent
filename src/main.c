@@ -102,7 +102,7 @@ static void set_textbox_overlay(HWND textbox, const WCHAR *text, BOOL show);
 static BOOL start_background_work(WORK_CTX *ctx);
 static WCHAR *get_required_topic_text(HWND owner, HWND topic_edit);
 static DWORD WINAPI work_thread_proc(LPVOID param);
-static void post_llm_stream_progress(HWND target_textbox, const WCHAR *partial, size_t done, size_t total, double tps);
+static void post_llm_stream_progress(HWND target_textbox, const WCHAR *partial, size_t tokens_done, size_t tokens_total, double tps);
 static BOOL work_cancelled(void);
 static void free_work_ctx(WORK_CTX *ctx);
 static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
@@ -312,25 +312,25 @@ static BOOL post_work_text(UINT msg, HWND target_textbox, const WCHAR *text) {
     return post_work_text_kind(msg, target_textbox, text, 0);
 }
 
-static void post_llm_stream_progress(HWND target_textbox, const WCHAR *partial, size_t done, size_t total, double tps) {
+static void post_llm_stream_progress(HWND target_textbox, const WCHAR *partial, size_t tokens_done, size_t tokens_total, double tps) {
     const size_t bar_width = 24;
-    if (total == 0) total = 1;
-    if (done > total) done = total;
-    size_t filled = (done * bar_width) / total;
-    WSTRB b = {0};
-    if (!wstrb_append(&b, L"\u751f\u6210\u8fdb\u5ea6 [")) goto cleanup;
+    if (tokens_total == 0) tokens_total = 1;
+    if (tokens_done > tokens_total) tokens_done = tokens_total;
+    size_t filled = (tokens_done * bar_width) / tokens_total;
+    WSTRB progress_builder = {0};
+    if (!wstrb_append(&progress_builder, L"\u751f\u6210\u8fdb\u5ea6 [")) goto cleanup;
     for (size_t i = 0; i < bar_width; ++i) {
-        if (!wstrb_append_char(&b, i < filled ? L'#' : L'-')) goto cleanup;
+        if (!wstrb_append_char(&progress_builder, i < filled ? L'#' : L'-')) goto cleanup;
     }
     if (tps > 0.0) {
-        if (!wstrb_appendf(&b, L"] %zu/%zu  %.1f token/s\r\n\r\n", done, total, tps)) goto cleanup;
+        if (!wstrb_appendf(&progress_builder, L"] %zu/%zu  %.1f token/s\r\n\r\n", tokens_done, tokens_total, tps)) goto cleanup;
     } else {
-        if (!wstrb_appendf(&b, L"] %zu/%zu  -- token/s\r\n\r\n", done, total)) goto cleanup;
+        if (!wstrb_appendf(&progress_builder, L"] %zu/%zu  -- token/s\r\n\r\n", tokens_done, tokens_total)) goto cleanup;
     }
-    if (!wstrb_append(&b, partial ? partial : L"")) goto cleanup;
-    post_work_text(WM_APP_WORK_UPDATE, target_textbox, b.data ? b.data : L"");
+    if (!wstrb_append(&progress_builder, partial ? partial : L"")) goto cleanup;
+    post_work_text(WM_APP_WORK_UPDATE, target_textbox, progress_builder.data ? progress_builder.data : L"");
 cleanup:
-    wstrb_free(&b);
+    wstrb_free(&progress_builder);
 }
 
 static BOOL start_background_work(WORK_CTX *ctx) {
@@ -371,8 +371,8 @@ static void do_export_key(HWND hwnd, HWND target_textbox) {
 }
 
 typedef struct NAME_PROMPT_STATE {
-    BOOL done;
-    BOOL ok;
+    BOOL is_done;
+    BOOL is_accepted;
     WCHAR name[128];
 } NAME_PROMPT_STATE;
 
@@ -389,11 +389,11 @@ static LRESULT CALLBACK NamePromptWndProc(HWND hwnd, UINT msg, WPARAM wparam, LP
                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
                                     14, 46, 300, 28, hwnd, (HMENU)IDC_NAME_EDIT, g_instance, NULL);
         SendMessageW(edit, EM_SETLIMITTEXT, ARRAYSIZE(state->name) - 1, 0);
-        HWND ok = CreateWindowExW(0, L"BUTTON", L"\u786e\u5b9a", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                                  146, 88, 80, 32, hwnd, (HMENU)IDOK, g_instance, NULL);
+        HWND ok_button = CreateWindowExW(0, L"BUTTON", L"\u786e\u5b9a", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                                         146, 88, 80, 32, hwnd, (HMENU)IDOK, g_instance, NULL);
         HWND cancel = CreateWindowExW(0, L"BUTTON", L"\u53d6\u6d88", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                                       234, 88, 80, 32, hwnd, (HMENU)IDCANCEL, g_instance, NULL);
-        HWND controls[] = { label, edit, ok, cancel };
+        HWND controls[] = { label, edit, ok_button, cancel };
         for (size_t i = 0; i < ARRAYSIZE(controls); ++i) set_control_font(controls[i]);
         SetFocus(edit);
         return 0;
@@ -402,7 +402,7 @@ static LRESULT CALLBACK NamePromptWndProc(HWND hwnd, UINT msg, WPARAM wparam, LP
         if (LOWORD(wparam) == IDOK) {
             GetWindowTextW(GetDlgItem(hwnd, IDC_NAME_EDIT), state->name, ARRAYSIZE(state->name));
             if (state->name[0] == L'\0') StringCchCopyW(state->name, ARRAYSIZE(state->name), L"\u5bfc\u5165\u5bc6\u94a5");
-            state->ok = TRUE;
+            state->is_accepted = TRUE;
             DestroyWindow(hwnd);
             return 0;
         }
@@ -417,7 +417,7 @@ static LRESULT CALLBACK NamePromptWndProc(HWND hwnd, UINT msg, WPARAM wparam, LP
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
-        if (state) state->done = TRUE;
+        if (state) state->is_done = TRUE;
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -435,14 +435,14 @@ static BOOL prompt_key_name(HWND owner, WCHAR *name, size_t cch) {
     EnableWindow(owner, FALSE);
     ShowWindow(win, SW_SHOW);
     MSG msg;
-    while (!state.done && GetMessageW(&msg, NULL, 0, 0)) {
+    while (!state.is_done && GetMessageW(&msg, NULL, 0, 0)) {
         if (IsDialogMessageW(win, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
     EnableWindow(owner, TRUE);
     SetForegroundWindow(owner);
-    if (!state.ok) return FALSE;
+    if (!state.is_accepted) return FALSE;
     StringCchCopyW(name, cch, state.name);
     return TRUE;
 }
@@ -504,10 +504,10 @@ static void do_import_key(HWND hwnd, HWND source_textbox) {
 
 static WCHAR *get_window_text_alloc(HWND hwnd) {
     int len = GetWindowTextLengthW(hwnd);
-    WCHAR *buf = (WCHAR *)xalloc(((SIZE_T)len + 1) * sizeof(WCHAR));
-    if (!buf) return NULL;
-    GetWindowTextW(hwnd, buf, len + 1);
-    return buf;
+    WCHAR *window_text = (WCHAR *)xalloc(((SIZE_T)len + 1) * sizeof(WCHAR));
+    if (!window_text) return NULL;
+    GetWindowTextW(hwnd, window_text, len + 1);
+    return window_text;
 }
 
 static BOOL get_clipboard_text(HWND owner, WCHAR **out) {
@@ -591,21 +591,21 @@ static DWORD WINAPI work_thread_proc(LPVOID param) {
     WORK_CTX *ctx = (WORK_CTX *)param;
     WCHAR *result = NULL;
     WCHAR err[256] = L"";
-    BOOL ok = FALSE;
+    BOOL work_succeeded = FALSE;
 
     if (ctx->kind == WORK_KIND_ENCRYPT) {
-        ok = worker_encrypt(ctx, &result, err, ARRAYSIZE(err));
+        work_succeeded = worker_encrypt(ctx, &result, err, ARRAYSIZE(err));
     } else if (ctx->kind == WORK_KIND_EXPORT_KEY) {
-        ok = worker_export_key(ctx, &result, err, ARRAYSIZE(err));
+        work_succeeded = worker_export_key(ctx, &result, err, ARRAYSIZE(err));
     } else if (ctx->kind == WORK_KIND_IMPORT_KEY) {
-        ok = worker_import_key(ctx, &result, err, ARRAYSIZE(err));
+        work_succeeded = worker_import_key(ctx, &result, err, ARRAYSIZE(err));
     } else if (ctx->kind == WORK_KIND_DECRYPT) {
-        ok = worker_decrypt(ctx, &result, err, ARRAYSIZE(err));
+        work_succeeded = worker_decrypt(ctx, &result, err, ARRAYSIZE(err));
     } else {
         set_error(err, ARRAYSIZE(err), L"Unknown background work kind.");
     }
 
-    if (ok && !work_cancelled()) {
+    if (work_succeeded && !work_cancelled()) {
         post_work_text_kind(WM_APP_WORK_DONE, ctx->target_textbox, result ? result : L"", ctx->kind);
     } else if (work_cancelled()) {
         post_work_text_kind(WM_APP_WORK_CANCELLED, ctx->target_textbox, L"", ctx->kind);

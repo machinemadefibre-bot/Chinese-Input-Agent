@@ -61,11 +61,11 @@ struct CRYPTO_BOX {
     BOX_BUF remote_public_key;
 };
 
-static void set_box_error(WCHAR *buf, size_t cch, const WCHAR *fmt, ...) {
-    if (!buf || cch == 0) return;
+static void set_box_error(WCHAR *error_buffer, size_t cch, const WCHAR *fmt, ...) {
+    if (!error_buffer || cch == 0) return;
     va_list args;
     va_start(args, fmt);
-    StringCchVPrintfW(buf, cch, fmt, args);
+    StringCchVPrintfW(error_buffer, cch, fmt, args);
     va_end(args);
 }
 
@@ -80,9 +80,9 @@ static void box_secure_free(void *p, size_t bytes) {
     }
 }
 
-static BOOL bytes_all_zero(const uint8_t *data, size_t len) {
+static BOOL bytes_all_zero(const uint8_t *bytes, size_t len) {
     uint8_t acc = 0;
-    for (size_t i = 0; i < len; ++i) acc |= data[i];
+    for (size_t i = 0; i < len; ++i) acc |= bytes[i];
     return acc == 0;
 }
 
@@ -101,17 +101,17 @@ static BOOL validate_private_key_blob(const uint8_t *blob, size_t len) {
     uint8_t clamped[X25519_KEY_BYTES];
     memcpy(clamped, blob, sizeof(clamped));
     x25519_clamp_private(clamped);
-    BOOL ok = memcmp(clamped, blob, sizeof(clamped)) == 0;
+    BOOL is_clamped = memcmp(clamped, blob, sizeof(clamped)) == 0;
     SecureZeroMemory(clamped, sizeof(clamped));
-    return ok;
+    return is_clamped;
 }
 
-static BOOL buf_set(BOX_BUF *dst, const uint8_t *data, size_t len) {
+static BOOL buf_set(BOX_BUF *dst, const uint8_t *bytes, size_t len) {
     uint8_t *copy = NULL;
     if (len) {
         copy = (uint8_t *)box_alloc(len);
         if (!copy) return FALSE;
-        memcpy(copy, data, len);
+        memcpy(copy, bytes, len);
     }
     box_secure_free(dst->data, dst->len);
     dst->data = copy;
@@ -119,18 +119,18 @@ static BOOL buf_set(BOX_BUF *dst, const uint8_t *data, size_t len) {
     return TRUE;
 }
 
-static void buf_clear(BOX_BUF *buf) {
-    box_secure_free(buf->data, buf->len);
-    buf->data = NULL;
-    buf->len = 0;
+static void buf_clear(BOX_BUF *box_buffer) {
+    box_secure_free(box_buffer->data, box_buffer->len);
+    box_buffer->data = NULL;
+    box_buffer->len = 0;
 }
 
-static BOOL builder_reserve(BYTE_BUILDER *b, size_t extra) {
-    if (!b) return FALSE;
-    if (extra > SIZE_MAX - b->len) return FALSE;
-    size_t need = b->len + extra;
-    if (need <= b->cap) return TRUE;
-    size_t cap = b->cap ? b->cap : 256;
+static BOOL builder_reserve(BYTE_BUILDER *builder, size_t extra) {
+    if (!builder) return FALSE;
+    if (extra > SIZE_MAX - builder->len) return FALSE;
+    size_t need = builder->len + extra;
+    if (need <= builder->cap) return TRUE;
+    size_t cap = builder->cap ? builder->cap : 256;
     while (cap < need) {
         if (cap > SIZE_MAX / 2) {
             cap = need;
@@ -138,40 +138,40 @@ static BOOL builder_reserve(BYTE_BUILDER *b, size_t extra) {
         }
         cap *= 2;
     }
-    uint8_t *p = b->data ?
-        (uint8_t *)HeapReAlloc(GetProcessHeap(), 0, b->data, cap) :
+    uint8_t *p = builder->data ?
+        (uint8_t *)HeapReAlloc(GetProcessHeap(), 0, builder->data, cap) :
         (uint8_t *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, cap);
     if (!p) return FALSE;
-    b->data = p;
-    b->cap = cap;
+    builder->data = p;
+    builder->cap = cap;
     return TRUE;
 }
 
-static BOOL builder_append(BYTE_BUILDER *b, const void *data, size_t len) {
-    if (!b || (!data && len)) return FALSE;
-    if (!builder_reserve(b, len)) return FALSE;
-    if (len) memcpy(b->data + b->len, data, len);
-    b->len += len;
+static BOOL builder_append(BYTE_BUILDER *builder, const void *bytes, size_t len) {
+    if (!builder || (!bytes && len)) return FALSE;
+    if (!builder_reserve(builder, len)) return FALSE;
+    if (len) memcpy(builder->data + builder->len, bytes, len);
+    builder->len += len;
     return TRUE;
 }
 
-static BOOL builder_u32(BYTE_BUILDER *b, uint32_t v) {
-    uint8_t p[4];
-    p[0] = (uint8_t)(v & 0xff);
-    p[1] = (uint8_t)((v >> 8) & 0xff);
-    p[2] = (uint8_t)((v >> 16) & 0xff);
-    p[3] = (uint8_t)((v >> 24) & 0xff);
-    return builder_append(b, p, sizeof(p));
+static BOOL builder_u32(BYTE_BUILDER *builder, uint32_t v) {
+    uint8_t encoded[4];
+    encoded[0] = (uint8_t)(v & 0xff);
+    encoded[1] = (uint8_t)((v >> 8) & 0xff);
+    encoded[2] = (uint8_t)((v >> 16) & 0xff);
+    encoded[3] = (uint8_t)((v >> 24) & 0xff);
+    return builder_append(builder, encoded, sizeof(encoded));
 }
 
-static BOOL builder_blob(BYTE_BUILDER *b, const uint8_t *data, size_t len) {
+static BOOL builder_blob(BYTE_BUILDER *builder, const uint8_t *bytes, size_t len) {
     if (len > 0xffffffffu) return FALSE;
-    return builder_u32(b, (uint32_t)len) && builder_append(b, data, len);
+    return builder_u32(builder, (uint32_t)len) && builder_append(builder, bytes, len);
 }
 
-static void builder_free(BYTE_BUILDER *b) {
-    box_secure_free(b->data, b->cap);
-    ZeroMemory(b, sizeof(*b));
+static void builder_free(BYTE_BUILDER *builder) {
+    box_secure_free(builder->data, builder->cap);
+    ZeroMemory(builder, sizeof(*builder));
 }
 
 static BOOL read_u32(READ_CURSOR *c, uint32_t *out) {
@@ -182,10 +182,10 @@ static BOOL read_u32(READ_CURSOR *c, uint32_t *out) {
     return TRUE;
 }
 
-static BOOL read_blob_ref(READ_CURSOR *c, const uint8_t **data, size_t *len) {
+static BOOL read_blob_ref(READ_CURSOR *c, const uint8_t **bytes, size_t *len) {
     uint32_t n = 0;
-    if (!data || !len || !read_u32(c, &n) || c->pos > c->len || (size_t)n > c->len - c->pos) return FALSE;
-    *data = c->data + c->pos;
+    if (!bytes || !len || !read_u32(c, &n) || c->pos > c->len || (size_t)n > c->len - c->pos) return FALSE;
+    *bytes = c->data + c->pos;
     *len = n;
     c->pos += n;
     return TRUE;
@@ -202,25 +202,25 @@ static BOOL read_file_all(const WCHAR *path, uint8_t **out, DWORD *out_len) {
         return FALSE;
     }
     DWORD len = (DWORD)sz.QuadPart;
-    uint8_t *buf = (uint8_t *)box_alloc(len ? len : 1);
-    if (!buf) {
+    uint8_t *file_buffer = (uint8_t *)box_alloc(len ? len : 1);
+    if (!file_buffer) {
         CloseHandle(h);
         return FALSE;
     }
-    DWORD got = 0;
-    BOOL ok = ReadFile(h, buf, len, &got, NULL) && got == len;
+    DWORD bytes_read = 0;
+    BOOL read_succeeded = ReadFile(h, file_buffer, len, &bytes_read, NULL) && bytes_read == len;
     CloseHandle(h);
-    if (!ok) {
-        box_secure_free(buf, len);
+    if (!read_succeeded) {
+        box_secure_free(file_buffer, len);
         return FALSE;
     }
-    *out = buf;
+    *out = file_buffer;
     *out_len = len;
     return TRUE;
 }
 
-static BOOL write_file_all(const WCHAR *path, const uint8_t *data, DWORD len) {
-    return write_file_bytes_atomic(path, data, len);
+static BOOL write_file_all(const WCHAR *path, const uint8_t *bytes, DWORD len) {
+    return write_file_bytes_atomic(path, bytes, len);
 }
 
 static BOOL box_file_exists(const WCHAR *path) {
@@ -232,7 +232,7 @@ static BOOL box_file_exists(const WCHAR *path) {
 static BOOL hmac_sha256_segments(const uint8_t *key, DWORD key_len,
                                  const uint8_t **parts, const DWORD *lens, int count,
                                  uint8_t out[32]) {
-    BOOL ok = FALSE;
+    BOOL hmac_succeeded = FALSE;
     BCRYPT_ALG_HANDLE alg = NULL;
     BCRYPT_HASH_HANDLE hash = NULL;
     uint8_t *object = NULL;
@@ -248,17 +248,17 @@ static BOOL hmac_sha256_segments(const uint8_t *key, DWORD key_len,
         if (lens[i] && BCryptHashData(hash, (PUCHAR)parts[i], lens[i], 0) < 0) goto cleanup;
     }
     if (BCryptFinishHash(hash, out, 32, 0) < 0) goto cleanup;
-    ok = TRUE;
+    hmac_succeeded = TRUE;
 cleanup:
-    if (!ok) SecureZeroMemory(out, 32);
+    if (!hmac_succeeded) SecureZeroMemory(out, 32);
     if (hash) BCryptDestroyHash(hash);
     if (alg) BCryptCloseAlgorithmProvider(alg, 0);
     box_secure_free(object, obj_len);
-    return ok;
+    return hmac_succeeded;
 }
 
 static BOOL sha256_segments(const uint8_t **parts, const DWORD *lens, int count, uint8_t out[32]) {
-    BOOL ok = FALSE;
+    BOOL hash_succeeded = FALSE;
     BCRYPT_ALG_HANDLE alg = NULL;
     BCRYPT_HASH_HANDLE hash = NULL;
     uint8_t *object = NULL;
@@ -274,13 +274,13 @@ static BOOL sha256_segments(const uint8_t **parts, const DWORD *lens, int count,
         if (lens[i] && BCryptHashData(hash, (PUCHAR)parts[i], lens[i], 0) < 0) goto cleanup;
     }
     if (BCryptFinishHash(hash, out, 32, 0) < 0) goto cleanup;
-    ok = TRUE;
+    hash_succeeded = TRUE;
 cleanup:
-    if (!ok) SecureZeroMemory(out, 32);
+    if (!hash_succeeded) SecureZeroMemory(out, 32);
     if (hash) BCryptDestroyHash(hash);
     if (alg) BCryptCloseAlgorithmProvider(alg, 0);
     box_secure_free(object, obj_len);
-    return ok;
+    return hash_succeeded;
 }
 
 static BOOL derive_message_key(const uint8_t *shared, DWORD shared_len,
@@ -298,17 +298,17 @@ static BOOL derive_message_key(const uint8_t *shared, DWORD shared_len,
     DWORD ikm_lens[1] = { shared_len };
     const uint8_t *info_parts[2] = { info, &one };
     DWORD info_lens[2] = { (DWORD)(sizeof(info) - 1), 1 };
-    BOOL ok = FALSE;
+    BOOL key_derived = FALSE;
 
     if (!hmac_sha256_segments(salt_key, (DWORD)(sizeof(salt_key) - 1), salt_parts, salt_lens, 2, salt)) goto cleanup;
     if (!hmac_sha256_segments(salt, sizeof(salt), ikm_parts, ikm_lens, 1, prk)) goto cleanup;
     if (!hmac_sha256_segments(prk, sizeof(prk), info_parts, info_lens, 2, key_out)) goto cleanup;
-    ok = TRUE;
+    key_derived = TRUE;
 cleanup:
     SecureZeroMemory(salt, sizeof(salt));
     SecureZeroMemory(prk, sizeof(prk));
-    if (!ok) SecureZeroMemory(key_out, 32);
-    return ok;
+    if (!key_derived) SecureZeroMemory(key_out, 32);
+    return key_derived;
 }
 
 static BOOL aes_gcm_encrypt_raw(const uint8_t key_bytes[32],
@@ -317,7 +317,7 @@ static BOOL aes_gcm_encrypt_raw(const uint8_t key_bytes[32],
                                 const uint8_t *plain, DWORD plain_len,
                                 uint8_t *tag, DWORD tag_len,
                                 uint8_t *cipher) {
-    BOOL ok = FALSE;
+    BOOL encrypt_succeeded = FALSE;
     BCRYPT_ALG_HANDLE alg = NULL;
     BCRYPT_KEY_HANDLE key = NULL;
     uint8_t *key_object = NULL;
@@ -339,12 +339,12 @@ static BOOL aes_gcm_encrypt_raw(const uint8_t key_bytes[32],
     auth.cbTag = tag_len;
     if (BCryptEncrypt(key, (PUCHAR)plain, plain_len, &auth, NULL, 0, cipher, plain_len, &result, 0) < 0 ||
         result != plain_len) goto cleanup;
-    ok = TRUE;
+    encrypt_succeeded = TRUE;
 cleanup:
     if (key) BCryptDestroyKey(key);
     if (alg) BCryptCloseAlgorithmProvider(alg, 0);
     box_secure_free(key_object, obj_len);
-    return ok;
+    return encrypt_succeeded;
 }
 
 static BOOL aes_gcm_decrypt_raw(const uint8_t key_bytes[32],
@@ -353,7 +353,7 @@ static BOOL aes_gcm_decrypt_raw(const uint8_t key_bytes[32],
                                 const uint8_t *tag, DWORD tag_len,
                                 const uint8_t *cipher, DWORD cipher_len,
                                 uint8_t *plain) {
-    BOOL ok = FALSE;
+    BOOL decrypt_succeeded = FALSE;
     BCRYPT_ALG_HANDLE alg = NULL;
     BCRYPT_KEY_HANDLE key = NULL;
     uint8_t *key_object = NULL;
@@ -375,12 +375,12 @@ static BOOL aes_gcm_decrypt_raw(const uint8_t key_bytes[32],
     auth.cbTag = tag_len;
     if (BCryptDecrypt(key, (PUCHAR)cipher, cipher_len, &auth, NULL, 0, plain, cipher_len, &result, 0) < 0 ||
         result != cipher_len) goto cleanup;
-    ok = TRUE;
+    decrypt_succeeded = TRUE;
 cleanup:
     if (key) BCryptDestroyKey(key);
     if (alg) BCryptCloseAlgorithmProvider(alg, 0);
     box_secure_free(key_object, obj_len);
-    return ok;
+    return decrypt_succeeded;
 }
 
 static BOOL x25519_public_from_private(const uint8_t priv[X25519_KEY_BYTES], uint8_t pub[X25519_KEY_BYTES]) {
@@ -403,10 +403,10 @@ static BOOL contact_checksum(const uint8_t pub[X25519_KEY_BYTES], uint8_t out[CO
     uint8_t digest[32];
     const uint8_t *parts[2] = { label, pub };
     DWORD lens[2] = { (DWORD)(sizeof(label) - 1), X25519_KEY_BYTES };
-    BOOL ok = sha256_segments(parts, lens, 2, digest);
-    if (ok) memcpy(out, digest, CONTACT_CHECKSUM_BYTES);
+    BOOL checksum_built = sha256_segments(parts, lens, 2, digest);
+    if (checksum_built) memcpy(out, digest, CONTACT_CHECKSUM_BYTES);
     SecureZeroMemory(digest, sizeof(digest));
-    return ok;
+    return checksum_built;
 }
 
 static BOOL contact_fingerprint_from_public(const uint8_t pub[X25519_KEY_BYTES], WCHAR *out, size_t cch) {
@@ -440,58 +440,58 @@ static BOOL protect_state(CRYPTO_BOX *box, const uint8_t *plain, DWORD plain_len
     const DWORD overhead = STATE_HEADER_BYTES + STATE_NONCE_BYTES + STATE_TAG_BYTES;
     if (!box || (!plain && plain_len) || plain_len > 0xffffffffu - overhead) return FALSE;
     uint8_t nonce[STATE_NONCE_BYTES];
-    uint8_t *env = NULL;
+    uint8_t *state_envelope = NULL;
     DWORD total = overhead + plain_len;
-    BOOL ok = FALSE;
+    BOOL state_protected = FALSE;
 
     if (BCryptGenRandom(NULL, nonce, sizeof(nonce), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) return FALSE;
-    env = (uint8_t *)box_alloc(total ? total : 1);
-    if (!env) goto cleanup;
-    memcpy(env, "CIST", 4);
-    env[4] = STATE_VERSION;
-    env[5] = STATE_NONCE_BYTES;
-    env[6] = STATE_TAG_BYTES;
-    env[7] = 0;
-    env[8] = (uint8_t)(plain_len & 0xff);
-    env[9] = (uint8_t)((plain_len >> 8) & 0xff);
-    env[10] = (uint8_t)((plain_len >> 16) & 0xff);
-    env[11] = (uint8_t)((plain_len >> 24) & 0xff);
-    memcpy(env + STATE_HEADER_BYTES, nonce, sizeof(nonce));
-    if (!aes_gcm_encrypt_raw(box->master_key, env, STATE_HEADER_BYTES,
+    state_envelope = (uint8_t *)box_alloc(total ? total : 1);
+    if (!state_envelope) goto cleanup;
+    memcpy(state_envelope, "CIST", 4);
+    state_envelope[4] = STATE_VERSION;
+    state_envelope[5] = STATE_NONCE_BYTES;
+    state_envelope[6] = STATE_TAG_BYTES;
+    state_envelope[7] = 0;
+    state_envelope[8] = (uint8_t)(plain_len & 0xff);
+    state_envelope[9] = (uint8_t)((plain_len >> 8) & 0xff);
+    state_envelope[10] = (uint8_t)((plain_len >> 16) & 0xff);
+    state_envelope[11] = (uint8_t)((plain_len >> 24) & 0xff);
+    memcpy(state_envelope + STATE_HEADER_BYTES, nonce, sizeof(nonce));
+    if (!aes_gcm_encrypt_raw(box->master_key, state_envelope, STATE_HEADER_BYTES,
                              nonce, sizeof(nonce),
                              plain, plain_len,
-                             env + STATE_HEADER_BYTES + STATE_NONCE_BYTES,
+                             state_envelope + STATE_HEADER_BYTES + STATE_NONCE_BYTES,
                              STATE_TAG_BYTES,
-                             env + STATE_HEADER_BYTES + STATE_NONCE_BYTES + STATE_TAG_BYTES)) goto cleanup;
-    *out = env;
+                             state_envelope + STATE_HEADER_BYTES + STATE_NONCE_BYTES + STATE_TAG_BYTES)) goto cleanup;
+    *out = state_envelope;
     *out_len = total;
-    env = NULL;
-    ok = TRUE;
+    state_envelope = NULL;
+    state_protected = TRUE;
 cleanup:
-    box_secure_free(env, total);
+    box_secure_free(state_envelope, total);
     SecureZeroMemory(nonce, sizeof(nonce));
-    return ok;
+    return state_protected;
 }
 
-static BOOL unprotect_state(CRYPTO_BOX *box, const uint8_t *env, DWORD env_len, uint8_t **out, DWORD *out_len) {
+static BOOL unprotect_state(CRYPTO_BOX *box, const uint8_t *state_envelope, DWORD state_envelope_len, uint8_t **out, DWORD *out_len) {
     *out = NULL;
     *out_len = 0;
     const DWORD overhead = STATE_HEADER_BYTES + STATE_NONCE_BYTES + STATE_TAG_BYTES;
     if (!box ||
-        !env ||
-        env_len < overhead ||
-        memcmp(env, "CIST", 4) != 0 ||
-        env[4] != STATE_VERSION ||
-        env[5] != STATE_NONCE_BYTES ||
-        env[6] != STATE_TAG_BYTES) return FALSE;
-    DWORD plain_len = (DWORD)env[8] | ((DWORD)env[9] << 8) | ((DWORD)env[10] << 16) | ((DWORD)env[11] << 24);
-    if (plain_len > env_len - overhead || overhead + plain_len != env_len) return FALSE;
+        !state_envelope ||
+        state_envelope_len < overhead ||
+        memcmp(state_envelope, "CIST", 4) != 0 ||
+        state_envelope[4] != STATE_VERSION ||
+        state_envelope[5] != STATE_NONCE_BYTES ||
+        state_envelope[6] != STATE_TAG_BYTES) return FALSE;
+    DWORD plain_len = (DWORD)state_envelope[8] | ((DWORD)state_envelope[9] << 8) | ((DWORD)state_envelope[10] << 16) | ((DWORD)state_envelope[11] << 24);
+    if (plain_len > state_envelope_len - overhead || overhead + plain_len != state_envelope_len) return FALSE;
     uint8_t *plain = (uint8_t *)box_alloc(plain_len ? plain_len : 1);
     if (!plain) return FALSE;
-    if (!aes_gcm_decrypt_raw(box->master_key, env, STATE_HEADER_BYTES,
-                             env + STATE_HEADER_BYTES, STATE_NONCE_BYTES,
-                             env + STATE_HEADER_BYTES + STATE_NONCE_BYTES, STATE_TAG_BYTES,
-                             env + STATE_HEADER_BYTES + STATE_NONCE_BYTES + STATE_TAG_BYTES,
+    if (!aes_gcm_decrypt_raw(box->master_key, state_envelope, STATE_HEADER_BYTES,
+                             state_envelope + STATE_HEADER_BYTES, STATE_NONCE_BYTES,
+                             state_envelope + STATE_HEADER_BYTES + STATE_NONCE_BYTES, STATE_TAG_BYTES,
+                             state_envelope + STATE_HEADER_BYTES + STATE_NONCE_BYTES + STATE_TAG_BYTES,
                              plain_len, plain)) {
         box_secure_free(plain, plain_len);
         return FALSE;
@@ -503,21 +503,21 @@ static BOOL unprotect_state(CRYPTO_BOX *box, const uint8_t *env, DWORD env_len, 
 
 static BOOL save_state(CRYPTO_BOX *box) {
     if (!box || !box->state_path[0]) return TRUE;
-    BYTE_BUILDER b = {0};
+    BYTE_BUILDER state_builder = {0};
     uint8_t *protected_blob = NULL;
     DWORD protected_len = 0;
-    BOOL ok = FALSE;
-    if (!builder_u32(&b, STATE_MAGIC) ||
-        !builder_u32(&b, STATE_VERSION) ||
-        !builder_blob(&b, box->public_key.data, box->public_key.len) ||
-        !builder_blob(&b, box->private_key.data, box->private_key.len) ||
-        !builder_blob(&b, box->remote_public_key.data, box->remote_public_key.len)) goto cleanup;
-    if (!protect_state(box, b.data, (DWORD)b.len, &protected_blob, &protected_len)) goto cleanup;
-    ok = write_file_all(box->state_path, protected_blob, protected_len);
+    BOOL state_saved = FALSE;
+    if (!builder_u32(&state_builder, STATE_MAGIC) ||
+        !builder_u32(&state_builder, STATE_VERSION) ||
+        !builder_blob(&state_builder, box->public_key.data, box->public_key.len) ||
+        !builder_blob(&state_builder, box->private_key.data, box->private_key.len) ||
+        !builder_blob(&state_builder, box->remote_public_key.data, box->remote_public_key.len)) goto cleanup;
+    if (!protect_state(box, state_builder.data, (DWORD)state_builder.len, &protected_blob, &protected_len)) goto cleanup;
+    state_saved = write_file_all(box->state_path, protected_blob, protected_len);
 cleanup:
-    builder_free(&b);
+    builder_free(&state_builder);
     box_secure_free(protected_blob, protected_len);
-    return ok;
+    return state_saved;
 }
 
 static BOOL load_state(CRYPTO_BOX *box) {
@@ -525,7 +525,7 @@ static BOOL load_state(CRYPTO_BOX *box) {
     DWORD file_len = 0;
     uint8_t *plain = NULL;
     DWORD plain_len = 0;
-    BOOL ok = FALSE;
+    BOOL state_loaded = FALSE;
     if (!box || !box->state_path[0] || !read_file_all(box->state_path, &file, &file_len)) return FALSE;
     if (!unprotect_state(box, file, file_len, &plain, &plain_len)) goto cleanup;
     READ_CURSOR c = { plain, plain_len, 0 };
@@ -545,29 +545,29 @@ static BOOL load_state(CRYPTO_BOX *box) {
     if (!buf_set(&box->public_key, pub, pub_len) ||
         !buf_set(&box->private_key, priv, priv_len) ||
         !buf_set(&box->remote_public_key, remote, remote_len)) goto cleanup;
-    ok = TRUE;
+    state_loaded = TRUE;
 cleanup:
     box_secure_free(file, file_len);
     box_secure_free(plain, plain_len);
-    return ok;
+    return state_loaded;
 }
 
 static BOOL generate_identity(CRYPTO_BOX *box) {
     uint8_t priv[X25519_KEY_BYTES];
     uint8_t pub[X25519_KEY_BYTES];
-    BOOL ok = FALSE;
+    BOOL identity_generated = FALSE;
     ZeroMemory(priv, sizeof(priv));
     ZeroMemory(pub, sizeof(pub));
     if (BCryptGenRandom(NULL, priv, sizeof(priv), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) goto cleanup;
     x25519_clamp_private(priv);
     if (!x25519_public_from_private(priv, pub)) goto cleanup;
-    ok = box &&
-         buf_set(&box->public_key, pub, sizeof(pub)) &&
-         buf_set(&box->private_key, priv, sizeof(priv));
+    identity_generated = box &&
+                         buf_set(&box->public_key, pub, sizeof(pub)) &&
+                         buf_set(&box->private_key, priv, sizeof(priv));
 cleanup:
     SecureZeroMemory(priv, sizeof(priv));
     SecureZeroMemory(pub, sizeof(pub));
-    return ok;
+    return identity_generated;
 }
 
 BOOL crypto_box_open(const BYTE master_key[32], const WCHAR *state_path, CRYPTO_BOX **out,
@@ -669,11 +669,11 @@ BOOL crypto_box_contact_package_fingerprint(const BYTE *pkg, DWORD pkg_len, WCHA
         return FALSE;
     }
     uint8_t expected[CONTACT_CHECKSUM_BYTES];
-    BOOL ok = contact_checksum(pkg, expected) &&
-              memcmp(expected, pkg + X25519_KEY_BYTES, CONTACT_CHECKSUM_BYTES) == 0 &&
-              contact_fingerprint_from_public(pkg, out, cch);
+    BOOL package_verified = contact_checksum(pkg, expected) &&
+                            memcmp(expected, pkg + X25519_KEY_BYTES, CONTACT_CHECKSUM_BYTES) == 0 &&
+                            contact_fingerprint_from_public(pkg, out, cch);
     SecureZeroMemory(expected, sizeof(expected));
-    if (!ok) {
+    if (!package_verified) {
         set_box_error(err, err_cch, L"Invalid compact contact package checksum.");
         return FALSE;
     }
@@ -693,7 +693,7 @@ BOOL crypto_box_export_contact_package(CRYPTO_BOX *box, BYTE **out, DWORD *out_l
     *out_len = 0;
     uint8_t checksum[CONTACT_CHECKSUM_BYTES];
     uint8_t *pkg = NULL;
-    BOOL ok = FALSE;
+    BOOL package_exported = FALSE;
     ZeroMemory(checksum, sizeof(checksum));
     if (!box || !validate_public_key_blob(box->public_key.data, box->public_key.len)) {
         set_box_error(err, err_cch, L"Local public key is not ready.");
@@ -714,16 +714,16 @@ BOOL crypto_box_export_contact_package(CRYPTO_BOX *box, BYTE **out, DWORD *out_l
     *out = pkg;
     *out_len = CONTACT_COMPACT_PACKAGE_BYTES;
     pkg = NULL;
-    ok = TRUE;
+    package_exported = TRUE;
 cleanup:
-    if (!ok) {
+    if (!package_exported) {
         box_secure_free(*out, *out_len);
         *out = NULL;
         *out_len = 0;
     }
     box_secure_free(pkg, CONTACT_COMPACT_PACKAGE_BYTES);
     SecureZeroMemory(checksum, sizeof(checksum));
-    return ok;
+    return package_exported;
 }
 
 BOOL crypto_box_import_contact_package(CRYPTO_BOX *box, const BYTE *pkg, DWORD pkg_len, WCHAR *err, size_t err_cch) {
@@ -769,7 +769,7 @@ BOOL crypto_box_encrypt(CRYPTO_BOX *box, const BYTE *plain, DWORD plain_len, BYT
     uint8_t nonce[MESSAGE_NONCE_BYTES];
     uint8_t *message = NULL;
     DWORD message_len = 0;
-    BOOL ok = FALSE;
+    BOOL message_encrypted = FALSE;
 
     ZeroMemory(eph_priv, sizeof(eph_priv));
     ZeroMemory(eph_pub, sizeof(eph_pub));
@@ -824,7 +824,7 @@ BOOL crypto_box_encrypt(CRYPTO_BOX *box, const BYTE *plain, DWORD plain_len, BYT
     *out = message;
     *out_len = message_len;
     message = NULL;
-    ok = TRUE;
+    message_encrypted = TRUE;
 cleanup:
     box_secure_free(message, message_len);
     SecureZeroMemory(eph_priv, sizeof(eph_priv));
@@ -832,7 +832,7 @@ cleanup:
     SecureZeroMemory(shared, sizeof(shared));
     SecureZeroMemory(key, sizeof(key));
     SecureZeroMemory(nonce, sizeof(nonce));
-    return ok;
+    return message_encrypted;
 }
 
 BOOL crypto_box_decrypt(CRYPTO_BOX *box, const BYTE *message, DWORD message_len, BYTE **out, DWORD *out_len,
@@ -847,7 +847,7 @@ BOOL crypto_box_decrypt(CRYPTO_BOX *box, const BYTE *message, DWORD message_len,
     uint8_t key[32];
     uint8_t *plain = NULL;
     DWORD cipher_len = 0;
-    BOOL ok = FALSE;
+    BOOL message_decrypted = FALSE;
 
     ZeroMemory(shared, sizeof(shared));
     ZeroMemory(key, sizeof(key));
@@ -891,10 +891,10 @@ BOOL crypto_box_decrypt(CRYPTO_BOX *box, const BYTE *message, DWORD message_len,
     *out = plain;
     *out_len = cipher_len;
     plain = NULL;
-    ok = TRUE;
+    message_decrypted = TRUE;
 cleanup:
     box_secure_free(plain, cipher_len);
     SecureZeroMemory(shared, sizeof(shared));
     SecureZeroMemory(key, sizeof(key));
-    return ok;
+    return message_decrypted;
 }

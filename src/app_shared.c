@@ -45,20 +45,20 @@ void secure_free_str(char *ptr) {
     if (ptr) secure_free(ptr, strlen(ptr) + 1);
 }
 
-void set_error(WCHAR *buf, size_t cch, const WCHAR *fmt, ...) {
-    if (!buf || cch == 0) return;
+void set_error(WCHAR *error_buffer, size_t cch, const WCHAR *fmt, ...) {
+    if (!error_buffer || cch == 0) return;
     va_list args;
     va_start(args, fmt);
-    StringCchVPrintfW(buf, cch, fmt, args);
+    StringCchVPrintfW(error_buffer, cch, fmt, args);
     va_end(args);
 }
 
-BOOL strb_reserve(STRB *b, size_t extra) {
-    if (!b) return FALSE;
-    if (b->len > SIZE_MAX - 1 || extra > SIZE_MAX - b->len - 1) return FALSE;
-    size_t need = b->len + extra + 1;
-    if (need <= b->cap) return TRUE;
-    size_t cap = b->cap ? b->cap : 256;
+BOOL strb_reserve(STRB *builder, size_t extra) {
+    if (!builder) return FALSE;
+    if (builder->len > SIZE_MAX - 1 || extra > SIZE_MAX - builder->len - 1) return FALSE;
+    size_t need = builder->len + extra + 1;
+    if (need <= builder->cap) return TRUE;
+    size_t cap = builder->cap ? builder->cap : 256;
     while (cap < need) {
         if (cap > SIZE_MAX / 2) {
             cap = need;
@@ -66,56 +66,56 @@ BOOL strb_reserve(STRB *b, size_t extra) {
         }
         cap *= 2;
     }
-    char *p = (char *)xrealloc(b->data, cap);
+    char *p = (char *)xrealloc(builder->data, cap);
     if (!p) return FALSE;
-    b->data = p;
-    b->cap = cap;
+    builder->data = p;
+    builder->cap = cap;
     return TRUE;
 }
 
-BOOL strb_append_n(STRB *b, const char *s, size_t n) {
-    if (!b || (!s && n)) return FALSE;
-    if (!strb_reserve(b, n)) return FALSE;
-    CopyMemory(b->data + b->len, s, n);
-    b->len += n;
-    b->data[b->len] = '\0';
+BOOL strb_append_n(STRB *builder, const char *s, size_t n) {
+    if (!builder || (!s && n)) return FALSE;
+    if (!strb_reserve(builder, n)) return FALSE;
+    CopyMemory(builder->data + builder->len, s, n);
+    builder->len += n;
+    builder->data[builder->len] = '\0';
     return TRUE;
 }
 
-BOOL strb_append(STRB *b, const char *s) {
-    return strb_append_n(b, s ? s : "", s ? strlen(s) : 0);
+BOOL strb_append(STRB *builder, const char *s) {
+    return strb_append_n(builder, s ? s : "", s ? strlen(s) : 0);
 }
 
-BOOL strb_appendf(STRB *b, const char *fmt, ...) {
+BOOL strb_appendf(STRB *builder, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     int needed = _vscprintf(fmt, args);
     va_end(args);
     if (needed < 0) return FALSE;
-    if (!strb_reserve(b, (size_t)needed)) return FALSE;
+    if (!strb_reserve(builder, (size_t)needed)) return FALSE;
     va_start(args, fmt);
-    vsnprintf(b->data + b->len, b->cap - b->len, fmt, args);
+    vsnprintf(builder->data + builder->len, builder->cap - builder->len, fmt, args);
     va_end(args);
-    b->len += (size_t)needed;
+    builder->len += (size_t)needed;
     return TRUE;
 }
 
-void strb_free(STRB *b) {
-    xfree(b->data);
-    ZeroMemory(b, sizeof(*b));
+void strb_free(STRB *builder) {
+    xfree(builder->data);
+    ZeroMemory(builder, sizeof(*builder));
 }
 
-void strb_secure_free(STRB *b) {
-    secure_free(b->data, b->cap);
-    ZeroMemory(b, sizeof(*b));
+void strb_secure_free(STRB *builder) {
+    secure_free(builder->data, builder->cap);
+    ZeroMemory(builder, sizeof(*builder));
 }
 
-BOOL wstrb_reserve(WSTRB *b, size_t extra) {
-    if (!b) return FALSE;
-    if (b->len > SIZE_MAX - 1 || extra > SIZE_MAX - b->len - 1) return FALSE;
-    size_t need = b->len + extra + 1;
-    if (need <= b->cap) return TRUE;
-    size_t cap = b->cap ? b->cap : 128;
+BOOL wstrb_reserve(WSTRB *builder, size_t extra) {
+    if (!builder) return FALSE;
+    if (builder->len > SIZE_MAX - 1 || extra > SIZE_MAX - builder->len - 1) return FALSE;
+    size_t need = builder->len + extra + 1;
+    if (need <= builder->cap) return TRUE;
+    size_t cap = builder->cap ? builder->cap : 128;
     while (cap < need) {
         if (cap > SIZE_MAX / 2) {
             cap = need;
@@ -124,52 +124,52 @@ BOOL wstrb_reserve(WSTRB *b, size_t extra) {
         cap *= 2;
     }
     if (cap > SIZE_MAX / sizeof(WCHAR)) return FALSE;
-    WCHAR *p = (WCHAR *)xrealloc(b->data, cap * sizeof(WCHAR));
+    WCHAR *p = (WCHAR *)xrealloc(builder->data, cap * sizeof(WCHAR));
     if (!p) return FALSE;
-    b->data = p;
-    b->cap = cap;
+    builder->data = p;
+    builder->cap = cap;
     return TRUE;
 }
 
-BOOL wstrb_append_n(WSTRB *b, const WCHAR *s, size_t n) {
-    if (!b || (!s && n)) return FALSE;
-    if (!wstrb_reserve(b, n)) return FALSE;
-    CopyMemory(b->data + b->len, s, n * sizeof(WCHAR));
-    b->len += n;
-    b->data[b->len] = L'\0';
+BOOL wstrb_append_n(WSTRB *builder, const WCHAR *s, size_t n) {
+    if (!builder || (!s && n)) return FALSE;
+    if (!wstrb_reserve(builder, n)) return FALSE;
+    CopyMemory(builder->data + builder->len, s, n * sizeof(WCHAR));
+    builder->len += n;
+    builder->data[builder->len] = L'\0';
     return TRUE;
 }
 
-BOOL wstrb_append(WSTRB *b, const WCHAR *s) {
-    return wstrb_append_n(b, s ? s : L"", s ? wcslen(s) : 0);
+BOOL wstrb_append(WSTRB *builder, const WCHAR *s) {
+    return wstrb_append_n(builder, s ? s : L"", s ? wcslen(s) : 0);
 }
 
-BOOL wstrb_append_char(WSTRB *b, WCHAR ch) {
-    return wstrb_append_n(b, &ch, 1);
+BOOL wstrb_append_char(WSTRB *builder, WCHAR ch) {
+    return wstrb_append_n(builder, &ch, 1);
 }
 
-BOOL wstrb_appendf(WSTRB *b, const WCHAR *fmt, ...) {
+BOOL wstrb_appendf(WSTRB *builder, const WCHAR *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     int needed = _vscwprintf(fmt, args);
     va_end(args);
     if (needed < 0) return FALSE;
-    if (!wstrb_reserve(b, (size_t)needed)) return FALSE;
+    if (!wstrb_reserve(builder, (size_t)needed)) return FALSE;
     va_start(args, fmt);
-    vswprintf(b->data + b->len, b->cap - b->len, fmt, args);
+    vswprintf(builder->data + builder->len, builder->cap - builder->len, fmt, args);
     va_end(args);
-    b->len += (size_t)needed;
+    builder->len += (size_t)needed;
     return TRUE;
 }
 
-void wstrb_free(WSTRB *b) {
-    xfree(b->data);
-    ZeroMemory(b, sizeof(*b));
+void wstrb_free(WSTRB *builder) {
+    xfree(builder->data);
+    ZeroMemory(builder, sizeof(*builder));
 }
 
-void wstrb_secure_free(WSTRB *b) {
-    secure_free(b->data, b->cap * sizeof(WCHAR));
-    ZeroMemory(b, sizeof(*b));
+void wstrb_secure_free(WSTRB *builder) {
+    secure_free(builder->data, builder->cap * sizeof(WCHAR));
+    ZeroMemory(builder, sizeof(*builder));
 }
 
 BOOL wide_to_utf8(const WCHAR *ws, char **out, int *out_len) {
@@ -177,13 +177,13 @@ BOOL wide_to_utf8(const WCHAR *ws, char **out, int *out_len) {
     if (out_len) *out_len = 0;
     int needed = WideCharToMultiByte(CP_UTF8, 0, ws ? ws : L"", -1, NULL, 0, NULL, NULL);
     if (needed <= 0) return FALSE;
-    char *buf = (char *)xalloc((SIZE_T)needed);
-    if (!buf) return FALSE;
-    if (!WideCharToMultiByte(CP_UTF8, 0, ws ? ws : L"", -1, buf, needed, NULL, NULL)) {
-        xfree(buf);
+    char *utf8_buffer = (char *)xalloc((SIZE_T)needed);
+    if (!utf8_buffer) return FALSE;
+    if (!WideCharToMultiByte(CP_UTF8, 0, ws ? ws : L"", -1, utf8_buffer, needed, NULL, NULL)) {
+        xfree(utf8_buffer);
         return FALSE;
     }
-    *out = buf;
+    *out = utf8_buffer;
     if (out_len) *out_len = needed - 1;
     return TRUE;
 }
@@ -192,43 +192,43 @@ BOOL utf8_to_wide_n(const char *s, int len, WCHAR **out) {
     *out = NULL;
     int needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, len, NULL, 0);
     if (needed <= 0) return FALSE;
-    WCHAR *buf = (WCHAR *)xalloc(((SIZE_T)needed + 1) * sizeof(WCHAR));
-    if (!buf) return FALSE;
-    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, len, buf, needed)) {
-        xfree(buf);
+    WCHAR *wide_buffer = (WCHAR *)xalloc(((SIZE_T)needed + 1) * sizeof(WCHAR));
+    if (!wide_buffer) return FALSE;
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, len, wide_buffer, needed)) {
+        xfree(wide_buffer);
         return FALSE;
     }
-    buf[needed] = L'\0';
-    *out = buf;
+    wide_buffer[needed] = L'\0';
+    *out = wide_buffer;
     return TRUE;
 }
 
-BOOL append_json_escaped_wide(STRB *b, const WCHAR *ws) {
+BOOL append_json_escaped_wide(STRB *json_builder, const WCHAR *ws) {
     char *utf8 = NULL;
     int len = 0;
     if (!wide_to_utf8(ws, &utf8, &len)) return FALSE;
-    BOOL ok = TRUE;
-    for (int i = 0; i < len && ok; ++i) {
+    BOOL append_succeeded = TRUE;
+    for (int i = 0; i < len && append_succeeded; ++i) {
         unsigned char c = (unsigned char)utf8[i];
         switch (c) {
-        case '\\': ok = strb_append(b, "\\\\"); break;
-        case '"': ok = strb_append(b, "\\\""); break;
-        case '\b': ok = strb_append(b, "\\b"); break;
-        case '\f': ok = strb_append(b, "\\f"); break;
-        case '\n': ok = strb_append(b, "\\n"); break;
-        case '\r': ok = strb_append(b, "\\r"); break;
-        case '\t': ok = strb_append(b, "\\t"); break;
+        case '\\': append_succeeded = strb_append(json_builder, "\\\\"); break;
+        case '"': append_succeeded = strb_append(json_builder, "\\\""); break;
+        case '\b': append_succeeded = strb_append(json_builder, "\\b"); break;
+        case '\f': append_succeeded = strb_append(json_builder, "\\f"); break;
+        case '\n': append_succeeded = strb_append(json_builder, "\\n"); break;
+        case '\r': append_succeeded = strb_append(json_builder, "\\r"); break;
+        case '\t': append_succeeded = strb_append(json_builder, "\\t"); break;
         default:
             if (c < 0x20) {
-                ok = strb_appendf(b, "\\u%04x", c);
+                append_succeeded = strb_appendf(json_builder, "\\u%04x", c);
             } else {
-                ok = strb_append_n(b, (const char *)&utf8[i], 1);
+                append_succeeded = strb_append_n(json_builder, (const char *)&utf8[i], 1);
             }
             break;
         }
     }
     xfree(utf8);
-    return ok;
+    return append_succeeded;
 }
 
 void strip_last_path_component_early(WCHAR *path) {
@@ -308,77 +308,78 @@ BOOL read_file_bytes(const WCHAR *path, BYTE **out, DWORD *out_len) {
         CloseHandle(h);
         return FALSE;
     }
-    BYTE *buf = (BYTE *)xalloc((SIZE_T)size.QuadPart);
-    if (!buf) {
+    BYTE *file_buffer = (BYTE *)xalloc((SIZE_T)size.QuadPart);
+    if (!file_buffer) {
         CloseHandle(h);
         return FALSE;
     }
     DWORD read = 0;
-    BOOL ok = ReadFile(h, buf, (DWORD)size.QuadPart, &read, NULL) && read == (DWORD)size.QuadPart;
+    BOOL read_succeeded = ReadFile(h, file_buffer, (DWORD)size.QuadPart, &read, NULL) && read == (DWORD)size.QuadPart;
     CloseHandle(h);
-    if (!ok) {
-        xfree(buf);
+    if (!read_succeeded) {
+        xfree(file_buffer);
         return FALSE;
     }
-    *out = buf;
+    *out = file_buffer;
     *out_len = read;
     return TRUE;
 }
 
-BOOL write_file_bytes(const WCHAR *path, const BYTE *data, DWORD len) {
-    if (!path || !path[0] || (!data && len)) return FALSE;
+BOOL write_file_bytes(const WCHAR *path, const BYTE *bytes, DWORD len) {
+    if (!path || !path[0] || (!bytes && len)) return FALSE;
     HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return FALSE;
     DWORD written = 0;
-    BOOL ok = WriteFile(h, data, len, &written, NULL) && written == len;
+    BOOL write_succeeded = WriteFile(h, bytes, len, &written, NULL) && written == len;
     CloseHandle(h);
-    return ok;
+    return write_succeeded;
 }
 
-BOOL write_file_bytes_atomic(const WCHAR *path, const BYTE *data, DWORD len) {
-    if (!path || !path[0] || (!data && len)) return FALSE;
+BOOL write_file_bytes_atomic(const WCHAR *path, const BYTE *bytes, DWORD len) {
+    if (!path || !path[0] || (!bytes && len)) return FALSE;
 
-    WCHAR dir[MAX_PATH];
-    WCHAR tmp[MAX_PATH];
-    if (FAILED(StringCchCopyW(dir, ARRAYSIZE(dir), path))) return FALSE;
-    strip_last_path_component(dir);
-    if (!dir[0]) return FALSE;
-    if (!GetTempFileNameW(dir, L"cia", 0, tmp)) return FALSE;
+    WCHAR target_dir[MAX_PATH];
+    WCHAR temp_path[MAX_PATH];
+    if (FAILED(StringCchCopyW(target_dir, ARRAYSIZE(target_dir), path))) return FALSE;
+    strip_last_path_component(target_dir);
+    if (!target_dir[0]) return FALSE;
+    if (!GetTempFileNameW(target_dir, L"cia", 0, temp_path)) return FALSE;
 
-    HANDLE h = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+    HANDLE h = CreateFileW(temp_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) {
-        DeleteFileW(tmp);
+        DeleteFileW(temp_path);
         return FALSE;
     }
 
     DWORD written = 0;
-    BOOL ok = WriteFile(h, data, len, &written, NULL) && written == len && FlushFileBuffers(h);
+    BOOL temp_file_written = WriteFile(h, bytes, len, &written, NULL) && written == len && FlushFileBuffers(h);
     CloseHandle(h);
-    if (ok) {
-        ok = MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    BOOL replace_succeeded = temp_file_written;
+    if (replace_succeeded) {
+        replace_succeeded = MoveFileExW(temp_path, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
     }
-    if (!ok) DeleteFileW(tmp);
-    return ok;
+    if (!replace_succeeded) DeleteFileW(temp_path);
+    return replace_succeeded;
 }
 
 BOOL write_text_utf8_file(const WCHAR *path, const WCHAR *text) {
     char *utf8 = NULL;
     int len = 0;
     if (!wide_to_utf8(text ? text : L"", &utf8, &len)) return FALSE;
-    BOOL ok = write_file_bytes(path, (const BYTE *)utf8, (DWORD)len);
+    BOOL write_succeeded = write_file_bytes(path, (const BYTE *)utf8, (DWORD)len);
     secure_free(utf8, (SIZE_T)len + 1);
-    return ok;
+    return write_succeeded;
 }
 
 BOOL read_utf8_text_file(const WCHAR *path, WCHAR **out) {
     *out = NULL;
-    BYTE *data = NULL;
+    BYTE *utf8_bytes = NULL;
     DWORD len = 0;
-    if (!read_file_bytes(path, &data, &len)) return FALSE;
-    BOOL ok = utf8_to_wide_n((const char *)data, (int)len, out);
-    secure_free(data, len);
-    return ok;
+    if (!read_file_bytes(path, &utf8_bytes, &len)) return FALSE;
+    BOOL decode_succeeded = utf8_to_wide_n((const char *)utf8_bytes, (int)len, out);
+    secure_free(utf8_bytes, len);
+    return decode_succeeded;
 }
 
 BOOL file_exists_w(const WCHAR *path) {
@@ -463,9 +464,9 @@ BOOL find_local_worker(WCHAR *script, size_t script_cch, WCHAR *workdir, size_t 
 BOOL make_temp_path(WCHAR *path, size_t cch) {
     WCHAR dir[MAX_PATH];
     if (!GetTempPathW(ARRAYSIZE(dir), dir)) return FALSE;
-    WCHAR tmp[MAX_PATH];
-    if (!GetTempFileNameW(dir, L"cia", 0, tmp)) return FALSE;
-    return SUCCEEDED(StringCchCopyW(path, cch, tmp));
+    WCHAR generated_path[MAX_PATH];
+    if (!GetTempFileNameW(dir, L"cia", 0, generated_path)) return FALSE;
+    return SUCCEEDED(StringCchCopyW(path, cch, generated_path));
 }
 
 void secure_delete_file(const WCHAR *path) {
@@ -536,13 +537,13 @@ BOOL append_process_log(WCHAR *err, size_t err_cch, const WCHAR *prefix, const W
     return FALSE;
 }
 
-BOOL write_all_handle(HANDLE h, const void *data, DWORD len) {
-    const BYTE *p = (const BYTE *)data;
+BOOL write_all_handle(HANDLE h, const void *bytes, DWORD len) {
+    const BYTE *cursor = (const BYTE *)bytes;
     DWORD left = len;
     while (left > 0) {
         DWORD written = 0;
-        if (!WriteFile(h, p, left, &written, NULL) || written == 0) return FALSE;
-        p += written;
+        if (!WriteFile(h, cursor, left, &written, NULL) || written == 0) return FALSE;
+        cursor += written;
         left -= written;
     }
     return TRUE;

@@ -65,7 +65,7 @@ BOOL local_aes_gcm_encrypt(const BYTE key[MASTER_KEY_BYTES], const BYTE *plain, 
     *out_len = 0;
     const DWORD overhead = LOCAL_BLOB_HEADER_BYTES + LOCAL_BLOB_NONCE_BYTES + LOCAL_BLOB_TAG_BYTES;
     if (!key || (!plain && plain_len) || plain_len > 0xffffffffu - overhead) return FALSE;
-    BOOL ok = FALSE;
+    BOOL encrypt_succeeded = FALSE;
     BCRYPT_ALG_HANDLE alg = NULL;
     BCRYPT_KEY_HANDLE hkey = NULL;
     BYTE *key_object = NULL;
@@ -112,14 +112,14 @@ BOOL local_aes_gcm_encrypt(const BYTE key[MASTER_KEY_BYTES], const BYTE *plain, 
     *out = envelope;
     *out_len = total;
     envelope = NULL;
-    ok = TRUE;
+    encrypt_succeeded = TRUE;
 cleanup:
     if (hkey) BCryptDestroyKey(hkey);
     if (alg) BCryptCloseAlgorithmProvider(alg, 0);
     secure_free(key_object, obj_len);
     secure_free(envelope, envelope ? total : 0);
     SecureZeroMemory(nonce, sizeof(nonce));
-    return ok;
+    return encrypt_succeeded;
 }
 
 BOOL local_aes_gcm_decrypt(const BYTE key[MASTER_KEY_BYTES], const BYTE *envelope, DWORD envelope_len,
@@ -139,7 +139,7 @@ BOOL local_aes_gcm_decrypt(const BYTE key[MASTER_KEY_BYTES], const BYTE *envelop
                        ((DWORD)envelope[11] << 24);
     if (cipher_len > envelope_len - overhead || overhead + cipher_len != envelope_len) return FALSE;
 
-    BOOL ok = FALSE;
+    BOOL decrypt_succeeded = FALSE;
     BCRYPT_ALG_HANDLE alg = NULL;
     BCRYPT_KEY_HANDLE hkey = NULL;
     BYTE *key_object = NULL;
@@ -169,13 +169,13 @@ BOOL local_aes_gcm_decrypt(const BYTE key[MASTER_KEY_BYTES], const BYTE *envelop
     *out = plain;
     *out_len = cipher_len;
     plain = NULL;
-    ok = TRUE;
+    decrypt_succeeded = TRUE;
 cleanup:
     if (hkey) BCryptDestroyKey(hkey);
     if (alg) BCryptCloseAlgorithmProvider(alg, 0);
     secure_free(key_object, obj_len);
     secure_free(plain, cipher_len);
-    return ok;
+    return decrypt_succeeded;
 }
 
 BOOL read_u32_mem(const BYTE **p, const BYTE *end, DWORD *out) {
