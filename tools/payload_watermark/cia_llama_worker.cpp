@@ -171,6 +171,18 @@ static std::array<uint8_t, 32> sha256_bytes(const std::string & s) {
     Sha256 h; h.update(s); return h.final();
 }
 
+static std::array<uint8_t, 32> topk_generation_seed_digest(const std::string & seed,
+                                                           const std::vector<uint8_t> & payload) {
+    Sha256 h;
+    h.update("ChineseInputAgent top-k generation seed v2");
+    const uint8_t zero = 0;
+    h.update(&zero, 1);
+    h.update(seed);
+    h.update(&zero, 1);
+    if (!payload.empty()) h.update(payload.data(), payload.size());
+    return h.final();
+}
+
 static std::vector<uint8_t> read_binary(const std::string & path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("无法打开输入文件：" + path);
@@ -1511,7 +1523,7 @@ public:
         const std::string prompt = build_topk_prompt(topic);
         std::string last_error;
         uint32_t base_seed = 0;
-        auto digest = sha256_bytes(seed + ":" + std::to_string(payload.size()) + ":topk");
+        auto digest = topk_generation_seed_digest(seed, payload);
         for (int i = 0; i < 4; ++i) base_seed = (base_seed << 8) | digest[static_cast<size_t>(i)];
         for (int attempt = 1; attempt <= 5; ++attempt) {
             std::string text;
@@ -1552,24 +1564,29 @@ static std::string default_model_path(char ** argv) {
     std::vector<fs::path> candidates;
     fs::path cwd = fs::current_path();
     fs::path exe_dir = exe_dir_path(argv);
-    candidates.push_back(cwd / "models" / "Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
-    candidates.push_back(cwd / "models" / "qwen3-4b-instruct-2507-q4_k_m.gguf");
-    candidates.push_back(cwd / "models" / "Qwen_Qwen3.5-4B-Q4_K_M.gguf");
-    candidates.push_back(cwd / "models" / "qwen3.5-4b-instruct-Q4_K_M.gguf");
-    candidates.push_back(cwd / "models" / "Qwen3.5-4B-Q4_K_M.gguf");
-    candidates.push_back(cwd / "models" / "base_model.gguf");
-    candidates.push_back(cwd / ".." / ".." / "models" / "Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
-    candidates.push_back(cwd / ".." / ".." / "models" / "qwen3-4b-instruct-2507-q4_k_m.gguf");
-    candidates.push_back(cwd / ".." / ".." / "models" / "Qwen_Qwen3.5-4B-Q4_K_M.gguf");
-    candidates.push_back(cwd / ".." / ".." / "models" / "qwen3.5-4b-instruct-Q4_K_M.gguf");
-    candidates.push_back(cwd / ".." / ".." / "models" / "Qwen3.5-4B-Q4_K_M.gguf");
-    candidates.push_back(cwd / ".." / ".." / "models" / "base_model.gguf");
-    candidates.push_back(exe_dir / ".." / ".." / "models" / "Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
-    candidates.push_back(exe_dir / ".." / ".." / "models" / "qwen3-4b-instruct-2507-q4_k_m.gguf");
-    candidates.push_back(exe_dir / ".." / ".." / "models" / "Qwen_Qwen3.5-4B-Q4_K_M.gguf");
-    candidates.push_back(exe_dir / ".." / ".." / "models" / "qwen3.5-4b-instruct-Q4_K_M.gguf");
-    candidates.push_back(exe_dir / ".." / ".." / "models" / "Qwen3.5-4B-Q4_K_M.gguf");
-    candidates.push_back(exe_dir / ".." / ".." / "models" / "base_model.gguf");
+    const char * names[] = {
+        "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+        "qwen3-4b-instruct-2507-q4_k_m.gguf",
+        "Qwen_Qwen3.5-4B-Q4_K_M.gguf",
+        "qwen3.5-4b-instruct-Q4_K_M.gguf",
+        "Qwen3.5-4B-Q4_K_M.gguf",
+        "base_model.gguf",
+    };
+    auto add_dir = [&](const fs::path & dir) {
+        for (const char * name : names) candidates.push_back(dir / name);
+    };
+    add_dir(cwd / "models");
+    add_dir(cwd);
+    add_dir(cwd / ".." / "models");
+    add_dir(cwd / "..");
+    add_dir(cwd / ".." / ".." / "models");
+    add_dir(cwd / ".." / "..");
+    add_dir(exe_dir / "models");
+    add_dir(exe_dir);
+    add_dir(exe_dir / ".." / "models");
+    add_dir(exe_dir / "..");
+    add_dir(exe_dir / ".." / ".." / "models");
+    add_dir(exe_dir / ".." / "..");
     for (const auto & p : candidates) if (fs::exists(p)) return fs::absolute(p).string();
     return fs::absolute(candidates.front()).string();
 }
