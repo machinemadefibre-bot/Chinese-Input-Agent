@@ -2134,23 +2134,19 @@ static BOOL start_background_work(WORK_CTX *ctx) {
 }
 
 static void do_export_key(HWND hwnd, HWND target_textbox) {
-    WCHAR *topic = get_required_topic_text(hwnd, g_topic_edit);
-    if (!topic) return;
     WORK_CTX *ctx = (WORK_CTX *)xalloc(sizeof(WORK_CTX));
     if (!ctx) {
-        xfree(topic);
         show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
         return;
     }
     ctx->kind = WORK_KIND_EXPORT_KEY;
     ctx->owner = hwnd;
     ctx->target_textbox = target_textbox;
-    ctx->topic = topic;
+    ctx->topic = NULL;
     set_textbox_overlay(target_textbox, L"\u6b63\u5728\u751f\u6210\u8054\u7cfb\u4eba\u516c\u94a5\u5305\u8f7d\u4f53\u6587\u672c\uff0c\u8bf7\u7a0d\u5019...", TRUE);
     SetWindowTextW(target_textbox, L"");
     if (!start_background_work(ctx)) {
         set_textbox_overlay(target_textbox, NULL, FALSE);
-        xfree(topic);
         xfree(ctx);
     }
 }
