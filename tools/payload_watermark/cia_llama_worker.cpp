@@ -1,0 +1,1745 @@
+#include "llama.h"
+
+#include "ggml-backend.h"
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cctype>
+#include <filesystem>
+#include <functional>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <numeric>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+static constexpr int DEFAULT_RADIX = 4;
+static constexpr int VERSION = 2;
+static constexpr int TERMINATOR_SECURITY_BITS = 64;
+static const std::string SELF_INTRO_TOPIC_UTF8 =
+    "\xE8\x87\xAA" "\xE6\x88\x91" "\xE4\xBB\x8B" "\xE7\xBB\x8D";
+static const std::string TOPK_PROMPT =
+    "<|im_start|>user\n"
+    "写一篇自然流畅的中文随笔。\n"
+    "要求：只输出正文，不要标题，不要提纲，不要编号，不要解释，不要输出思考过程，不要输出<think>。\n"
+    "内容可以围绕日常见闻、学习生活、人际交流和个人感受自然展开，句子要通顺，有正常标点。\n"
+    "<|im_end|>\n"
+    "<|im_start|>assistant\n";
+static std::string ascii_lower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
+static bool contains_ci(const std::string & haystack, const std::string & needle) {
+    return ascii_lower(haystack).find(ascii_lower(needle)) != std::string::npos;
+}
+
+static std::string clean_prompt_topic(std::string topic) {
+    for (char & c : topic) {
+        if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+    }
+    size_t start = 0;
+    while (start < topic.size() && std::isspace(static_cast<unsigned char>(topic[start]))) ++start;
+    size_t end = topic.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(topic[end - 1]))) --end;
+    topic = topic.substr(start, end - start);
+    if (topic.empty()) topic = "daily life";
+    if (topic.size() > 240) topic.resize(240);
+    return topic;
+}
+
+static std::string build_topk_prompt(const std::string & topic) {
+    std::string clean = clean_prompt_topic(topic);
+    if (clean.find(SELF_INTRO_TOPIC_UTF8) != std::string::npos || contains_ci(clean, "self-introduction")) {
+        return std::string("<|im_start|>user\n") +
+            "Write a first-person Chinese self-introduction.\n\n"
+            "Requirements:\n"
+            "1. Output Chinese prose only.\n"
+            "2. Stay on the self-introduction topic from beginning to end.\n"
+            "3. Write naturally about identity, daily life, learning, interests, personality, and how you communicate with others.\n"
+            "4. Do not output a title, outline, numbering, explanation, Markdown, JSON, or thinking process.\n"
+            "5. Do not output <think> or </think>.\n"
+            "6. Use normal punctuation and complete sentences.\n"
+            "<|im_end|>\n"
+            "<|im_start|>assistant\n";
+    }
+    return std::string("<|im_start|>user\n") +
+        "Write a natural, fluent Chinese prose text about this topic:\n" +
+        clean +
+        "\n\nRequirements:\n"
+        "1. Output Chinese prose only.\n"
+        "2. Do not output a title, outline, numbering, explanation, Markdown, JSON, or thinking process.\n"
+        "3. Do not output <think> or </think>.\n"
+        "4. Use normal punctuation and complete sentences.\n"
+        "5. If the topic is self-introduction, write in first person as a normal self-introduction.\n"
+        "<|im_end|>\n"
+        "<|im_start|>assistant\n";
+}
+
+struct Sha256 {
+    uint32_t h[8];
+    uint8_t block[64];
+    uint64_t bytes = 0;
+    size_t used = 0;
+
+    static uint32_t rotr(uint32_t x, uint32_t n) { return (x >> n) | (x << (32 - n)); }
+    static uint32_t load_be(const uint8_t * p) {
+        return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+    }
+    static void store_be(uint8_t * p, uint32_t v) {
+        p[0] = uint8_t(v >> 24); p[1] = uint8_t(v >> 16); p[2] = uint8_t(v >> 8); p[3] = uint8_t(v);
+    }
+
+    Sha256() { reset(); }
+    void reset() {
+        h[0] = 0x6a09e667u; h[1] = 0xbb67ae85u; h[2] = 0x3c6ef372u; h[3] = 0xa54ff53au;
+        h[4] = 0x510e527fu; h[5] = 0x9b05688cu; h[6] = 0x1f83d9abu; h[7] = 0x5be0cd19u;
+        bytes = 0; used = 0; std::memset(block, 0, sizeof(block));
+    }
+    void transform(const uint8_t * chunk) {
+        static const uint32_t k[64] = {
+            0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
+            0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
+            0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+            0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
+            0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
+            0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+            0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
+            0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u };
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i) w[i] = load_be(chunk + i * 4);
+        for (int i = 16; i < 64; ++i) {
+            uint32_t s0 = rotr(w[i-15], 7) ^ rotr(w[i-15], 18) ^ (w[i-15] >> 3);
+            uint32_t s1 = rotr(w[i-2], 17) ^ rotr(w[i-2], 19) ^ (w[i-2] >> 10);
+            w[i] = w[i-16] + s0 + w[i-7] + s1;
+        }
+        uint32_t a=h[0], b=h[1], c=h[2], d=h[3], e=h[4], f=h[5], g=h[6], hh=h[7];
+        for (int i = 0; i < 64; ++i) {
+            uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            uint32_t ch = (e & f) ^ ((~e) & g);
+            uint32_t temp1 = hh + S1 + ch + k[i] + w[i];
+            uint32_t S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            uint32_t temp2 = S0 + maj;
+            hh = g; g = f; f = e; e = d + temp1; d = c; c = b; b = a; a = temp1 + temp2;
+        }
+        h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+    }
+    void update(const uint8_t * data, size_t len) {
+        bytes += len;
+        while (len > 0) {
+            size_t take = std::min(len, sizeof(block) - used);
+            std::memcpy(block + used, data, take);
+            used += take; data += take; len -= take;
+            if (used == sizeof(block)) { transform(block); used = 0; }
+        }
+    }
+    void update(const std::string & s) { update(reinterpret_cast<const uint8_t *>(s.data()), s.size()); }
+    std::array<uint8_t, 32> final() {
+        uint64_t bit_len = bytes * 8;
+        block[used++] = 0x80;
+        if (used > 56) {
+            while (used < 64) block[used++] = 0;
+            transform(block); used = 0;
+        }
+        while (used < 56) block[used++] = 0;
+        for (int i = 7; i >= 0; --i) block[used++] = uint8_t(bit_len >> (i * 8));
+        transform(block);
+        std::array<uint8_t, 32> out{};
+        for (int i = 0; i < 8; ++i) store_be(out.data() + i * 4, h[i]);
+        return out;
+    }
+};
+
+static std::array<uint8_t, 32> sha256_bytes(const std::string & s) {
+    Sha256 h; h.update(s); return h.final();
+}
+
+static uint32_t crc32_bytes(const std::vector<uint8_t> & data) {
+    uint32_t crc = 0xffffffffu;
+    for (uint8_t b : data) {
+        crc ^= b;
+        for (int i = 0; i < 8; ++i) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+}
+
+static std::vector<uint8_t> read_binary(const std::string & path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("无法打开输入文件：" + path);
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+static std::string read_text(const std::string & path) {
+    auto data = read_binary(path);
+    return std::string(reinterpret_cast<const char *>(data.data()), data.size());
+}
+
+static void write_binary(const std::string & path, const std::vector<uint8_t> & data) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("无法打开输出文件：" + path);
+    f.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
+}
+
+static void write_text_file(const std::string & path, const std::string & text) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("无法打开输出文件：" + path);
+    f.write(text.data(), static_cast<std::streamsize>(text.size()));
+}
+
+static void append_utf8(std::string & out, uint32_t cp) {
+    if (cp <= 0x7f) out.push_back(char(cp));
+    else if (cp <= 0x7ff) { out.push_back(char(0xc0 | (cp >> 6))); out.push_back(char(0x80 | (cp & 0x3f))); }
+    else if (cp <= 0xffff) { out.push_back(char(0xe0 | (cp >> 12))); out.push_back(char(0x80 | ((cp >> 6) & 0x3f))); out.push_back(char(0x80 | (cp & 0x3f))); }
+    else { out.push_back(char(0xf0 | (cp >> 18))); out.push_back(char(0x80 | ((cp >> 12) & 0x3f))); out.push_back(char(0x80 | ((cp >> 6) & 0x3f))); out.push_back(char(0x80 | (cp & 0x3f))); }
+}
+
+static bool next_utf8(const std::string & s, size_t & i, uint32_t & cp) {
+    if (i >= s.size()) return false;
+    uint8_t c = uint8_t(s[i++]);
+    if (c < 0x80) { cp = c; return true; }
+    int need = 0; cp = 0;
+    if ((c & 0xe0) == 0xc0) { need = 1; cp = c & 0x1f; }
+    else if ((c & 0xf0) == 0xe0) { need = 2; cp = c & 0x0f; }
+    else if ((c & 0xf8) == 0xf0) { need = 3; cp = c & 0x07; }
+    else return false;
+    if (i + size_t(need) > s.size()) return false;
+    for (int j = 0; j < need; ++j) {
+        uint8_t d = uint8_t(s[i++]);
+        if ((d & 0xc0) != 0x80) return false;
+        cp = (cp << 6) | (d & 0x3f);
+    }
+    return true;
+}
+
+static bool is_cjk(uint32_t cp) {
+    return (cp >= 0x3400 && cp <= 0x4dbf) || (cp >= 0x4e00 && cp <= 0x9fff) || (cp >= 0xf900 && cp <= 0xfaff);
+}
+
+static bool is_chinese_punct(uint32_t cp) {
+    return cp == 0xff0c || cp == 0x3002 || cp == 0xff01 || cp == 0xff1f || cp == 0xff1b || cp == 0xff1a || cp == 0x3001;
+}
+
+static bool is_any_punctuation(uint32_t cp) {
+    if (is_chinese_punct(cp)) return true;
+    if ((cp >= 0x21 && cp <= 0x2f) || (cp >= 0x3a && cp <= 0x40) ||
+        (cp >= 0x5b && cp <= 0x60) || (cp >= 0x7b && cp <= 0x7e)) {
+        return true;
+    }
+    if (cp >= 0x2000 && cp <= 0x206f) return true; // General Punctuation
+    if (cp >= 0x3000 && cp <= 0x303f) return true; // CJK Symbols and Punctuation
+    if (cp >= 0xfe10 && cp <= 0xfe1f) return true; // Vertical punctuation
+    if (cp >= 0xfe30 && cp <= 0xfe4f) return true; // CJK compatibility forms
+    if (cp >= 0xff01 && cp <= 0xff0f) return true; // Fullwidth ASCII punctuation
+    if (cp >= 0xff1a && cp <= 0xff20) return true;
+    if (cp >= 0xff3b && cp <= 0xff40) return true;
+    if (cp >= 0xff5b && cp <= 0xff65) return true;
+    return false;
+}
+
+static bool is_book_title_mark(uint32_t cp) {
+    return cp == 0x3008 || cp == 0x3009 || cp == 0x300a || cp == 0x300b;
+}
+
+static bool is_bracket_char(uint32_t cp) {
+    return cp == '(' || cp == ')' || cp == '[' || cp == ']' || cp == '{' || cp == '}' ||
+           cp == '<' || cp == '>' || cp == 0xff08 || cp == 0xff09 ||
+           cp == 0x3010 || cp == 0x3011 || cp == 0x3014 || cp == 0x3015 ||
+           cp == 0x300c || cp == 0x300d || cp == 0x300e || cp == 0x300f ||
+           cp == 0x3016 || cp == 0x3017 || cp == 0x3018 || cp == 0x3019 ||
+           cp == 0x301a || cp == 0x301b || cp == 0xfe59 || cp == 0xfe5a ||
+           cp == 0xfe5b || cp == 0xfe5c || cp == 0xfe5d || cp == 0xfe5e ||
+           cp == 0xff3b || cp == 0xff3d || cp == 0xff5b || cp == 0xff5d ||
+           cp == 0xff1c || cp == 0xff1e;
+}
+
+static bool contains_bracket(const std::string & text) {
+    size_t i = 0; uint32_t cp = 0;
+    while (next_utf8(text, i, cp)) if (is_bracket_char(cp)) return true;
+    return false;
+}
+
+static bool is_social_stable_text(const std::string & text) {
+    if (text.empty()) return false;
+    bool has_cjk_char = false;
+    size_t i = 0;
+    while (i < text.size()) {
+        uint32_t cp = 0;
+        if (!next_utf8(text, i, cp)) return false;
+        if (cp == 0xfffd || cp < 0x20 || cp == 0x200b || cp == 0x200c || cp == 0x200d || cp == 0xfeff) return false;
+        if (cp == '\r' || cp == '\n' || cp == '\t' || cp == '`' || cp == '\\' || is_bracket_char(cp)) return false;
+        if (!(is_cjk(cp) || is_chinese_punct(cp) || is_book_title_mark(cp))) return false;
+        if (is_cjk(cp)) has_cjk_char = true;
+    }
+    return has_cjk_char;
+}
+
+static size_t cjk_count(const std::string & text) {
+    size_t n = 0, i = 0; uint32_t cp = 0;
+    while (next_utf8(text, i, cp)) if (is_cjk(cp)) ++n;
+    return n;
+}
+
+static bool contains_sentence_break(const std::string & text) {
+    size_t i = 0; uint32_t cp = 0;
+    while (next_utf8(text, i, cp)) if (cp == 0x3002 || cp == 0xff01 || cp == 0xff1f) return true;
+    return false;
+}
+
+static bool contains_punctuation(const std::string & text) {
+    size_t i = 0; uint32_t cp = 0;
+    while (next_utf8(text, i, cp)) if (is_any_punctuation(cp)) return true;
+    return false;
+}
+
+static bool is_punctuation_only_text(const std::string & text) {
+    if (text.empty()) return false;
+    bool any = false;
+    size_t i = 0; uint32_t cp = 0;
+    while (next_utf8(text, i, cp)) {
+        if (cp == 0xfffd || cp < 0x20 || cp == 0x200b || cp == 0x200c || cp == 0x200d || cp == 0xfeff) return false;
+        if (!(is_chinese_punct(cp) || is_book_title_mark(cp))) return false;
+        any = true;
+    }
+    return any;
+}
+static std::string json_escape(const std::string & s) {
+    std::string out;
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char buf[8]; std::snprintf(buf, sizeof(buf), "\\u%04x", c); out += buf;
+                } else out.push_back(char(c));
+        }
+    }
+    return out;
+}
+
+static bool parse_hex4(const std::string & s, size_t pos, uint32_t & cp) {
+    if (pos + 4 > s.size()) return false;
+    cp = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        char c = s[pos + i];
+        cp <<= 4;
+        if (c >= '0' && c <= '9') cp |= uint32_t(c - '0');
+        else if (c >= 'a' && c <= 'f') cp |= uint32_t(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') cp |= uint32_t(c - 'A' + 10);
+        else return false;
+    }
+    return true;
+}
+
+static bool json_get_string(const std::string & json, const std::string & key, std::string & out) {
+    std::string pat = "\"" + key + "\"";
+    size_t p = json.find(pat);
+    if (p == std::string::npos) return false;
+    p = json.find(':', p + pat.size());
+    if (p == std::string::npos) return false;
+    ++p;
+    while (p < json.size() && std::isspace(static_cast<unsigned char>(json[p]))) ++p;
+    if (p >= json.size() || json[p] != '"') return false;
+    ++p;
+    out.clear();
+    while (p < json.size()) {
+        char c = json[p++];
+        if (c == '"') return true;
+        if (c != '\\') { out.push_back(c); continue; }
+        if (p >= json.size()) return false;
+        char e = json[p++];
+        switch (e) {
+            case '"': out.push_back('"'); break;
+            case '\\': out.push_back('\\'); break;
+            case '/': out.push_back('/'); break;
+            case 'b': out.push_back('\b'); break;
+            case 'f': out.push_back('\f'); break;
+            case 'n': out.push_back('\n'); break;
+            case 'r': out.push_back('\r'); break;
+            case 't': out.push_back('\t'); break;
+            case 'u': {
+                uint32_t cp = 0;
+                if (!parse_hex4(json, p, cp)) return false;
+                p += 4;
+                if (cp >= 0xd800 && cp <= 0xdbff && p + 6 <= json.size() && json[p] == '\\' && json[p + 1] == 'u') {
+                    uint32_t lo = 0;
+                    if (parse_hex4(json, p + 2, lo) && lo >= 0xdc00 && lo <= 0xdfff) {
+                        cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+                        p += 6;
+                    }
+                }
+                append_utf8(out, cp);
+                break;
+            }
+            default: return false;
+        }
+    }
+    return false;
+}
+
+static int json_get_int(const std::string & json, const std::string & key, int fallback = 0) {
+    std::string pat = "\"" + key + "\"";
+    size_t p = json.find(pat);
+    if (p == std::string::npos) return fallback;
+    p = json.find(':', p + pat.size());
+    if (p == std::string::npos) return fallback;
+    ++p;
+    while (p < json.size() && std::isspace(static_cast<unsigned char>(json[p]))) ++p;
+    int sign = 1;
+    if (p < json.size() && json[p] == '-') { sign = -1; ++p; }
+    int v = 0; bool any = false;
+    while (p < json.size() && std::isdigit(static_cast<unsigned char>(json[p]))) { any = true; v = v * 10 + (json[p++] - '0'); }
+    return any ? sign * v : fallback;
+}
+
+static std::vector<int> tokenize(const llama_vocab * vocab, const std::string & text, bool add_special, bool parse_special) {
+    int n = llama_tokenize(vocab, text.c_str(), static_cast<int32_t>(text.size()), nullptr, 0, add_special, parse_special);
+    if (n == 0) return {};
+    if (n > 0) throw std::runtime_error("tokenizer 返回了异常的长度探测结果");
+    std::vector<int> out(static_cast<size_t>(-n));
+    n = llama_tokenize(vocab, text.c_str(), static_cast<int32_t>(text.size()), out.data(), static_cast<int32_t>(out.size()), add_special, parse_special);
+    if (n < 0) throw std::runtime_error("tokenizer 编码失败");
+    out.resize(static_cast<size_t>(n));
+    return out;
+}
+
+static std::string token_piece(const llama_vocab * vocab, int token) {
+    std::array<char, 256> small{};
+    int n = llama_token_to_piece(vocab, token, small.data(), static_cast<int32_t>(small.size()), 0, false);
+    if (n >= 0) return std::string(small.data(), static_cast<size_t>(n));
+    std::vector<char> buf(static_cast<size_t>(-n));
+    n = llama_token_to_piece(vocab, token, buf.data(), static_cast<int32_t>(buf.size()), 0, false);
+    if (n < 0) throw std::runtime_error("无法将 token 转换为文本片段");
+    return std::string(buf.data(), static_cast<size_t>(n));
+}
+
+static std::string detokenize(const llama_vocab * vocab, const std::vector<int> & tokens) {
+    if (tokens.empty()) return {};
+    int n = llama_detokenize(vocab, tokens.data(), static_cast<int32_t>(tokens.size()), nullptr, 0, false, false);
+    if (n == 0) return {};
+    if (n > 0) throw std::runtime_error("detokenizer 返回了异常的长度探测结果");
+    std::vector<char> buf(static_cast<size_t>(-n));
+    n = llama_detokenize(vocab, tokens.data(), static_cast<int32_t>(tokens.size()), buf.data(), static_cast<int32_t>(buf.size()), false, false);
+    if (n < 0) throw std::runtime_error("detokenizer 解码失败");
+    return std::string(buf.data(), static_cast<size_t>(n));
+}
+
+struct Candidate {
+    std::array<uint8_t, 32> digest{};
+    int token = 0;
+    std::string text;
+};
+
+struct TokenTable {
+    int radix = DEFAULT_RADIX;
+    std::vector<int> punctuation_tokens;
+    std::vector<int> free_text_tokens;
+    std::unordered_map<int, std::string> token_text;
+};
+
+static std::array<uint8_t, 32> token_digest(const std::string & seed, int token, const std::string & text) {
+    Sha256 h;
+    h.update(seed);
+    const uint8_t zero = 0;
+    h.update(&zero, 1);
+    std::string id = std::to_string(token);
+    h.update(id);
+    h.update(&zero, 1);
+    h.update(reinterpret_cast<const uint8_t *>(text.data()), text.size());
+    return h.final();
+}
+
+static bool stable_token(const llama_vocab * vocab, int token, const std::string & text) {
+    auto ids = tokenize(vocab, text, false, false);
+    return ids.size() == 1 && ids[0] == token;
+}
+
+static TokenTable build_token_table(const llama_vocab * vocab, const std::string & seed, int radix) {
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    std::vector<Candidate> candidates;
+    std::vector<Candidate> punctuation_candidates;
+    candidates.reserve(static_cast<size_t>(n_vocab / 4));
+    for (int token = 0; token < n_vocab; ++token) {
+        if (llama_vocab_is_control(vocab, token) || llama_vocab_is_eog(vocab, token)) continue;
+        std::string text;
+        try { text = token_piece(vocab, token); } catch (...) { continue; }
+        if (text.find("<think") != std::string::npos || text.find("</think") != std::string::npos) continue;
+        if (contains_bracket(text)) continue;
+        try { if (!stable_token(vocab, token, text)) continue; } catch (...) { continue; }
+        if (!is_social_stable_text(text) && !is_punctuation_only_text(text)) continue;
+        if (contains_punctuation(text)) {
+            if (is_punctuation_only_text(text) || is_social_stable_text(text)) {
+                punctuation_candidates.push_back({token_digest(seed + ":punctuation", token, text), token, text});
+            }
+            continue;
+        }
+        candidates.push_back({token_digest(seed, token, text), token, text});
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate & a, const Candidate & b) {
+        return a.digest < b.digest;
+    });
+    std::sort(punctuation_candidates.begin(), punctuation_candidates.end(), [](const Candidate & a, const Candidate & b) {
+        return a.digest < b.digest;
+    });
+    if (static_cast<int>(candidates.size()) < radix * 64) {
+        throw std::runtime_error("稳定 token 候选不足，无法构建 top-k 载体候选集");
+    }
+    TokenTable table;
+    table.radix = radix;
+    for (const auto & c : candidates) {
+        table.free_text_tokens.push_back(c.token);
+        table.token_text[c.token] = c.text;
+    }
+    for (const auto & c : punctuation_candidates) {
+        table.punctuation_tokens.push_back(c.token);
+        table.token_text[c.token] = c.text;
+    }
+    table.free_text_tokens.insert(table.free_text_tokens.end(), table.punctuation_tokens.begin(), table.punctuation_tokens.end());
+    return table;
+}
+
+static int bits_per_digit(int radix) {
+    if (radix == 2) return 1;
+    if (radix == 4) return 2;
+    if (radix == 8) return 3;
+    if (radix == 16) return 4;
+    throw std::runtime_error("top-k 载荷进制必须是 2、4、8 或 16");
+}
+
+static std::vector<int> bytes_to_base_digits(const std::vector<uint8_t> & data, int radix) {
+    const int bits = bits_per_digit(radix);
+    const int mask = radix - 1;
+    uint32_t acc = 0;
+    int bit_count = 0;
+    std::vector<int> out;
+    for (uint8_t byte : data) {
+        acc = (acc << 8) | byte;
+        bit_count += 8;
+        while (bit_count >= bits) {
+            bit_count -= bits;
+            out.push_back((acc >> bit_count) & mask);
+            acc &= bit_count ? ((1u << bit_count) - 1u) : 0u;
+        }
+    }
+    if (bit_count) out.push_back((acc << (bits - bit_count)) & mask);
+    return out;
+}
+
+static std::vector<uint8_t> base_digits_to_bytes(const std::vector<int> & digits, int radix) {
+    const int bits = bits_per_digit(radix);
+    uint32_t acc = 0;
+    int bit_count = 0;
+    std::vector<uint8_t> out;
+    for (int d : digits) {
+        if (d < 0 || d >= radix) throw std::runtime_error("载荷位超出当前 top-k 进制范围");
+        acc = (acc << bits) | static_cast<uint32_t>(d);
+        bit_count += bits;
+        while (bit_count >= 8) {
+            bit_count -= 8;
+            out.push_back(static_cast<uint8_t>((acc >> bit_count) & 0xffu));
+            acc &= bit_count ? ((1u << bit_count) - 1u) : 0u;
+        }
+    }
+    return out;
+}
+
+static bool is_power_of_two_radix(int radix) {
+    return radix == 2 || radix == 4 || radix == 8 || radix == 16;
+}
+
+static void append_u16_be(std::vector<uint8_t> & out, uint16_t v) { out.push_back(uint8_t(v >> 8)); out.push_back(uint8_t(v)); }
+static void append_u32_be(std::vector<uint8_t> & out, uint32_t v) { out.push_back(uint8_t(v >> 24)); out.push_back(uint8_t(v >> 16)); out.push_back(uint8_t(v >> 8)); out.push_back(uint8_t(v)); }
+static uint16_t read_u16_be(const std::vector<uint8_t> & d, size_t p) { return (uint16_t(d[p]) << 8) | d[p+1]; }
+static uint32_t read_u32_be(const std::vector<uint8_t> & d, size_t p) { return (uint32_t(d[p]) << 24) | (uint32_t(d[p+1]) << 16) | (uint32_t(d[p+2]) << 8) | d[p+3]; }
+
+static std::vector<uint8_t> frame_payload(const std::vector<uint8_t> & payload, int radix) {
+    (void)radix;
+    std::vector<uint8_t> out;
+    std::string magic = "CIAT";
+    out.insert(out.end(), magic.begin(), magic.end());
+    out.push_back(uint8_t(VERSION));
+    out.push_back(0); // flags
+    append_u16_be(out, 17); // fixed header, no HMAC tag
+    append_u32_be(out, static_cast<uint32_t>(payload.size()));
+    append_u32_be(out, crc32_bytes(payload));
+    out.push_back(0); // tag length
+    out.insert(out.end(), payload.begin(), payload.end());
+    return out;
+}
+
+static std::vector<uint8_t> unframe_payload(const std::vector<uint8_t> & frame, int radix) {
+    (void)radix;
+    if (frame.size() < 17) throw std::runtime_error("top-k 载荷帧长度不足，无法读取帧头");
+    std::string magic(reinterpret_cast<const char *>(frame.data()), 4);
+    if (magic != "CIAT") throw std::runtime_error("top-k 载荷帧标识不匹配，可能是 seed/tokenizer 不一致或复制内容不完整");
+    if (frame[4] != VERSION) throw std::runtime_error("top-k 载荷帧版本不兼容");
+    if (frame[5] != 0) throw std::runtime_error("top-k 载荷帧包含当前版本不支持的标志位");
+    uint16_t header_len = read_u16_be(frame, 6);
+    uint32_t payload_len = read_u32_be(frame, 8);
+    uint32_t crc = read_u32_be(frame, 12);
+    uint8_t tag_len = frame[16];
+    if (header_len != uint16_t(17 + tag_len) || tag_len != 0) throw std::runtime_error("top-k 载荷帧头结构不符合当前版本");
+    size_t needed = size_t(header_len) + payload_len;
+    if (frame.size() < needed) {
+        throw std::runtime_error("top-k 载荷帧被截断：需要 " + std::to_string(needed) +
+                                 " 字节，实际恢复 " + std::to_string(frame.size()) +
+                                 " 字节；请确认载体文本完整复制，且两端安装包、模型和 tokenizer 完全一致");
+    }
+    std::vector<uint8_t> payload(frame.begin() + header_len, frame.begin() + header_len + payload_len);
+    if (crc32_bytes(payload) != crc) throw std::runtime_error("top-k 载荷帧校验失败，载体文本可能被改写或 seed/tokenizer 不一致");
+    return payload;
+}
+
+static std::vector<int> terminator_digits(int radix) {
+    int bits = bits_per_digit(radix);
+    int needed = (TERMINATOR_SECURITY_BITS + bits - 1) / bits;
+    auto digest = sha256_bytes("ChineseInputAgent payload terminator v1 base " + std::to_string(radix));
+    std::vector<uint8_t> bytes(digest.begin(), digest.end());
+    auto digits = bytes_to_base_digits(bytes, radix);
+    if (static_cast<int>(digits.size()) > needed) digits.resize(static_cast<size_t>(needed));
+    return digits;
+}
+
+static bool has_terminator_suffix(const std::vector<int> & digits, int radix) {
+    auto marker = terminator_digits(radix);
+    if (digits.size() < marker.size()) return false;
+    return std::equal(marker.begin(), marker.end(), digits.end() - static_cast<std::ptrdiff_t>(marker.size()));
+}
+
+static std::vector<int> encode_payload_to_digits(const std::vector<uint8_t> & payload, int radix) {
+    auto framed = frame_payload(payload, radix);
+    auto digits = bytes_to_base_digits(framed, radix);
+    auto term = terminator_digits(radix);
+    digits.insert(digits.end(), term.begin(), term.end());
+    return digits;
+}
+
+static bool split_at_terminator(const std::vector<int> & digits, int radix, std::vector<int> & trimmed) {
+    auto marker = terminator_digits(radix);
+    if (digits.size() < marker.size()) return false;
+    for (size_t start = 0; start + marker.size() <= digits.size(); ++start) {
+        if (std::equal(marker.begin(), marker.end(), digits.begin() + static_cast<std::ptrdiff_t>(start))) {
+            trimmed.assign(digits.begin(), digits.begin() + static_cast<std::ptrdiff_t>(start));
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool try_decode_payload_digits(const std::vector<int> & digits, int radix, std::vector<uint8_t> & payload, std::string & err) {
+    try {
+        auto bytes = base_digits_to_bytes(digits, radix);
+        payload = unframe_payload(bytes, radix);
+        return true;
+    } catch (const std::exception & e) {
+        err = e.what();
+        return false;
+    }
+}
+
+static std::vector<uint8_t> decode_digits_to_payload(const std::vector<int> & digits, int radix) {
+    if (digits.empty()) {
+        throw std::runtime_error("未从载体文本中解出任何 top-k 载荷位；请确认复制的是完整载体文本，且两端模型和 tokenizer 一致");
+    }
+    std::vector<std::vector<int>> candidates;
+    std::vector<int> trimmed;
+    bool found_terminator = split_at_terminator(digits, radix, trimmed);
+    if (found_terminator) candidates.push_back(trimmed);
+    candidates.push_back(digits);
+    std::string primary_error;
+    std::string scan_error;
+    for (const auto & candidate : candidates) {
+        std::vector<uint8_t> payload; std::string err;
+        if (try_decode_payload_digits(candidate, radix, payload, err)) return payload;
+        if (primary_error.empty() && !err.empty()) primary_error = err;
+        size_t scan_limit = std::min<size_t>(candidate.size(), 2048);
+        for (size_t start = 1; start < scan_limit; ++start) {
+            std::vector<int> suffix(candidate.begin() + static_cast<std::ptrdiff_t>(start), candidate.end());
+            if (try_decode_payload_digits(suffix, radix, payload, err)) return payload;
+            if (scan_error.empty() && !err.empty()) scan_error = err;
+        }
+    }
+    std::string err = !primary_error.empty() ? primary_error : (!scan_error.empty() ? scan_error : "top-k 载荷帧无法解码");
+    err += "（top-k进制=" + std::to_string(radix) +
+           "，恢复位数=" + std::to_string(digits.size()) +
+           "，终止标记=" + std::string(found_terminator ? "已找到" : "未找到") + "）";
+    throw std::runtime_error(err);
+}
+
+static std::string trim_text(std::string s) {
+    auto is_ws = [](unsigned char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+    while (!s.empty() && is_ws(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+    while (!s.empty() && is_ws(static_cast<unsigned char>(s.back()))) s.pop_back();
+    return s;
+}
+
+static std::string strip_thinking_blocks(std::string s) {
+    for (;;) {
+        size_t start = s.find("<think>");
+        if (start == std::string::npos) break;
+        size_t end = s.find("</think>", start);
+        if (end == std::string::npos) {
+            s.erase(start);
+            break;
+        }
+        s.erase(start, end + 8 - start);
+    }
+    for (;;) {
+        size_t p = s.find("</think>");
+        if (p == std::string::npos) break;
+        s.erase(p, 8);
+    }
+    return s;
+}
+
+static bool contains_any_phrase(const std::string & text, const std::vector<std::string> & phrases) {
+    for (const auto & phrase : phrases) {
+        if (!phrase.empty() && text.find(phrase) != std::string::npos) return true;
+    }
+    return false;
+}
+
+static bool has_enough_article_before(const std::string & text, size_t pos, size_t min_cjk = 260) {
+    if (pos == std::string::npos || pos == 0) return false;
+    return cjk_count(text.substr(0, pos)) >= min_cjk;
+}
+
+static void truncate_at_tail_phrase(std::string & text, const std::vector<std::string> & phrases, size_t min_cjk = 260) {
+    size_t cut = std::string::npos;
+    for (const auto & phrase : phrases) {
+        size_t pos = text.find(phrase);
+        if (pos != std::string::npos && has_enough_article_before(text, pos, min_cjk)) cut = std::min(cut, pos);
+    }
+    if (cut != std::string::npos) {
+        text.resize(cut);
+        text = trim_text(text);
+    }
+}
+
+static bool is_chinese_section_marker(uint32_t cp) {
+    return cp == 0x4e00 || cp == 0x4e8c || cp == 0x4e09 || cp == 0x56db ||
+           cp == 0x4e94 || cp == 0x516d || cp == 0x4e03 || cp == 0x516b ||
+           cp == 0x4e5d || cp == 0x5341;
+}
+
+static bool starts_with_outline_ordinal(const std::string & line) {
+    const char * ordinal[] = {
+        "\xe9\xa6\x96\xe5\x85\x88",
+        "\xe5\x85\xb6\xe6\xac\xa1",
+        "\xe6\x9c\x80\xe5\x90\x8e",
+    };
+    for (const char * marker : ordinal) {
+        const size_t ml = std::strlen(marker);
+        if (line.rfind(marker, 0) == 0 && line.size() > ml) {
+            size_t k = ml;
+            uint32_t cp = 0;
+            if (!next_utf8(line, k, cp) ||
+                cp == 0x3001 || cp == 0xff0c || cp == 0xff1a ||
+                cp == ':' || std::isspace(static_cast<unsigned char>(line[ml]))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool contains_outline_markers_precise(const std::string & text) {
+    auto has_phrase = [&](const char * phrase) {
+        return phrase && phrase[0] && text.find(phrase) != std::string::npos;
+    };
+    if (has_phrase("\xe6\x8f\x90\xe7\xba\xb2") ||
+        has_phrase("\xe6\xa0\x87\xe9\xa2\x98\xef\xbc\x9a") ||
+        has_phrase("\xe6\xa0\x87\xe9\xa2\x98:") ||
+        has_phrase("\xe5\xb0\x8f\xe6\xa0\x87\xe9\xa2\x98\xef\xbc\x9a") ||
+        has_phrase("\xe5\xb0\x8f\xe6\xa0\x87\xe9\xa2\x98:") ||
+        has_phrase("\xe4\xb8\x8b\xe9\x9d\xa2\xe6\x98\xaf\xe6\xad\xa3\xe6\x96\x87") ||
+        has_phrase("\xe6\xad\xa3\xe6\x96\x87\xe5\xa6\x82\xe4\xb8\x8b")) {
+        return true;
+    }
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t line_end = text.find('\n', pos);
+        std::string line = trim_text(line_end == std::string::npos ? text.substr(pos) : text.substr(pos, line_end - pos));
+        if (!line.empty()) {
+            size_t n = 0;
+            while (n < line.size() && std::isdigit(static_cast<unsigned char>(line[n]))) ++n;
+            if (n > 0 && n < line.size() &&
+                (line[n] == '.' || line[n] == ':' || line.compare(n, 3, "\xe3\x80\x81") == 0 || line.compare(n, 3, "\xef\xbc\x9a") == 0)) {
+                return true;
+            }
+            size_t i = 0;
+            uint32_t cp = 0;
+            if (next_utf8(line, i, cp) && is_chinese_section_marker(cp)) {
+                uint32_t next_cp = 0;
+                size_t j = i;
+                bool has_next = next_utf8(line, j, next_cp);
+                if (!has_next || std::isspace(static_cast<unsigned char>(line[i])) ||
+                    next_cp == 0x3001 || next_cp == 0xff1a || next_cp == ':') {
+                    return true;
+                }
+            }
+            if (starts_with_outline_ordinal(line)) return true;
+        }
+        if (line_end == std::string::npos) break;
+        pos = line_end + 1;
+    }
+    return false;
+}
+
+static bool looks_like_meta_or_compliance_text(const std::string & text) {
+    return contains_any_phrase(text, {
+        "合规检查", "合规性", "安全检查", "安全过滤", "安全审查",
+        "正常辅助工作", "超出了正常辅助", "拒绝进一步",
+        "不符合正式出版", "核心能力范围", "服务安全性",
+        "风险缺失", "法律法规", "准确性",
+        "请确认阅读", "请确认", "请您", "请提供", "继续处理",
+        "是否完成", "新的要求", "用户需求", "写作需求", "格式需求",
+        "准备好接受", "下方评论区", "根据你提供", "你提供的", "你的要求",
+        "提纲内容", "注意结尾", "注：", "注:", "此处根据"
+    });
+}
+
+static bool contains_outline_markers(const std::string & text) {
+    if (contains_any_phrase(text, {
+            "提纲", "标题：", "标题:", "小标题：", "小标题:",
+            "首先", "其次", "最后", "本段将", "本文将", "下面是正文", "正文如下"
+        })) {
+        return true;
+    }
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t line_end = text.find('\n', pos);
+        std::string line = trim_text(line_end == std::string::npos ? text.substr(pos) : text.substr(pos, line_end - pos));
+        if (!line.empty()) {
+            size_t n = 0;
+            while (n < line.size() && std::isdigit(static_cast<unsigned char>(line[n]))) ++n;
+            if (n > 0 && n < line.size() &&
+                (line[n] == '.' || line[n] == ':' || line.compare(n, 3, "、") == 0 || line.compare(n, 3, "：") == 0)) {
+                return true;
+            }
+            size_t i = 0;
+            uint32_t cp = 0;
+            if (next_utf8(line, i, cp) && is_chinese_section_marker(cp)) {
+                uint32_t next_cp = 0;
+                size_t j = i;
+                bool has_next = next_utf8(line, j, next_cp);
+                if (!has_next || std::isspace(static_cast<unsigned char>(line[i])) ||
+                    next_cp == 0x3001 || next_cp == 0xff1a || next_cp == ':') {
+                    return true;
+                }
+            }
+        }
+        if (line_end == std::string::npos) break;
+        pos = line_end + 1;
+    }
+    return false;
+}
+
+static bool looks_like_numbered_section_body(const std::string & text) {
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t line_end = text.find('\n', pos);
+        std::string line = trim_text(line_end == std::string::npos ? text.substr(pos) : text.substr(pos, line_end - pos));
+        if (!line.empty()) {
+            size_t i = 0;
+            uint32_t cp = 0;
+            if (next_utf8(line, i, cp) && is_chinese_section_marker(cp)) {
+                uint32_t next_cp = 0;
+                size_t j = i;
+                bool has_next = next_utf8(line, j, next_cp);
+                if (!has_next || std::isspace(static_cast<unsigned char>(line[i])) ||
+                    next_cp == 0x3001 || next_cp == 0xff1a || next_cp == ':') return true;
+            }
+        }
+        if (line_end == std::string::npos) break;
+        pos = line_end + 1;
+    }
+    return false;
+}
+
+static void collapse_repeated_tail_paragraphs(std::string & text) {
+    std::vector<std::string> parts;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t next = text.find("\n\n", pos);
+        std::string part = trim_text(next == std::string::npos ? text.substr(pos) : text.substr(pos, next - pos));
+        if (!part.empty()) parts.push_back(part);
+        if (next == std::string::npos) break;
+        pos = next + 2;
+    }
+    if (parts.size() < 3) return;
+    bool changed = false;
+    while (parts.size() >= 2) {
+        const std::string & last = parts.back();
+        const std::string & prev = parts[parts.size() - 2];
+        if (cjk_count(last) < 24 || last != prev) break;
+        parts.pop_back();
+        changed = true;
+    }
+    if (!changed) return;
+    text = trim_text(std::accumulate(std::next(parts.begin()), parts.end(), parts.front(),
+        [](std::string a, const std::string & b) { return std::move(a) + "\n\n" + b; }));
+}
+
+static std::string clean_generated_article(std::string text) {
+    text = strip_thinking_blocks(text);
+    text = trim_text(text);
+    truncate_at_tail_phrase(text, {
+        "<|im_", "```", "以上是我", "以上就是", "以上内容", "以上正文", "以上文章",
+        "根据提纲撰写", "完整正文所有内容", "字数约", "符合文章主题", "满足写作助手",
+        "请您继续处理", "请继续处理", "请确认", "是否完成此请求", "是否有新的要求",
+        "新的要求需要调整", "如果不需要继续", "不需要继续处理", "直接输入", "不写内容",
+        "最终输出文档", "即可执行", "生成最终输出", "合规检查", "安全检查", "安全过滤",
+        "安全审查", "正常辅助工作", "超出了正常辅助", "拒绝进一步", "不符合正式出版",
+        "核心能力范围", "服务安全性", "根据你提供", "你提供的", "你的要求", "提纲内容",
+        "注意结尾", "注：", "注:", "此处根据"
+    });
+    for (;;) {
+        bool changed = false;
+        text = trim_text(text);
+        for (const auto & prefix : {"正文：", "正文:", "文章：", "文章:"}) {
+            if (text.rfind(prefix, 0) == 0) {
+                text.erase(0, std::strlen(prefix));
+                changed = true;
+                break;
+            }
+        }
+        if (!changed) break;
+    }
+    collapse_repeated_tail_paragraphs(text);
+    return trim_text(text);
+}
+
+static bool looks_like_instruction_reply(const std::string & text) {
+    if (looks_like_meta_or_compliance_text(text)) return true;
+    std::string head = text.substr(0, std::min<size_t>(text.size(), 1800));
+    if (contains_any_phrase(head, {
+            "请提供具体", "请提供更多", "请提供完整", "提供具体的写作需求", "写作需求",
+            "这是一个关于", "这是一篇关于", "建议文章吗", "完整的长篇文章",
+            "我可以继续", "我会继续", "继续为你", "进一步处理", "开始处理",
+            "如果你希望", "如果你需要", "是否要", "是否需要", "你希望我",
+            "请确认", "请告诉我", "让我们从", "我们可以先"
+        })) {
+        return true;
+    }
+    std::string tail = text.size() > 2200 ? text.substr(text.size() - 2200) : text;
+    return contains_any_phrase(tail, {
+        "以上是我", "以上就是", "完整正文所有内容", "字数约", "满足写作助手",
+        "请您继续处理", "请继续处理", "请确认", "是否完成此请求", "是否有新的要求",
+        "如果不需要继续", "直接输入", "不写内容", "最终输出文档", "即可执行"
+    });
+}
+struct ScoredToken {
+    int token = 0;
+    float score = 0.0f;
+    std::string text;
+};
+
+static float apply_repeat_penalty(float score, float penalty) {
+    if (penalty <= 1.0f) return score;
+    return score > 0 ? score / penalty : score * penalty;
+}
+
+static int trailing_token_run(const std::vector<int> & tokens, int token) {
+    int run = 0;
+    for (size_t i = tokens.size(); i > 0; --i) {
+        if (tokens[i - 1] != token) break;
+        ++run;
+    }
+    return run;
+}
+
+static float apply_contiguous_repeat_penalty(float score, const std::vector<int> & generated_tokens, int token) {
+    int run = trailing_token_run(generated_tokens, token);
+    if (run <= 0) return score;
+    float penalty = std::min(2.25f, 1.18f + 0.22f * static_cast<float>(run));
+    return apply_repeat_penalty(score, penalty);
+}
+
+static int chars_since_sentence_break(const std::string & text) {
+    int count = 0;
+    size_t i = text.size();
+    while (i > 0) {
+        size_t start = i - 1;
+        while (start > 0 && (uint8_t(text[start]) & 0xc0) == 0x80) --start;
+        size_t tmp = start; uint32_t cp = 0;
+        if (!next_utf8(text, tmp, cp)) break;
+        if (cp == 0x3002 || cp == 0xff01 || cp == 0xff1f) break;
+        if (is_cjk(cp)) ++count;
+        i = start;
+    }
+    return count;
+}
+
+static int chars_since_punctuation(const std::string & text) {
+    int count = 0;
+    size_t i = text.size();
+    while (i > 0) {
+        size_t start = i - 1;
+        while (start > 0 && (uint8_t(text[start]) & 0xc0) == 0x80) --start;
+        size_t tmp = start; uint32_t cp = 0;
+        if (!next_utf8(text, tmp, cp)) break;
+        if (is_chinese_punct(cp)) break;
+        if (is_cjk(cp)) ++count;
+        i = start;
+    }
+    return count;
+}
+
+static float punctuation_ramp(int chars) {
+    if (chars < 20) return 0.0f;
+    if (chars < 40) return float(chars - 19) / 21.0f;
+    return std::min(5.0f, 1.0f + float(chars - 40) / 12.0f);
+}
+
+static void build_stability_tail(const llama_vocab * vocab, const std::vector<int> & generated_tokens,
+                                 std::vector<int> & tail_tokens, std::string & tail_text) {
+    tail_tokens.clear();
+    tail_text.clear();
+    const size_t n = generated_tokens.size();
+    const size_t start = n > 64 ? n - 64 : 0;
+    tail_tokens.reserve(n - start);
+    for (size_t i = start; i < n; ++i) {
+        int id = generated_tokens[i];
+        tail_tokens.push_back(id);
+        tail_text += token_piece(vocab, id);
+    }
+}
+
+static bool stable_append_tail(const llama_vocab * vocab, const std::string & tail_text,
+                               const std::vector<int> & tail_tokens, int token, const std::string & piece) {
+    auto ids = tokenize(vocab, tail_text + piece, false, false);
+    if (ids.size() != tail_tokens.size() + 1) return false;
+    for (size_t i = 0; i < tail_tokens.size(); ++i) if (ids[i] != tail_tokens[i]) return false;
+    return ids.back() == token;
+}
+
+static int topk_digit_for_token(const std::string & seed, size_t payload_pos, int token, int radix) {
+        if (!is_power_of_two_radix(radix)) throw std::runtime_error("top-k 载荷进制必须是 2、4、8 或 16");
+    Sha256 h;
+    h.update("ChineseInputAgent top-k token digit v1");
+    const uint8_t zero = 0;
+    h.update(&zero, 1);
+    h.update(seed);
+    h.update(&zero, 1);
+    std::string pos = std::to_string(payload_pos);
+    h.update(pos);
+    h.update(&zero, 1);
+    std::string tok = std::to_string(token);
+    h.update(tok);
+    auto digest = h.final();
+    return int(digest[0] & uint8_t(radix - 1));
+}
+class LlamaPayloadWorker {
+public:
+    std::string model_path;
+    std::string adapter_path;
+    int radix = DEFAULT_RADIX;
+    int n_gpu_layers = 99;
+    int n_ctx = 4096;
+    int n_threads = std::max(2u, std::thread::hardware_concurrency());
+    int free_tail_tokens = 64;
+    int min_tail_tokens = 0;
+    float temperature = 0.62f;
+    float top_p = 0.78f;
+    int top_k = 128;
+    std::string backend_preference = "auto";
+    std::string backend_used = "cpu";
+
+    llama_model * model = nullptr;
+    llama_adapter_lora * adapter = nullptr;
+    const llama_vocab * vocab = nullptr;
+    std::map<std::string, TokenTable> table_cache;
+    ggml_backend_dev_t selected_devices[2] = { nullptr, nullptr };
+
+    ~LlamaPayloadWorker() {
+        if (adapter) llama_adapter_lora_free(adapter);
+        if (model) llama_model_free(model);
+    }
+
+    std::string device_backend_name(ggml_backend_dev_t dev) const {
+        if (!dev) return "cpu";
+        std::string label;
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+        const char * dev_name = ggml_backend_dev_name(dev);
+        const char * desc = ggml_backend_dev_description(dev);
+        if (reg_name) label += reg_name;
+        if (dev_name) { if (!label.empty()) label += ":"; label += dev_name; }
+        if (desc) { if (!label.empty()) label += ":"; label += desc; }
+        return label.empty() ? "gpu" : label;
+    }
+
+    void add_matching_devices(std::vector<ggml_backend_dev_t> & out, const std::string & backend) const {
+        const size_t count = ggml_backend_dev_count();
+        for (size_t i = 0; i < count; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (!dev) continue;
+            if (std::find(out.begin(), out.end(), dev) != out.end()) continue;
+            std::string label = device_backend_name(dev);
+            if (contains_ci(label, backend)) out.push_back(dev);
+        }
+    }
+
+    void add_gpu_devices(std::vector<ggml_backend_dev_t> & out) const {
+        const size_t count = ggml_backend_dev_count();
+        for (size_t i = 0; i < count; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (!dev) continue;
+            if (std::find(out.begin(), out.end(), dev) != out.end()) continue;
+            auto type = ggml_backend_dev_type(dev);
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) out.push_back(dev);
+        }
+    }
+
+    int64_t device_priority_score(ggml_backend_dev_t dev) const {
+        if (!dev) return 0;
+        std::string label = device_backend_name(dev);
+        std::string lower = ascii_lower(label);
+        int64_t score = 0;
+
+        // Backend order: CUDA first, then Vulkan, then any other accelerator. Within
+        // Vulkan, strongly prefer a discrete GPU so AMD/NVIDIA dGPUs do not lose to
+        // Intel/AMD integrated adapters that may report large shared system memory.
+        if (contains_ci(label, "cuda")) score += 1000000;
+        else if (contains_ci(label, "vulkan")) score += 700000;
+        else score += 400000;
+
+        auto type = ggml_backend_dev_type(dev);
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU) score += 250000;
+        else if (type == GGML_BACKEND_DEVICE_TYPE_IGPU) score -= 250000;
+
+        if (contains_ci(label, "nvidia")) score += 70000;
+        if (contains_ci(label, "geforce") || contains_ci(label, "rtx") || contains_ci(label, "gtx")) score += 50000;
+        if (contains_ci(label, "amd") || contains_ci(label, "radeon")) score += 30000;
+        if (contains_ci(label, "radeon rx") || contains_ci(label, "radeon pro") ||
+            lower.find(" rx ") != std::string::npos || lower.find("(rx ") != std::string::npos) {
+            score += 60000;
+        }
+        if (contains_ci(label, "intel") || contains_ci(label, "uhd") || contains_ci(label, "iris") ||
+            contains_ci(label, "integrated") || contains_ci(label, "igpu")) {
+            score -= 160000;
+        }
+        if (contains_ci(label, "radeon(tm) graphics") || contains_ci(label, "radeon graphics") ||
+            contains_ci(label, "vega")) {
+            score -= 80000;
+        }
+
+        size_t free_mem = 0, total_mem = 0;
+        ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+        const int64_t total_mib = static_cast<int64_t>(total_mem / (1024ull * 1024ull));
+        const int64_t free_mib = static_cast<int64_t>(free_mem / (1024ull * 1024ull));
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            score += std::min<int64_t>(total_mib, 65536);
+            score += std::min<int64_t>(free_mib / 2, 32768);
+        } else if (type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            score += std::min<int64_t>(total_mib / 32, 2048);
+            score += std::min<int64_t>(free_mib / 64, 1024);
+        }
+
+        return score;
+    }
+
+    void sort_devices_by_priority(std::vector<ggml_backend_dev_t> & devices) const {
+        std::stable_sort(devices.begin(), devices.end(), [&](ggml_backend_dev_t a, ggml_backend_dev_t b) {
+            return device_priority_score(a) > device_priority_score(b);
+        });
+    }
+
+    std::vector<ggml_backend_dev_t> preferred_devices() const {
+        std::vector<ggml_backend_dev_t> devices;
+        std::string pref = ascii_lower(backend_preference);
+        if (pref == "cpu") return devices;
+        if (pref == "cuda") {
+            add_matching_devices(devices, "cuda");
+            sort_devices_by_priority(devices);
+            return devices;
+        }
+        if (pref == "vulkan") {
+            add_matching_devices(devices, "vulkan");
+            sort_devices_by_priority(devices);
+            return devices;
+        }
+        add_matching_devices(devices, "cuda");
+        add_matching_devices(devices, "vulkan");
+        add_gpu_devices(devices);
+        sort_devices_by_priority(devices);
+        return devices;
+    }
+
+    llama_model * load_model_file(const std::string & path, std::string & used_backend) {
+        std::vector<ggml_backend_dev_t> candidates = preferred_devices();
+        candidates.push_back(nullptr);
+        std::string first_error;
+        for (ggml_backend_dev_t dev : candidates) {
+            llama_model_params mp = llama_model_default_params();
+            if (dev) {
+                selected_devices[0] = dev;
+                selected_devices[1] = nullptr;
+                mp.devices = selected_devices;
+                mp.n_gpu_layers = n_gpu_layers;
+            } else {
+                selected_devices[0] = nullptr;
+                selected_devices[1] = nullptr;
+                mp.devices = nullptr;
+                mp.n_gpu_layers = 0;
+            }
+            llama_model * loaded = llama_model_load_from_file(path.c_str(), mp);
+            if (loaded) {
+                used_backend = dev ? device_backend_name(dev) : "cpu";
+                return loaded;
+            }
+            if (first_error.empty()) first_error = dev ? device_backend_name(dev) : "cpu";
+        }
+        throw std::runtime_error("无法加载 GGUF 模型：" + path);
+    }
+
+    void load() {
+        ggml_backend_load_all();
+        model = load_model_file(model_path, backend_used);
+        if (!model) throw std::runtime_error("无法加载 GGUF 模型：" + model_path);
+        vocab = llama_model_get_vocab(model);
+        if (!vocab) throw std::runtime_error("已加载模型不包含 tokenizer 词表");
+        if (!adapter_path.empty() && fs::exists(adapter_path)) {
+            adapter = llama_adapter_lora_init(model, adapter_path.c_str());
+            if (!adapter) throw std::runtime_error("无法加载 LoRA adapter：" + adapter_path);
+        }
+    }
+
+    TokenTable & table_for_seed(const std::string & seed) {
+        auto it = table_cache.find(seed);
+        if (it != table_cache.end()) return it->second;
+        auto inserted = table_cache.emplace(seed, build_token_table(vocab, seed, radix));
+        return inserted.first->second;
+    }
+
+    llama_sampler * make_sampler(uint32_t seed) const {
+        auto params = llama_sampler_chain_default_params();
+        params.no_perf = true;
+        llama_sampler * smpl = llama_sampler_chain_init(params);
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k));
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, 1));
+        llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature));
+        llama_sampler_chain_add(smpl, llama_sampler_init_dist(seed));
+        return smpl;
+    }
+
+    std::vector<int> candidate_subset(const std::vector<int> & allowed, const std::vector<int> & generated_tokens,
+                                      const std::string & generated_text, size_t limit) const {
+        if (allowed.size() <= limit) return allowed;
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&](uint64_t v) {
+            h ^= v;
+            h *= 1099511628211ull;
+        };
+        mix(static_cast<uint64_t>(allowed.size()));
+        mix(static_cast<uint64_t>(generated_tokens.size()));
+        const size_t token_tail = std::min<size_t>(16, generated_tokens.size());
+        for (size_t i = generated_tokens.size() - token_tail; i < generated_tokens.size(); ++i) {
+            mix(static_cast<uint64_t>(static_cast<uint32_t>(generated_tokens[i])));
+        }
+        const size_t text_tail = std::min<size_t>(96, generated_text.size());
+        for (size_t i = generated_text.size() - text_tail; i < generated_text.size(); ++i) {
+            mix(static_cast<unsigned char>(generated_text[i]));
+        }
+        std::vector<int> out;
+        out.reserve(limit + 96);
+        std::unordered_set<int> seen;
+        seen.reserve(limit + 96);
+        size_t pos = static_cast<size_t>(h % allowed.size());
+        size_t stride = static_cast<size_t>(((h >> 33) | 1ull) % allowed.size());
+        if (stride == 0) stride = 1;
+        const size_t max_walk = std::min(allowed.size(), limit * 8);
+        for (size_t walked = 0; walked < max_walk && out.size() < limit; ++walked) {
+            int id = allowed[pos];
+            if (seen.insert(id).second) out.push_back(id);
+            pos += stride;
+            pos %= allowed.size();
+        }
+        for (size_t i = allowed.size() - std::min<size_t>(96, allowed.size()); i < allowed.size() && out.size() < limit + 96; ++i) {
+            int id = allowed[i];
+            if (seen.insert(id).second) out.push_back(id);
+        }
+        return out.empty() ? std::vector<int>(allowed.begin(), allowed.begin() + static_cast<std::ptrdiff_t>(std::min(limit, allowed.size()))) : out;
+    }
+
+    int sample_allowed_fast(llama_sampler * smpl, const TokenTable & table, const std::vector<int> & allowed, const float * logits,
+                            const std::vector<int> & generated_tokens = {}, const std::string & generated_text = {}) const {
+        std::vector<int> candidates = candidate_subset(allowed, generated_tokens, generated_text, 1536);
+        std::vector<llama_token_data> data;
+        data.reserve(candidates.size());
+        for (int id : candidates) {
+            auto tx = table.token_text.find(id);
+            const std::string & piece = tx == table.token_text.end() ? std::string() : tx->second;
+            if (!piece.empty() && contains_bracket(piece)) continue;
+            float score = apply_contiguous_repeat_penalty(logits[id], generated_tokens, id);
+            data.push_back({id, score, 0.0f});
+        }
+        if (data.empty()) throw std::runtime_error("采样器没有可用的候选 token");
+        llama_token_data_array cur{data.data(), data.size(), -1, false};
+        llama_sampler_apply(smpl, &cur);
+        if (cur.selected < 0 || static_cast<size_t>(cur.selected) >= data.size()) throw std::runtime_error("采样器未选出有效 token");
+        int token = data[static_cast<size_t>(cur.selected)].id;
+        llama_sampler_accept(smpl, token);
+        return token;
+    }
+
+    bool should_insert_free_punctuation(const std::string & generated_text, size_t step) const {
+        if (cjk_count(generated_text) < 14) return false;
+        int since_punc = chars_since_punctuation(generated_text);
+        if (since_punc < 20) return false;
+        if (since_punc >= 44) return true;
+        if (since_punc >= 34) return (step % 2) == 0;
+        if (since_punc >= 26) return (step % 4) == 0;
+        return false;
+    }
+
+    int sample_free_punctuation(llama_sampler * smpl, const TokenTable & table, const float * logits,
+                                const std::vector<int> & generated_tokens, const std::string & generated_text) const {
+        if (table.punctuation_tokens.empty()) return -1;
+        const int since_break = chars_since_sentence_break(generated_text);
+        const int since_punc = chars_since_punctuation(generated_text);
+        std::vector<int> tail_tokens;
+        std::string tail_text;
+        build_stability_tail(vocab, generated_tokens, tail_tokens, tail_text);
+        std::vector<ScoredToken> scored;
+        scored.reserve(table.punctuation_tokens.size());
+        for (int id : table.punctuation_tokens) {
+            auto tx = table.token_text.find(id);
+            std::string piece = tx == table.token_text.end() ? token_piece(vocab, id) : tx->second;
+            bool stable = false;
+            try { stable = stable_append_tail(vocab, tail_text, tail_tokens, id, piece); } catch (...) { stable = false; }
+            if (!stable) continue;
+            float score = logits[id];
+            if (!contains_sentence_break(piece)) score += since_punc >= 26 ? 1.1f : 0.2f;
+            if (contains_sentence_break(piece)) score += since_break >= 34 ? 2.2f : -0.4f;
+            if (piece == "，") score += 0.8f;
+            if (piece == "。") score += since_break >= 32 ? 1.4f : 0.2f;
+            if (piece == "！" || piece == "？") score -= 0.7f;
+            if (piece.size() > 6) score -= 1.0f;
+            scored.push_back({id, score, piece});
+        }
+        if (scored.empty()) return -1;
+        std::sort(scored.begin(), scored.end(), [](const ScoredToken & a, const ScoredToken & b) { return a.score > b.score; });
+        std::vector<llama_token_data> data;
+        data.reserve(24);
+        for (size_t i = 0; i < scored.size() && data.size() < 24; ++i) {
+            data.push_back({scored[i].token, scored[i].score, 0.0f});
+        }
+        llama_token_data_array cur{data.data(), data.size(), -1, false};
+        llama_sampler_apply(smpl, &cur);
+        int token = data[(cur.selected >= 0 && static_cast<size_t>(cur.selected) < data.size()) ? static_cast<size_t>(cur.selected) : 0].id;
+        llama_sampler_accept(smpl, token);
+        return token;
+    }
+
+    std::vector<ScoredToken> make_topk_code_candidates(const TokenTable & table, const float * logits,
+                                                       const std::vector<int> & generated_tokens,
+                                                       const std::string & generated_text,
+                                                       size_t limit) const {
+        std::unordered_map<int, int> recent_counts;
+        int start = std::max<int>(0, static_cast<int>(generated_tokens.size()) - 192);
+        for (int i = start; i < static_cast<int>(generated_tokens.size()); ++i) {
+            recent_counts[generated_tokens[static_cast<size_t>(i)]]++;
+        }
+        const int since_break = chars_since_sentence_break(generated_text);
+        const int since_punc = chars_since_punctuation(generated_text);
+        const float punc_ramp = punctuation_ramp(since_punc);
+        std::vector<int> tail_tokens;
+        std::string tail_text;
+        build_stability_tail(vocab, generated_tokens, tail_tokens, tail_text);
+        std::vector<ScoredToken> scored;
+        scored.reserve(table.free_text_tokens.size());
+        for (int id : table.free_text_tokens) {
+            auto tx = table.token_text.find(id);
+            std::string piece = tx == table.token_text.end() ? token_piece(vocab, id) : tx->second;
+            if (piece.empty() || contains_bracket(piece)) continue;
+            float score = logits[id];
+            auto seen = recent_counts.find(id);
+            if (seen != recent_counts.end()) {
+                score = apply_repeat_penalty(score, std::min(1.85f, 1.12f + 0.08f * float(seen->second)));
+            }
+            score = apply_contiguous_repeat_penalty(score, generated_tokens, id);
+            if (punc_ramp > 0.0f && contains_punctuation(piece)) {
+                score += 0.55f * punc_ramp * (contains_sentence_break(piece) ? 1.9f : 1.0f);
+            }
+            int overdue = std::max(0, since_break - 56);
+            if (overdue > 0 && !contains_sentence_break(piece)) {
+                score = apply_repeat_penalty(score, std::min(4.25f, 1.0f + float(overdue) * 0.025f));
+            }
+            scored.push_back({id, score, piece});
+        }
+        std::sort(scored.begin(), scored.end(), [](const ScoredToken & a, const ScoredToken & b) { return a.score > b.score; });
+        std::vector<ScoredToken> out;
+        out.reserve(limit);
+        size_t tested = 0;
+        size_t test_limit = std::min(scored.size(), std::max<size_t>(limit * 16, 256));
+        for (const auto & s : scored) {
+            if (tested++ >= test_limit && out.size() >= std::min<size_t>(limit, 8)) break;
+            bool stable = false;
+            try { stable = stable_append_tail(vocab, tail_text, tail_tokens, s.token, s.text); } catch (...) { stable = false; }
+            if (!stable) continue;
+            out.push_back(s);
+            if (out.size() >= limit) break;
+        }
+        if (out.empty()) {
+            for (const auto & s : scored) {
+                if (out.size() >= limit) break;
+                out.push_back(s);
+            }
+        }
+        return out;
+    }
+
+    int select_topk_payload_token(const std::string & seed, size_t payload_pos, int digit,
+                                  const TokenTable & table, const float * logits,
+                                  const std::vector<int> & generated_tokens,
+                                  const std::string & generated_text) const {
+        if (digit < 0 || digit >= radix) throw std::runtime_error("top-k 载荷位超出当前进制范围");
+        const size_t limits[] = {
+            static_cast<size_t>(std::max(top_k, radix * 8)),
+            static_cast<size_t>(std::max(top_k * 2, radix * 16)),
+            static_cast<size_t>(std::max(top_k * 4, radix * 32)),
+        };
+        for (size_t limit : limits) {
+            auto candidates = make_topk_code_candidates(table, logits, generated_tokens, generated_text, limit);
+            for (const auto & c : candidates) {
+                if (topk_digit_for_token(seed, payload_pos, c.token, radix) == digit) return c.token;
+            }
+        }
+        throw std::runtime_error("top-k 编码器在当前模型候选集中找不到匹配载荷位的 token");
+    }
+
+    std::string generate_topk_once(const std::string & seed, const std::vector<int> & digits,
+                                   const std::string & prompt,
+                                   uint32_t sample_seed,
+                                   int tail_tokens_override = -1,
+                                   const std::function<void(const std::string &, size_t, size_t, double)> & progress_cb = {}) {
+        TokenTable & table = table_for_seed(seed);
+        auto prompt_tokens = tokenize(vocab, prompt, false, true);
+        if (prompt_tokens.empty()) throw std::runtime_error("top-k 生成提示词无法被 tokenizer 编码");
+        const int requested_tail = tail_tokens_override >= 0 ? tail_tokens_override : free_tail_tokens;
+        const int tail_budget = std::max(0, std::min(requested_tail, 64));
+        const int min_tail = std::min(std::max(0, min_tail_tokens), tail_budget);
+        const int max_new = static_cast<int>(digits.size()) + tail_budget;
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = static_cast<uint32_t>(std::max(n_ctx, static_cast<int>(prompt_tokens.size()) + max_new + 64));
+        cp.n_batch = static_cast<uint32_t>(std::max<int>(512, static_cast<int>(prompt_tokens.size())));
+        cp.n_ubatch = 512;
+        cp.n_threads = n_threads;
+        cp.n_threads_batch = n_threads;
+        cp.no_perf = true;
+        llama_context * ctx = llama_init_from_model(model, cp);
+        if (!ctx) throw std::runtime_error("无法创建 top-k 生成上下文");
+        llama_memory_t mem = llama_get_memory(ctx);
+        const bool can_shift_context = mem && llama_memory_can_shift(mem);
+        const llama_pos keep_prompt_tokens = static_cast<llama_pos>(std::min<size_t>(prompt_tokens.size(), 256));
+        const llama_pos rolling_context_tokens = 768;
+        llama_sampler * smpl = make_sampler(sample_seed);
+        std::string generated_text;
+        std::vector<int> generated_tokens;
+        auto progress_start = std::chrono::steady_clock::now();
+        auto last_progress = std::chrono::steady_clock::now() - std::chrono::milliseconds(1000);
+        auto maybe_progress = [&](bool force, size_t done) {
+            if (!progress_cb) return;
+            auto now = std::chrono::steady_clock::now();
+            if (!force && now - last_progress < std::chrono::milliseconds(1000)) return;
+            last_progress = now;
+            double elapsed = std::chrono::duration<double>(now - progress_start).count();
+            double tps = elapsed > 0.05 ? static_cast<double>(generated_tokens.size()) / elapsed : 0.0;
+            progress_cb(generated_text, std::min(done, digits.size()), std::max<size_t>(1, digits.size()), tps);
+        };
+        auto maybe_shift_context = [&]() {
+            if (!can_shift_context || keep_prompt_tokens <= 0) return;
+            llama_pos pos_max = llama_memory_seq_pos_max(mem, 0);
+            if (pos_max < 0) return;
+            const llama_pos used = pos_max + 1;
+            const llama_pos target = keep_prompt_tokens + rolling_context_tokens;
+            if (used <= target + 128) return;
+            const llama_pos discard = used - target;
+            if (discard <= 0) return;
+            if (llama_memory_seq_rm(mem, 0, keep_prompt_tokens, keep_prompt_tokens + discard)) {
+                llama_memory_seq_add(mem, 0, keep_prompt_tokens + discard, -1, -discard);
+            }
+        };
+        try {
+            maybe_progress(true, 0);
+            llama_batch batch = llama_batch_get_one(prompt_tokens.data(), static_cast<int32_t>(prompt_tokens.size()));
+            if (llama_decode(ctx, batch) != 0) throw std::runtime_error("top-k 生成提示词前向计算失败");
+            for (size_t i = 0; i < digits.size(); ++i) {
+                const float * logits = llama_get_logits_ith(ctx, -1);
+                if (!logits) throw std::runtime_error("top-k 生成时无法读取模型 logits");
+                int token = select_topk_payload_token(seed, i, digits[i], table, logits, generated_tokens, generated_text);
+                llama_sampler_accept(smpl, token);
+                std::string piece = token_piece(vocab, token);
+                generated_tokens.push_back(token);
+                generated_text += piece;
+                if ((i < 32 || (i % 32) == 31 || i + 1 == digits.size()) &&
+                    (looks_like_meta_or_compliance_text(generated_text.size() > 4096 ? generated_text.substr(generated_text.size() - 4096) : generated_text) ||
+                     looks_like_instruction_reply(generated_text.size() > 4096 ? generated_text.substr(generated_text.size() - 4096) : generated_text))) {
+                    throw std::runtime_error("模型生成了元说明或合规检查文本，已拒绝该候选");
+                }
+                if (contains_bracket(piece)) throw std::runtime_error("模型生成了括号类 token，已拒绝该候选");
+                maybe_progress(false, i + 1);
+                maybe_shift_context();
+                batch = llama_batch_get_one(&generated_tokens.back(), 1);
+                if (llama_decode(ctx, batch) != 0) throw std::runtime_error("top-k 载荷 token 前向计算失败");
+            }
+            for (int tail = 0; tail < tail_budget; ++tail) {
+                const float * logits = llama_get_logits_ith(ctx, -1);
+                if (!logits) throw std::runtime_error("top-k 收尾生成时无法读取模型 logits");
+                int token = should_insert_free_punctuation(generated_text, static_cast<size_t>(tail))
+                    ? sample_free_punctuation(smpl, table, logits, generated_tokens, generated_text)
+                    : sample_allowed_fast(smpl, table, table.free_text_tokens, logits, generated_tokens, generated_text);
+                if (token < 0) token = sample_allowed_fast(smpl, table, table.free_text_tokens, logits, generated_tokens, generated_text);
+                std::string piece = token_piece(vocab, token);
+                if (contains_bracket(piece)) break;
+                generated_tokens.push_back(token);
+                generated_text += piece;
+                maybe_progress(false, digits.size());
+                if (tail >= min_tail && contains_sentence_break(piece)) break;
+                maybe_shift_context();
+                batch = llama_batch_get_one(&generated_tokens.back(), 1);
+                if (llama_decode(ctx, batch) != 0) break;
+            }
+        } catch (...) {
+            llama_sampler_free(smpl);
+            llama_free(ctx);
+            throw;
+        }
+        llama_sampler_free(smpl);
+        llama_free(ctx);
+        if (progress_cb) {
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - progress_start).count();
+            double tps = elapsed > 0.05 ? static_cast<double>(generated_tokens.size()) / elapsed : 0.0;
+            progress_cb(generated_text, digits.size(), std::max<size_t>(1, digits.size()), tps);
+        }
+        return generated_text;
+    }
+
+    std::vector<int> text_to_topk_digits(const std::string & seed, const std::string & text, int radix) {
+        auto text_tokens = tokenize(vocab, text, false, false);
+        if (text_tokens.empty()) throw std::runtime_error("载体文本无法被 tokenizer 切分出有效 token");
+        std::vector<int> digits;
+        digits.reserve(text_tokens.size());
+        for (int token : text_tokens) {
+            digits.push_back(topk_digit_for_token(seed, digits.size(), token, radix));
+            if (has_terminator_suffix(digits, radix)) break;
+        }
+        return digits;
+    }
+
+    std::string encode_payload(const std::string & seed, const std::vector<uint8_t> & payload, const std::string & topic,
+                               int tail_tokens_override = -1,
+                               std::string * outline_used = nullptr,
+                               const std::function<void(const std::string &, size_t, size_t, double)> & progress_cb = {}) {
+        TokenTable & table = table_for_seed(seed);
+        if (!is_power_of_two_radix(table.radix)) throw std::runtime_error("top-k 载荷进制必须是 2、4、8 或 16");
+        auto digits = encode_payload_to_digits(payload, table.radix);
+        const std::string prompt = build_topk_prompt(topic);
+        std::string last_error;
+        uint32_t base_seed = 0;
+        auto digest = sha256_bytes(seed + ":" + std::to_string(payload.size()) + ":topk");
+        for (int i = 0; i < 4; ++i) base_seed = (base_seed << 8) | digest[static_cast<size_t>(i)];
+        for (int attempt = 1; attempt <= 5; ++attempt) {
+            std::string text;
+            try {
+                if (outline_used) *outline_used = "";
+                text = generate_topk_once(seed, digits, prompt, base_seed + static_cast<uint32_t>(attempt * 9973), tail_tokens_override, progress_cb);
+                auto recovered_digits = text_to_topk_digits(seed, text, table.radix);
+                auto recovered = decode_digits_to_payload(recovered_digits, table.radix);
+                if (looks_like_instruction_reply(text)) {
+                    last_error = "自检拒绝：模型输出像是在请求继续指令";
+                    continue;
+                }
+                if (contains_bracket(text)) {
+                    last_error = "自检拒绝：载体文本包含括号类 token";
+                    continue;
+                }
+                if (recovered == payload) return text;
+                last_error = "自检拒绝：载体文本恢复出的二进制载荷与原始载荷不一致";
+            } catch (const std::exception & e) {
+                last_error = e.what();
+            }
+        }
+        throw std::runtime_error("top-k 载体文本生成失败，无法通过本地可解码性自检：" + last_error);
+    }
+
+    std::vector<uint8_t> decode_payload(const std::string & seed, const std::string & text) {
+        auto digits = text_to_topk_digits(seed, text, radix);
+        return decode_digits_to_payload(digits, radix);
+    }
+};
+
+static fs::path exe_dir_path(char ** argv) {
+    try { return fs::absolute(fs::path(argv[0])).parent_path(); }
+    catch (...) { return fs::current_path(); }
+}
+
+static std::string default_model_path(char ** argv) {
+    std::vector<fs::path> candidates;
+    fs::path cwd = fs::current_path();
+    fs::path exe_dir = exe_dir_path(argv);
+    candidates.push_back(cwd / "models" / "Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
+    candidates.push_back(cwd / "models" / "qwen3-4b-instruct-2507-q4_k_m.gguf");
+    candidates.push_back(cwd / "models" / "Qwen_Qwen3.5-4B-Q4_K_M.gguf");
+    candidates.push_back(cwd / "models" / "qwen3.5-4b-instruct-Q4_K_M.gguf");
+    candidates.push_back(cwd / "models" / "Qwen3.5-4B-Q4_K_M.gguf");
+    candidates.push_back(cwd / "models" / "base_model.gguf");
+    candidates.push_back(cwd / ".." / ".." / "models" / "Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
+    candidates.push_back(cwd / ".." / ".." / "models" / "qwen3-4b-instruct-2507-q4_k_m.gguf");
+    candidates.push_back(cwd / ".." / ".." / "models" / "Qwen_Qwen3.5-4B-Q4_K_M.gguf");
+    candidates.push_back(cwd / ".." / ".." / "models" / "qwen3.5-4b-instruct-Q4_K_M.gguf");
+    candidates.push_back(cwd / ".." / ".." / "models" / "Qwen3.5-4B-Q4_K_M.gguf");
+    candidates.push_back(cwd / ".." / ".." / "models" / "base_model.gguf");
+    candidates.push_back(exe_dir / ".." / ".." / "models" / "Qwen3-4B-Instruct-2507-Q4_K_M.gguf");
+    candidates.push_back(exe_dir / ".." / ".." / "models" / "qwen3-4b-instruct-2507-q4_k_m.gguf");
+    candidates.push_back(exe_dir / ".." / ".." / "models" / "Qwen_Qwen3.5-4B-Q4_K_M.gguf");
+    candidates.push_back(exe_dir / ".." / ".." / "models" / "qwen3.5-4b-instruct-Q4_K_M.gguf");
+    candidates.push_back(exe_dir / ".." / ".." / "models" / "Qwen3.5-4B-Q4_K_M.gguf");
+    candidates.push_back(exe_dir / ".." / ".." / "models" / "base_model.gguf");
+    for (const auto & p : candidates) if (fs::exists(p)) return fs::absolute(p).string();
+    return fs::absolute(candidates.front()).string();
+}
+
+static std::string default_adapter_path(char ** argv) {
+    const char * env_path = std::getenv("CIA_PAYLOAD_ADAPTER");
+    if (env_path && env_path[0]) {
+        std::string p = env_path;
+        if (ascii_lower(p) == "none" || ascii_lower(p) == "off" || ascii_lower(p) == "disabled") return "";
+        if (fs::exists(p)) return fs::absolute(fs::path(p)).string();
+        return p;
+    }
+    (void) argv;
+    return "";
+}
+
+static std::string get_string_or(const std::string & json, const std::string & key, const std::string & fallback) {
+    std::string out;
+    return json_get_string(json, key, out) ? out : fallback;
+}
+
+static void emit_json(const std::string & line) {
+    std::cout << line << "\n";
+    std::cout.flush();
+}
+
+static std::string ok_response(int id, const std::string & body) {
+    return "{\"id\":" + std::to_string(id) + ",\"ok\":true" + body + "}";
+}
+
+static std::string err_response(int id, const std::string & error) {
+    return "{\"id\":" + std::to_string(id) + ",\"ok\":false,\"error\":\"" + json_escape(error) + "\"}";
+}
+
+int main(int argc, char ** argv) {
+    std::setlocale(LC_ALL, "C.UTF-8");
+    LlamaPayloadWorker worker;
+    worker.model_path = default_model_path(argv);
+    worker.adapter_path = default_adapter_path(argv);
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto need = [&](const char * name) -> const char * {
+            if (i + 1 >= argc) throw std::runtime_error(std::string("缺少命令行参数值：") + name);
+            return argv[++i];
+        };
+        if (a == "--model") worker.model_path = need("--model");
+        else if (a == "--adapter") worker.adapter_path = need("--adapter");
+        else if (a == "--radix") worker.radix = std::stoi(need("--radix"));
+        else if (a == "--gpu-layers") worker.n_gpu_layers = std::stoi(need("--gpu-layers"));
+        else if (a == "--ctx") worker.n_ctx = std::stoi(need("--ctx"));
+        else if (a == "--threads") worker.n_threads = std::stoi(need("--threads"));
+        else if (a == "--free-tail-tokens") worker.free_tail_tokens = std::stoi(need("--free-tail-tokens"));
+        else if (a == "--temperature") worker.temperature = std::stof(need("--temperature"));
+        else if (a == "--top-p") worker.top_p = std::stof(need("--top-p"));
+        else if (a == "--top-k") worker.top_k = std::stoi(need("--top-k"));
+        else if (a == "--backend") worker.backend_preference = need("--backend");
+    }
+
+    try {
+        worker.load();
+        emit_json("{\"type\":\"ready\",\"ok\":true,\"backend\":\"llama.cpp\",\"backend_detail\":\"" + json_escape(worker.backend_used) + "\",\"model\":\"" + json_escape(worker.model_path) + "\",\"adapter\":\"" + json_escape(worker.adapter_path) + "\",\"adapter_loaded\":" + std::string(worker.adapter ? "true" : "false") + ",\"radix\":" + std::to_string(worker.radix) + "}");
+    } catch (const std::exception & e) {
+        emit_json("{\"type\":\"ready\",\"ok\":false,\"error\":\"" + json_escape(e.what()) + "\"}");
+        return 1;
+    }
+
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (line.empty()) continue;
+        int id = json_get_int(line, "id", 0);
+        try {
+            std::string cmd = get_string_or(line, "cmd", "");
+            if (cmd == "shutdown") {
+                emit_json(ok_response(id, ",\"bye\":true"));
+                break;
+            } else if (cmd == "encode") {
+                std::string payload_path, out_path;
+                if (!json_get_string(line, "payload", payload_path) || !json_get_string(line, "out", out_path)) throw std::runtime_error("top-k 编码请求缺少 payload 或 out 字段");
+                std::string topic = "日常生活";
+                std::string topic_path;
+                if (json_get_string(line, "topic_file", topic_path)) topic = read_text(topic_path);
+                else json_get_string(line, "topic", topic);
+                std::string seed = get_string_or(line, "seed", "ChineseInputAgent key-exchange top-k payload v1");
+                int tail_tokens = json_get_int(line, "tail_tokens", -1);
+                std::string outline_out_path;
+                bool write_outline = json_get_string(line, "outline_out", outline_out_path);
+                auto payload = read_binary(payload_path);
+                std::string outline_used;
+                auto progress_cb = [&](const std::string & partial, size_t done, size_t total, double tps) {
+                    std::ostringstream speed;
+                    speed.setf(std::ios::fixed);
+                    speed << std::setprecision(2) << tps;
+                    emit_json("{\"id\":" + std::to_string(id) +
+                              ",\"type\":\"progress\",\"ok\":true,\"done\":" + std::to_string(done) +
+                              ",\"total\":" + std::to_string(total) +
+                              ",\"tps\":" + speed.str() +
+                              ",\"text\":\"" + json_escape(partial) + "\"}");
+                };
+                std::string text = worker.encode_payload(seed, payload, topic, tail_tokens, write_outline ? &outline_used : nullptr, progress_cb);
+                write_text_file(out_path, text);
+                if (write_outline) write_text_file(outline_out_path, outline_used);
+                emit_json(ok_response(id, ",\"backend\":\"llama.cpp\",\"backend_detail\":\"" + json_escape(worker.backend_used) + "\",\"radix\":" + std::to_string(worker.radix) + ",\"bytes\":" + std::to_string(payload.size()) + ",\"chars\":" + std::to_string(cjk_count(text)) + (write_outline ? ",\"outline_chars\":" + std::to_string(cjk_count(outline_used)) : "")));
+            } else if (cmd == "decode") {
+                std::string text_path, out_path;
+                if (!json_get_string(line, "text", text_path) || !json_get_string(line, "out", out_path)) throw std::runtime_error("top-k 解码请求缺少 text 或 out 字段");
+                std::string seed = get_string_or(line, "seed", "ChineseInputAgent key-exchange top-k payload v1");
+                std::string text = read_text(text_path);
+                auto payload = worker.decode_payload(seed, text);
+                write_binary(out_path, payload);
+                emit_json(ok_response(id, ",\"backend\":\"llama.cpp\",\"backend_detail\":\"" + json_escape(worker.backend_used) + "\",\"radix\":" + std::to_string(worker.radix) + ",\"bytes\":" + std::to_string(payload.size())));
+            } else {
+                throw std::runtime_error("未知 worker 命令：" + cmd);
+            }
+        } catch (const std::exception & e) {
+            std::cerr << "request failed: " << e.what() << std::endl;
+            emit_json(err_response(id, e.what()));
+        }
+    }
+    return 0;
+}

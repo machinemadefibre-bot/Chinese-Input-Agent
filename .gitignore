@@ -1,0 +1,52 @@
+# Build output
+build/
+dist/
+out/
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.exe
+*.pdb
+*.res
+*.zip
+*.7z
+
+# Runtime and portable data
+data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Local models and adapters
+models/*
+!models/README.md
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Python helpers
+.venv/
+__pycache__/
+*.pyc
+
+# Training/prototype artifacts
+payload_buckets*.json
+payload_dataset*.jsonl
+payload_out/
+qwen_payload_lora*/
+qwen_long_article*/
+long_article*.jsonl
+
+# Editor and OS noise
+.vs/
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini

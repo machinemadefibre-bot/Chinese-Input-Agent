@@ -1,0 +1,18 @@
+<svg width="1200" height="420" viewBox="0 0 1200 420" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1200" height="420" rx="32" fill="#0A0F1F"/>
+  <path d="M0 330C170 250 270 385 425 302C585 216 675 120 830 158C990 197 1020 67 1200 108V420H0V330Z" fill="#1E8B7A" opacity="0.42"/>
+  <path d="M0 282C180 208 275 320 410 250C565 169 655 210 785 244C948 287 1032 169 1200 210V420H0V282Z" fill="#22C7A9" opacity="0.22"/>
+  <rect x="82" y="86" width="1036" height="248" rx="24" fill="#11182C" stroke="#2CE0C3" stroke-opacity="0.45"/>
+  <text x="122" y="166" fill="#F8FAFC" font-family="Segoe UI, Arial, sans-serif" font-size="58" font-weight="700">ChineseInputAgent</text>
+  <text x="126" y="218" fill="#A8F5E8" font-family="Segoe UI, Arial, sans-serif" font-size="24">Local encrypted chat camouflage for ordinary messaging apps</text>
+  <g font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="600">
+    <rect x="126" y="258" width="154" height="44" rx="22" fill="#2CE0C3" fill-opacity="0.14" stroke="#2CE0C3" stroke-opacity="0.5"/>
+    <text x="154" y="287" fill="#D8FFF8">Win32 UI</text>
+    <rect x="302" y="258" width="174" height="44" rx="22" fill="#2CE0C3" fill-opacity="0.14" stroke="#2CE0C3" stroke-opacity="0.5"/>
+    <text x="330" y="287" fill="#D8FFF8">llama.cpp</text>
+    <rect x="498" y="258" width="184" height="44" rx="22" fill="#2CE0C3" fill-opacity="0.14" stroke="#2CE0C3" stroke-opacity="0.5"/>
+    <text x="526" y="287" fill="#D8FFF8">Top-k codec</text>
+    <rect x="704" y="258" width="152" height="44" rx="22" fill="#2CE0C3" fill-opacity="0.14" stroke="#2CE0C3" stroke-opacity="0.5"/>
+    <text x="732" y="287" fill="#D8FFF8">Portable</text>
+  </g>
+</svg>

@@ -1,0 +1,7 @@
+*.bat text eol=crlf
+*.c text eol=lf
+*.h text eol=lf
+*.cpp text eol=lf
+*.py text eol=lf
+
+third_party/curve25519-donna/* linguist-vendored
