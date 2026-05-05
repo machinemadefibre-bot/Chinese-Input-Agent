@@ -10,6 +10,10 @@
   <img alt="License" src="https://img.shields.io/badge/License-MIT-22C55E">
 </p>
 
+<p align="center">
+  简体中文 | <a href="README.en.md">English</a>
+</p>
+
 <h3 align="center">一个把加密消息写成普通中文文章的本地 Windows 小工具。</h3>
 
 ChineseInputAgent 是我做来测试一个想法的：两台电脑能不能不靠云 API，只通过普通聊天软件，交换一段看起来像中文长文的加密消息。
