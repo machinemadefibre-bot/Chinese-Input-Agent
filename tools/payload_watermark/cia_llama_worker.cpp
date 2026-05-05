@@ -37,7 +37,7 @@ static const std::string SELF_INTRO_TOPIC_UTF8 =
 static const std::string TOPK_PROMPT =
     "<|im_start|>user\n"
     "写一篇自然流畅的中文随笔。\n"
-    "要求：只输出正文，不要标题，不要提纲，不要编号，不要解释，不要输出思考过程，不要输出<think>。\n"
+    "要求：只输出简体中文正文，不要使用繁体字，不要标题，不要提纲，不要编号，不要解释，不要输出思考过程，不要输出<think>。\n"
     "内容可以围绕日常见闻、学习生活、人际交流和个人感受自然展开，句子要通顺，有正常标点。\n"
     "<|im_end|>\n"
     "<|im_start|>assistant\n";
@@ -72,7 +72,7 @@ static std::string build_topk_prompt(const std::string & topic) {
         return std::string("<|im_start|>user\n") +
             "Write a first-person Chinese self-introduction.\n\n"
             "Requirements:\n"
-            "1. Output Chinese prose only.\n"
+            "1. Output Simplified Chinese prose only. Do not use Traditional Chinese characters.\n"
             "2. Stay on the self-introduction topic from beginning to end.\n"
             "3. Write naturally about identity, daily life, learning, interests, personality, and how you communicate with others.\n"
             "4. Do not output a title, outline, numbering, explanation, Markdown, JSON, or thinking process.\n"
@@ -85,7 +85,7 @@ static std::string build_topk_prompt(const std::string & topic) {
         "Write a natural, fluent Chinese prose text about this topic:\n" +
         clean +
         "\n\nRequirements:\n"
-        "1. Output Chinese prose only.\n"
+        "1. Output Simplified Chinese prose only. Do not use Traditional Chinese characters.\n"
         "2. Do not output a title, outline, numbering, explanation, Markdown, JSON, or thinking process.\n"
         "3. Do not output <think> or </think>.\n"
         "4. Use normal punctuation and complete sentences.\n"
