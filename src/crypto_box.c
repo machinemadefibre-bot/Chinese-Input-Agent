@@ -32,10 +32,8 @@ int curve25519_donna(uint8_t *out, const uint8_t *secret, const uint8_t *basepoi
 #define STATE_TAG_BYTES 16
 #define STATE_HEADER_BYTES 16
 
-#define MESSAGE_VERSION 3u
 #define MESSAGE_NONCE_BYTES 12
 #define MESSAGE_TAG_BYTES 16
-#define MESSAGE_HEADER_BYTES 8
 
 typedef struct BOX_BUF {
     uint8_t *data;
@@ -770,20 +768,15 @@ BOOL crypto_box_encrypt(const BYTE *plain, DWORD plain_len, BYTE **out, DWORD *o
         set_box_error(err, err_cch, L"Random generation failed.");
         goto cleanup;
     }
-    DWORD aad_len = MESSAGE_HEADER_BYTES + X25519_KEY_BYTES + MESSAGE_NONCE_BYTES;
+    DWORD aad_len = X25519_KEY_BYTES + MESSAGE_NONCE_BYTES;
     message_len = aad_len + MESSAGE_TAG_BYTES + plain_len;
     message = (uint8_t *)box_alloc(message_len ? message_len : 1);
     if (!message) {
         set_box_error(err, err_cch, L"Out of memory.");
         goto cleanup;
     }
-    memcpy(message, "CIX3", 4);
-    message[4] = MESSAGE_VERSION;
-    message[5] = X25519_KEY_BYTES;
-    message[6] = MESSAGE_NONCE_BYTES;
-    message[7] = MESSAGE_TAG_BYTES;
-    memcpy(message + MESSAGE_HEADER_BYTES, eph_pub, X25519_KEY_BYTES);
-    memcpy(message + MESSAGE_HEADER_BYTES + X25519_KEY_BYTES, nonce, MESSAGE_NONCE_BYTES);
+    memcpy(message, eph_pub, X25519_KEY_BYTES);
+    memcpy(message + X25519_KEY_BYTES, nonce, MESSAGE_NONCE_BYTES);
     if (!aes_gcm_encrypt_raw(key, message, aad_len, nonce, MESSAGE_NONCE_BYTES,
                              plain, plain_len,
                              message + aad_len, MESSAGE_TAG_BYTES,
@@ -818,16 +811,7 @@ BOOL crypto_box_decrypt(const BYTE *message, DWORD message_len, BYTE **out, DWOR
     ZeroMemory(shared, sizeof(shared));
     ZeroMemory(key, sizeof(key));
 
-    if (message_len < MESSAGE_HEADER_BYTES ||
-        memcmp(message, "CIX3", 4) != 0 ||
-        message[4] != MESSAGE_VERSION ||
-        message[5] != X25519_KEY_BYTES ||
-        message[6] != MESSAGE_NONCE_BYTES ||
-        message[7] != MESSAGE_TAG_BYTES) {
-        set_box_error(err, err_cch, L"Invalid encrypted message.");
-        goto cleanup;
-    }
-    DWORD aad_len = MESSAGE_HEADER_BYTES + X25519_KEY_BYTES + MESSAGE_NONCE_BYTES;
+    DWORD aad_len = X25519_KEY_BYTES + MESSAGE_NONCE_BYTES;
     if (message_len < aad_len + MESSAGE_TAG_BYTES) {
         set_box_error(err, err_cch, L"Invalid encrypted message length.");
         goto cleanup;
@@ -838,7 +822,7 @@ BOOL crypto_box_decrypt(const BYTE *message, DWORD message_len, BYTE **out, DWOR
         set_box_error(err, err_cch, L"Local private key is not ready.");
         goto cleanup;
     }
-    const uint8_t *eph_pub = message + MESSAGE_HEADER_BYTES;
+    const uint8_t *eph_pub = message;
     if (!validate_public_key_blob(eph_pub, X25519_KEY_BYTES) ||
         !x25519_shared_secret(g_private_key.data, eph_pub, shared)) {
         set_box_error(err, err_cch, L"X25519 key agreement failed.");
@@ -856,7 +840,7 @@ BOOL crypto_box_decrypt(const BYTE *message, DWORD message_len, BYTE **out, DWOR
         goto cleanup;
     }
     if (!aes_gcm_decrypt_raw(key, message, aad_len,
-                             message + MESSAGE_HEADER_BYTES + X25519_KEY_BYTES, MESSAGE_NONCE_BYTES,
+                             message + X25519_KEY_BYTES, MESSAGE_NONCE_BYTES,
                              message + aad_len, MESSAGE_TAG_BYTES,
                              message + aad_len + MESSAGE_TAG_BYTES, cipher_len,
                              plain)) {

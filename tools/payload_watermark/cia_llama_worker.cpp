@@ -30,8 +30,6 @@
 namespace fs = std::filesystem;
 
 static constexpr int DEFAULT_RADIX = 4;
-static constexpr int VERSION = 2;
-static constexpr int TERMINATOR_SECURITY_BITS = 64;
 static const std::string SELF_INTRO_TOPIC_UTF8 =
     "\xE8\x87\xAA" "\xE6\x88\x91" "\xE4\xBB\x8B" "\xE7\xBB\x8D";
 static const std::string TOPK_PROMPT =
@@ -171,15 +169,6 @@ struct Sha256 {
 
 static std::array<uint8_t, 32> sha256_bytes(const std::string & s) {
     Sha256 h; h.update(s); return h.final();
-}
-
-static uint32_t crc32_bytes(const std::vector<uint8_t> & data) {
-    uint32_t crc = 0xffffffffu;
-    for (uint8_t b : data) {
-        crc ^= b;
-        for (int i = 0; i < 8; ++i) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
-    }
-    return ~crc;
 }
 
 static std::vector<uint8_t> read_binary(const std::string & path) {
@@ -571,83 +560,58 @@ static bool is_power_of_two_radix(int radix) {
     return radix == 2 || radix == 4 || radix == 8 || radix == 16;
 }
 
-static void append_u16_be(std::vector<uint8_t> & out, uint16_t v) { out.push_back(uint8_t(v >> 8)); out.push_back(uint8_t(v)); }
-static void append_u32_be(std::vector<uint8_t> & out, uint32_t v) { out.push_back(uint8_t(v >> 24)); out.push_back(uint8_t(v >> 16)); out.push_back(uint8_t(v >> 8)); out.push_back(uint8_t(v)); }
-static uint16_t read_u16_be(const std::vector<uint8_t> & d, size_t p) { return (uint16_t(d[p]) << 8) | d[p+1]; }
-static uint32_t read_u32_be(const std::vector<uint8_t> & d, size_t p) { return (uint32_t(d[p]) << 24) | (uint32_t(d[p+1]) << 16) | (uint32_t(d[p+2]) << 8) | d[p+3]; }
+static void append_uvarint(std::vector<uint8_t> & out, uint32_t v) {
+    while (v >= 0x80u) {
+        out.push_back(uint8_t((v & 0x7fu) | 0x80u));
+        v >>= 7;
+    }
+    out.push_back(uint8_t(v));
+}
+
+static bool read_uvarint(const std::vector<uint8_t> & d, size_t & pos, uint32_t & out) {
+    out = 0;
+    uint32_t shift = 0;
+    for (int i = 0; i < 5; ++i) {
+        if (pos >= d.size()) return false;
+        uint8_t b = d[pos++];
+        out |= uint32_t(b & 0x7fu) << shift;
+        if ((b & 0x80u) == 0) return true;
+        shift += 7;
+    }
+    return false;
+}
 
 static std::vector<uint8_t> frame_payload(const std::vector<uint8_t> & payload, int radix) {
     (void)radix;
     std::vector<uint8_t> out;
-    std::string magic = "CIAT";
-    out.insert(out.end(), magic.begin(), magic.end());
-    out.push_back(uint8_t(VERSION));
-    out.push_back(0); // flags
-    append_u16_be(out, 17); // fixed header, no HMAC tag
-    append_u32_be(out, static_cast<uint32_t>(payload.size()));
-    append_u32_be(out, crc32_bytes(payload));
-    out.push_back(0); // tag length
+    if (payload.size() > 0xffffffffu) throw std::runtime_error("top-k 载荷过大，无法编码");
+    append_uvarint(out, static_cast<uint32_t>(payload.size()));
     out.insert(out.end(), payload.begin(), payload.end());
     return out;
 }
 
 static std::vector<uint8_t> unframe_payload(const std::vector<uint8_t> & frame, int radix) {
     (void)radix;
-    if (frame.size() < 17) throw std::runtime_error("top-k 载荷帧长度不足，无法读取帧头");
-    std::string magic(reinterpret_cast<const char *>(frame.data()), 4);
-    if (magic != "CIAT") throw std::runtime_error("top-k 载荷帧标识不匹配，可能是 seed/tokenizer 不一致或复制内容不完整");
-    if (frame[4] != VERSION) throw std::runtime_error("top-k 载荷帧版本不兼容");
-    if (frame[5] != 0) throw std::runtime_error("top-k 载荷帧包含当前版本不支持的标志位");
-    uint16_t header_len = read_u16_be(frame, 6);
-    uint32_t payload_len = read_u32_be(frame, 8);
-    uint32_t crc = read_u32_be(frame, 12);
-    uint8_t tag_len = frame[16];
-    if (header_len != uint16_t(17 + tag_len) || tag_len != 0) throw std::runtime_error("top-k 载荷帧头结构不符合当前版本");
-    size_t needed = size_t(header_len) + payload_len;
+    if (frame.empty()) throw std::runtime_error("top-k 紧凑载荷帧为空，无法读取长度");
+    size_t pos = 0;
+    uint32_t payload_len = 0;
+    if (!read_uvarint(frame, pos, payload_len) || payload_len == 0) {
+        throw std::runtime_error("top-k 紧凑载荷帧长度前缀无效，可能是 seed/tokenizer 不一致或复制内容不完整");
+    }
+    size_t needed = pos + size_t(payload_len);
     if (frame.size() < needed) {
-        throw std::runtime_error("top-k 载荷帧被截断：需要 " + std::to_string(needed) +
+        throw std::runtime_error("top-k 紧凑载荷帧被截断：需要 " + std::to_string(needed) +
                                  " 字节，实际恢复 " + std::to_string(frame.size()) +
                                  " 字节；请确认载体文本完整复制，且两端安装包、模型和 tokenizer 完全一致");
     }
-    std::vector<uint8_t> payload(frame.begin() + header_len, frame.begin() + header_len + payload_len);
-    if (crc32_bytes(payload) != crc) throw std::runtime_error("top-k 载荷帧校验失败，载体文本可能被改写或 seed/tokenizer 不一致");
+    std::vector<uint8_t> payload(frame.begin() + static_cast<std::ptrdiff_t>(pos),
+                                 frame.begin() + static_cast<std::ptrdiff_t>(needed));
     return payload;
-}
-
-static std::vector<int> terminator_digits(int radix) {
-    int bits = bits_per_digit(radix);
-    int needed = (TERMINATOR_SECURITY_BITS + bits - 1) / bits;
-    auto digest = sha256_bytes("ChineseInputAgent payload terminator v1 base " + std::to_string(radix));
-    std::vector<uint8_t> bytes(digest.begin(), digest.end());
-    auto digits = bytes_to_base_digits(bytes, radix);
-    if (static_cast<int>(digits.size()) > needed) digits.resize(static_cast<size_t>(needed));
-    return digits;
-}
-
-static bool has_terminator_suffix(const std::vector<int> & digits, int radix) {
-    auto marker = terminator_digits(radix);
-    if (digits.size() < marker.size()) return false;
-    return std::equal(marker.begin(), marker.end(), digits.end() - static_cast<std::ptrdiff_t>(marker.size()));
 }
 
 static std::vector<int> encode_payload_to_digits(const std::vector<uint8_t> & payload, int radix) {
     auto framed = frame_payload(payload, radix);
-    auto digits = bytes_to_base_digits(framed, radix);
-    auto term = terminator_digits(radix);
-    digits.insert(digits.end(), term.begin(), term.end());
-    return digits;
-}
-
-static bool split_at_terminator(const std::vector<int> & digits, int radix, std::vector<int> & trimmed) {
-    auto marker = terminator_digits(radix);
-    if (digits.size() < marker.size()) return false;
-    for (size_t start = 0; start + marker.size() <= digits.size(); ++start) {
-        if (std::equal(marker.begin(), marker.end(), digits.begin() + static_cast<std::ptrdiff_t>(start))) {
-            trimmed.assign(digits.begin(), digits.begin() + static_cast<std::ptrdiff_t>(start));
-            return true;
-        }
-    }
-    return false;
+    return bytes_to_base_digits(framed, radix);
 }
 
 static bool try_decode_payload_digits(const std::vector<int> & digits, int radix, std::vector<uint8_t> & payload, std::string & err) {
@@ -665,28 +629,12 @@ static std::vector<uint8_t> decode_digits_to_payload(const std::vector<int> & di
     if (digits.empty()) {
         throw std::runtime_error("未从载体文本中解出任何 top-k 载荷位；请确认复制的是完整载体文本，且两端模型和 tokenizer 一致");
     }
-    std::vector<std::vector<int>> candidates;
-    std::vector<int> trimmed;
-    bool found_terminator = split_at_terminator(digits, radix, trimmed);
-    if (found_terminator) candidates.push_back(trimmed);
-    candidates.push_back(digits);
-    std::string primary_error;
-    std::string scan_error;
-    for (const auto & candidate : candidates) {
-        std::vector<uint8_t> payload; std::string err;
-        if (try_decode_payload_digits(candidate, radix, payload, err)) return payload;
-        if (primary_error.empty() && !err.empty()) primary_error = err;
-        size_t scan_limit = std::min<size_t>(candidate.size(), 2048);
-        for (size_t start = 1; start < scan_limit; ++start) {
-            std::vector<int> suffix(candidate.begin() + static_cast<std::ptrdiff_t>(start), candidate.end());
-            if (try_decode_payload_digits(suffix, radix, payload, err)) return payload;
-            if (scan_error.empty() && !err.empty()) scan_error = err;
-        }
-    }
-    std::string err = !primary_error.empty() ? primary_error : (!scan_error.empty() ? scan_error : "top-k 载荷帧无法解码");
+    std::vector<uint8_t> payload;
+    std::string err;
+    if (try_decode_payload_digits(digits, radix, payload, err)) return payload;
+    if (err.empty()) err = "top-k 紧凑载荷帧无法解码";
     err += "（top-k进制=" + std::to_string(radix) +
-           "，恢复位数=" + std::to_string(digits.size()) +
-           "，终止标记=" + std::string(found_terminator ? "已找到" : "未找到") + "）";
+           "，恢复位数=" + std::to_string(digits.size()) + "）";
     throw std::runtime_error(err);
 }
 
@@ -1549,7 +1497,6 @@ public:
         digits.reserve(text_tokens.size());
         for (int token : text_tokens) {
             digits.push_back(topk_digit_for_token(seed, digits.size(), token, radix));
-            if (has_terminator_suffix(digits, radix)) break;
         }
         return digits;
     }
