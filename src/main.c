@@ -24,6 +24,8 @@
 #include "app_shared.h"
 #include "app_llm.h"
 #include "app_storage.h"
+#include "app_profiles.h"
+#include "app_archive.h"
 
 #define APP_TITLE L"ChineseInputAgent"
 #define APP_DIR_NAME L"ChineseInputAgent"
@@ -47,13 +49,8 @@
 #define WM_APP_WORK_ERROR (WM_APP + 12)
 #define WM_APP_WORK_CANCELLED (WM_APP + 13)
 
-#define MASTER_KEY_BYTES 32
-#define PROFILES_MAGIC 0x31505348u
-#define PROFILES_VERSION 1u
-#define MAX_PROFILES 64
-#define LOCAL_BLOB_HEADER_BYTES 12
-#define LOCAL_BLOB_NONCE_BYTES 12
-#define LOCAL_BLOB_TAG_BYTES 16
+#define MASTER_KEY_BYTES APP_PROFILE_MASTER_KEY_BYTES
+#define MAX_PROFILES APP_PROFILE_MAX_PROFILES
 #define WORK_KIND_ENCRYPT 1
 #define WORK_KIND_EXPORT_KEY 2
 #define WORK_KIND_DECRYPT 3
@@ -67,15 +64,6 @@ static const WCHAR KEY_PACKAGE_PREFIX_START[] = L"\u4f60\u597d\uff0c\u6211\u662f
 static const WCHAR KEY_PACKAGE_PREFIX_END[] = L"\uff0c\u8fd9\u662f\u6211\u7684\u81ea\u6211\u4ecb\u7ecd\u3002";
 static const WCHAR KEY_PACKAGE_TOPK_SEED[] = L"ChineseInputAgent key-exchange top-k payload v1";
 static const WCHAR KEY_PACKAGE_TOPIC[] = L"\u81ea\u6211\u4ecb\u7ecd";
-
-typedef struct KEY_PROFILE {
-    WCHAR id[33];
-    WCHAR name[128];
-    BYTE *wrapped_key;
-    DWORD wrapped_key_len;
-    BYTE master_key[MASTER_KEY_BYTES];
-    BOOL master_loaded;
-} KEY_PROFILE;
 
 typedef struct WORK_CTX {
     int kind;
@@ -101,11 +89,6 @@ static HWND g_topic_edit;
 static HWND g_key_window;
 static HWND g_key_overlay;
 static HFONT g_ui_font;
-static BYTE g_active_master_key[MASTER_KEY_BYTES];
-static KEY_PROFILE g_profiles[MAX_PROFILES];
-static int g_profile_count;
-static int g_active_profile = -1;
-static BOOL g_crypto_ready;
 static volatile LONG g_work_active;
 static volatile LONG g_cancel_work;
 static BOOL g_archive_mode;
@@ -130,56 +113,6 @@ static void post_llm_stream_progress(HWND target_textbox, const WCHAR *partial, 
 static BOOL work_cancelled(void);
 static void free_work_ctx(WORK_CTX *ctx);
 static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
-
-static BOOL get_profiles_path(WCHAR *path, size_t cch) {
-    return get_app_file(path, cch, L"profiles.dat");
-}
-
-static BOOL get_profile_state_path(const KEY_PROFILE *profile, WCHAR *path, size_t cch) {
-    WCHAR name[80];
-    if (FAILED(StringCchPrintfW(name, ARRAYSIZE(name), L"state_%s.dat", profile->id))) return FALSE;
-    return get_app_file(path, cch, name);
-}
-
-static BOOL get_profile_archive_path(const KEY_PROFILE *profile, WCHAR *path, size_t cch) {
-    WCHAR name[96];
-    if (!profile || !profile->id[0]) return FALSE;
-    if (FAILED(StringCchPrintfW(name, ARRAYSIZE(name), L"archive_%s.dat", profile->id))) return FALSE;
-    return get_app_file(path, cch, name);
-}
-
-static BOOL get_profile_legacy_archive_path(const KEY_PROFILE *profile, WCHAR *path, size_t cch) {
-    WCHAR name[96];
-    if (!profile || !profile->id[0]) return FALSE;
-    if (FAILED(StringCchPrintfW(name, ARRAYSIZE(name), L"archive_%s.txt", profile->id))) return FALSE;
-    return get_app_file(path, cch, name);
-}
-
-static void clear_profile(KEY_PROFILE *profile) {
-    secure_free(profile->wrapped_key, profile->wrapped_key_len);
-    SecureZeroMemory(profile->master_key, sizeof(profile->master_key));
-    ZeroMemory(profile, sizeof(*profile));
-}
-
-static void clear_all_profiles(void) {
-    for (int i = 0; i < g_profile_count; ++i) clear_profile(&g_profiles[i]);
-    g_profile_count = 0;
-    g_active_profile = -1;
-    SecureZeroMemory(g_active_master_key, sizeof(g_active_master_key));
-}
-
-static BOOL generate_profile_id(WCHAR id[33]) {
-    BYTE bytes[16];
-    static const WCHAR hex[] = L"0123456789abcdef";
-    if (BCryptGenRandom(NULL, bytes, sizeof(bytes), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) return FALSE;
-    for (int i = 0; i < 16; ++i) {
-        id[i * 2] = hex[(bytes[i] >> 4) & 0xf];
-        id[i * 2 + 1] = hex[bytes[i] & 0xf];
-    }
-    id[32] = L'\0';
-    SecureZeroMemory(bytes, sizeof(bytes));
-    return TRUE;
-}
 
 static BOOL append_hex_bytes(WCHAR *dst, size_t dst_cch, size_t offset, const BYTE *data, DWORD len) {
     static const WCHAR hex[] = L"0123456789abcdef";
@@ -224,305 +157,21 @@ static BOOL get_message_topk_seed(WCHAR *seed, size_t seed_cch, BOOL prefer_remo
     return ok;
 }
 
-static BOOL open_or_create_profile_wrap_key(NCRYPT_PROV_HANDLE *out_provider, NCRYPT_KEY_HANDLE *out_key, WCHAR *err, size_t err_cch) {
-    *out_provider = 0;
-    *out_key = 0;
-    NCRYPT_PROV_HANDLE provider = 0;
-    NCRYPT_KEY_HANDLE key = 0;
-    WCHAR key_name[128];
-    if (!get_scoped_wrap_key_name(L"Profile Wrap Key Hello v2", key_name, ARRAYSIZE(key_name))) {
-        set_error(err, err_cch, L"\u65e0\u6cd5\u521b\u5efa Windows Hello \u5bc6\u94a5\u540d\u79f0\u3002");
-        return FALSE;
+static void refresh_key_combo(void) {
+    if (!g_key_select) return;
+    SendMessageW(g_key_select, CB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < profiles_count(); ++i) {
+        KEY_PROFILE *profile = profiles_get(i);
+        SendMessageW(g_key_select, CB_ADDSTRING, 0, (LPARAM)(profile ? profile->name : L""));
     }
-    SECURITY_STATUS ss = NCryptOpenStorageProvider(&provider, MS_KEY_STORAGE_PROVIDER, 0);
-    if (ss != ERROR_SUCCESS) {
-        set_error(err, err_cch, L"\u65e0\u6cd5\u6253\u5f00 Windows \u5bc6\u94a5\u5b58\u50a8\u63d0\u4f9b\u7a0b\u5e8f\u3002");
-        return FALSE;
-    }
-    ss = NCryptOpenKey(provider, &key, key_name, 0, 0);
-    if (ss != ERROR_SUCCESS) {
-        ss = NCryptCreatePersistedKey(provider, &key, NCRYPT_RSA_ALGORITHM, key_name, 0, 0);
-        if (ss != ERROR_SUCCESS) {
-            NCryptFreeObject(provider);
-            set_error(err, err_cch, L"\u65e0\u6cd5\u521b\u5efa Windows Hello \u4fdd\u62a4\u5bc6\u94a5\u3002");
-            return FALSE;
-        }
-        DWORD key_bits = 2048;
-        ss = NCryptSetProperty(key, NCRYPT_LENGTH_PROPERTY, (PBYTE)&key_bits, sizeof(key_bits), 0);
-        if (ss != ERROR_SUCCESS) {
-            NCryptFreeObject(key);
-            NCryptFreeObject(provider);
-            set_error(err, err_cch, L"\u65e0\u6cd5\u914d\u7f6e Windows Hello \u4fdd\u62a4\u5bc6\u94a5\u3002");
-            return FALSE;
-        }
-        NCRYPT_UI_POLICY policy;
-        ZeroMemory(&policy, sizeof(policy));
-        policy.dwVersion = 1;
-        policy.dwFlags = NCRYPT_UI_PROTECT_KEY_FLAG | NCRYPT_UI_FORCE_HIGH_PROTECTION_FLAG;
-        ss = NCryptSetProperty(key, NCRYPT_UI_POLICY_PROPERTY, (PBYTE)&policy, sizeof(policy), 0);
-        if (ss != ERROR_SUCCESS) {
-            NCryptFreeObject(key);
-            NCryptFreeObject(provider);
-            set_error(err, err_cch, L"\u65e0\u6cd5\u542f\u7528 Windows Hello \u4fdd\u62a4\u3002");
-            return FALSE;
-        }
-        ss = NCryptFinalizeKey(key, 0);
-        if (ss != ERROR_SUCCESS) {
-            NCryptFreeObject(key);
-            NCryptFreeObject(provider);
-            set_error(err, err_cch, L"Windows Hello \u4fdd\u62a4\u5bc6\u94a5\u521b\u5efa\u5931\u8d25\u3002");
-            return FALSE;
-        }
-    }
-    *out_provider = provider;
-    *out_key = key;
-    return TRUE;
-}
-
-static BOOL wrap_profile_master_key(const BYTE master_key[MASTER_KEY_BYTES], BYTE **out, DWORD *out_len, WCHAR *err, size_t err_cch) {
-    *out = NULL;
-    *out_len = 0;
-    NCRYPT_PROV_HANDLE provider = 0;
-    NCRYPT_KEY_HANDLE key = 0;
-    if (!open_or_create_profile_wrap_key(&provider, &key, err, err_cch)) return FALSE;
-    BCRYPT_OAEP_PADDING_INFO padding;
-    ZeroMemory(&padding, sizeof(padding));
-    padding.pszAlgId = BCRYPT_SHA256_ALGORITHM;
-    DWORD cb = 0;
-    SECURITY_STATUS ss = NCryptEncrypt(key, (PBYTE)master_key, MASTER_KEY_BYTES, &padding, NULL, 0, &cb, NCRYPT_PAD_OAEP_FLAG);
-    if (ss != ERROR_SUCCESS || cb == 0) {
-        NCryptFreeObject(key);
-        NCryptFreeObject(provider);
-        set_error(err, err_cch, L"\u4e3b\u5bc6\u94a5\u4fdd\u62a4\u5931\u8d25\u3002");
-        return FALSE;
-    }
-    BYTE *buf = (BYTE *)xalloc(cb);
-    if (!buf) {
-        NCryptFreeObject(key);
-        NCryptFreeObject(provider);
-        set_error(err, err_cch, L"\u5185\u5b58\u4e0d\u8db3\u3002");
-        return FALSE;
-    }
-    ss = NCryptEncrypt(key, (PBYTE)master_key, MASTER_KEY_BYTES, &padding, buf, cb, &cb, NCRYPT_PAD_OAEP_FLAG);
-    NCryptFreeObject(key);
-    NCryptFreeObject(provider);
-    if (ss != ERROR_SUCCESS) {
-        secure_free(buf, cb);
-        set_error(err, err_cch, L"\u4e3b\u5bc6\u94a5\u4fdd\u62a4\u5931\u8d25\u3002");
-        return FALSE;
-    }
-    *out = buf;
-    *out_len = cb;
-    return TRUE;
-}
-
-static BOOL unwrap_profile_master_key(KEY_PROFILE *profile, WCHAR *err, size_t err_cch) {
-    if (profile->master_loaded) return TRUE;
-    NCRYPT_PROV_HANDLE provider = 0;
-    NCRYPT_KEY_HANDLE key = 0;
-    if (!open_or_create_profile_wrap_key(&provider, &key, err, err_cch)) return FALSE;
-    BCRYPT_OAEP_PADDING_INFO padding;
-    ZeroMemory(&padding, sizeof(padding));
-    padding.pszAlgId = BCRYPT_SHA256_ALGORITHM;
-    DWORD cb = MASTER_KEY_BYTES;
-    SECURITY_STATUS ss = NCryptDecrypt(key, profile->wrapped_key, profile->wrapped_key_len, &padding,
-                                       profile->master_key, MASTER_KEY_BYTES, &cb, NCRYPT_PAD_OAEP_FLAG);
-    NCryptFreeObject(key);
-    NCryptFreeObject(provider);
-    if (ss != ERROR_SUCCESS || cb != MASTER_KEY_BYTES) {
-        SecureZeroMemory(profile->master_key, sizeof(profile->master_key));
-        set_error(err, err_cch, L"Windows Hello \u89e3\u9501\u5931\u8d25\u6216\u5df2\u53d6\u6d88\u3002");
-        return FALSE;
-    }
-    profile->master_loaded = TRUE;
-    return TRUE;
-}
-
-static BOOL save_profiles(void) {
-    WCHAR path[MAX_PATH];
-    if (!get_profiles_path(path, ARRAYSIZE(path))) return FALSE;
-    STRB plain = {0};
-    BOOL ok = TRUE;
-    DWORD v = PROFILES_MAGIC;
-    ok = ok && strb_append_n(&plain, (const char *)&v, sizeof(v));
-    v = PROFILES_VERSION;
-    ok = ok && strb_append_n(&plain, (const char *)&v, sizeof(v));
-    v = (DWORD)g_profile_count;
-    ok = ok && strb_append_n(&plain, (const char *)&v, sizeof(v));
-    WCHAR active_id[33] = L"";
-    if (g_active_profile >= 0 && g_active_profile < g_profile_count) {
-        StringCchCopyW(active_id, ARRAYSIZE(active_id), g_profiles[g_active_profile].id);
-    }
-    ok = ok && strb_append_n(&plain, (const char *)active_id, sizeof(active_id));
-    for (int i = 0; i < g_profile_count && ok; ++i) {
-        ok = ok && strb_append_n(&plain, (const char *)g_profiles[i].id, sizeof(g_profiles[i].id));
-        ok = ok && strb_append_n(&plain, (const char *)g_profiles[i].name, sizeof(g_profiles[i].name));
-        v = g_profiles[i].wrapped_key_len;
-        ok = ok && strb_append_n(&plain, (const char *)&v, sizeof(v));
-        ok = ok && strb_append_n(&plain, (const char *)g_profiles[i].wrapped_key, g_profiles[i].wrapped_key_len);
-    }
-    if (ok) {
-        BYTE *protected_blob = NULL;
-        DWORD protected_len = 0;
-        ok = dpapi_protect((const BYTE *)plain.data, (DWORD)plain.len, &protected_blob, &protected_len) &&
-             write_file_bytes(path, protected_blob, protected_len);
-        secure_free(protected_blob, protected_len);
-    }
-    strb_secure_free(&plain);
-    return ok;
-}
-
-static BOOL create_profile_from_master(const WCHAR *name, const BYTE master_key[MASTER_KEY_BYTES], KEY_PROFILE *out, WCHAR *err, size_t err_cch) {
-    ZeroMemory(out, sizeof(*out));
-    if (!generate_profile_id(out->id)) {
-        set_error(err, err_cch, L"");
-        return FALSE;
-    }
-    StringCchCopyW(out->name, ARRAYSIZE(out->name), name && name[0] ? name : L"");
-    CopyMemory(out->master_key, master_key, MASTER_KEY_BYTES);
-    out->master_loaded = TRUE;
-    if (!wrap_profile_master_key(master_key, &out->wrapped_key, &out->wrapped_key_len, err, err_cch)) {
-        clear_profile(out);
-        return FALSE;
-    }
-    return TRUE;
-}
-
-static BOOL create_default_profile(WCHAR *err, size_t err_cch) {
-    if (g_profile_count >= MAX_PROFILES) return FALSE;
-    BYTE master[MASTER_KEY_BYTES];
-    if (BCryptGenRandom(NULL, master, sizeof(master), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
-        set_error(err, err_cch, L"");
-        return FALSE;
-    }
-    BOOL ok = create_profile_from_master(L"\u9ed8\u8ba4\u5bc6\u94a5", master, &g_profiles[0], err, err_cch);
-    SecureZeroMemory(master, sizeof(master));
-    if (!ok) return FALSE;
-    g_profile_count = 1;
-    g_active_profile = 0;
-    ok = save_profiles();
-    SecureZeroMemory(g_profiles[0].master_key, sizeof(g_profiles[0].master_key));
-    g_profiles[0].master_loaded = FALSE;
-    return ok;
-}
-
-static BOOL load_profiles(WCHAR *err, size_t err_cch) {
-    WCHAR path[MAX_PATH];
-    if (!get_profiles_path(path, ARRAYSIZE(path))) {
-        set_error(err, err_cch, L"");
-        return FALSE;
-    }
-    BYTE *data = NULL;
-    DWORD data_len = 0;
-    if (!read_file_bytes(path, &data, &data_len)) {
-        return create_default_profile(err, err_cch);
-    }
-    BYTE *plain = NULL;
-    DWORD plain_len = 0;
-    BOOL protected_file = dpapi_unprotect(data, data_len, &plain, &plain_len);
-    const BYTE *source = protected_file ? plain : data;
-    DWORD source_len = protected_file ? plain_len : data_len;
-    const BYTE *p = source;
-    const BYTE *end = source + source_len;
-    DWORD magic = 0, version = 0, count = 0;
-    WCHAR active_id[33] = L"";
-    BOOL ok = read_u32_mem(&p, end, &magic) &&
-              read_u32_mem(&p, end, &version) &&
-              read_u32_mem(&p, end, &count) &&
-              read_bytes_mem(&p, end, active_id, sizeof(active_id)) &&
-              magic == PROFILES_MAGIC &&
-              version == PROFILES_VERSION &&
-              count <= MAX_PROFILES;
-    if (!ok) {
-        secure_free(data, data_len);
-        secure_free(plain, plain_len);
-        set_error(err, err_cch, L"");
-        return FALSE;
-    }
-    clear_all_profiles();
-    for (DWORD i = 0; i < count; ++i) {
-        DWORD wrapped_len = 0;
-        ok = read_bytes_mem(&p, end, g_profiles[i].id, sizeof(g_profiles[i].id)) &&
-             read_bytes_mem(&p, end, g_profiles[i].name, sizeof(g_profiles[i].name)) &&
-             read_u32_mem(&p, end, &wrapped_len) &&
-             wrapped_len > 0 && (size_t)(end - p) >= wrapped_len;
-        if (!ok) break;
-        g_profiles[i].id[32] = L'\0';
-        g_profiles[i].name[ARRAYSIZE(g_profiles[i].name) - 1] = L'\0';
-        g_profiles[i].wrapped_key = (BYTE *)xalloc(wrapped_len);
-        if (!g_profiles[i].wrapped_key) {
-            ok = FALSE;
-            break;
-        }
-        g_profiles[i].wrapped_key_len = wrapped_len;
-        CopyMemory(g_profiles[i].wrapped_key, p, wrapped_len);
-        p += wrapped_len;
-    }
-    BOOL consumed_all = (p == end);
-    secure_free(data, data_len);
-    secure_free(plain, plain_len);
-    if (!ok || !consumed_all) {
-        clear_all_profiles();
-        set_error(err, err_cch, L"");
-        return FALSE;
-    }
-    g_profile_count = (int)count;
-    g_active_profile = 0;
-    for (int i = 0; i < g_profile_count; ++i) {
-        if (wcscmp(g_profiles[i].id, active_id) == 0) {
-            g_active_profile = i;
-            break;
-        }
-    }
-    if (g_profile_count == 0) return create_default_profile(err, err_cch);
-    if (!protected_file) save_profiles();
-    return TRUE;
+    if (profiles_active_index() >= 0) SendMessageW(g_key_select, CB_SETCURSEL, (WPARAM)profiles_active_index(), 0);
 }
 
 static BOOL activate_profile(int index, HWND owner, WCHAR *err, size_t err_cch) {
     (void)owner;
-    if (index < 0 || index >= g_profile_count) {
-        set_error(err, err_cch, L"");
-        return FALSE;
-    }
-    if (!unwrap_profile_master_key(&g_profiles[index], err, err_cch)) return FALSE;
-    if (g_crypto_ready) {
-        crypto_box_shutdown();
-        g_crypto_ready = FALSE;
-    }
-    WCHAR state_path[MAX_PATH];
-    if (!get_profile_state_path(&g_profiles[index], state_path, ARRAYSIZE(state_path))) {
-        set_error(err, err_cch, L"");
-        return FALSE;
-    }
-    if (!crypto_box_init(g_profiles[index].master_key, state_path, err, err_cch)) return FALSE;
-    g_crypto_ready = TRUE;
-    g_active_profile = index;
-    CopyMemory(g_active_master_key, g_profiles[index].master_key, MASTER_KEY_BYTES);
-    save_profiles();
-    if (g_key_select) SendMessageW(g_key_select, CB_SETCURSEL, (WPARAM)index, 0);
-    return TRUE;
-}
-
-static void refresh_key_combo(void) {
-    if (!g_key_select) return;
-    SendMessageW(g_key_select, CB_RESETCONTENT, 0, 0);
-    for (int i = 0; i < g_profile_count; ++i) {
-        SendMessageW(g_key_select, CB_ADDSTRING, 0, (LPARAM)g_profiles[i].name);
-    }
-    if (g_active_profile >= 0) SendMessageW(g_key_select, CB_SETCURSEL, (WPARAM)g_active_profile, 0);
-}
-
-static BOOL build_key_package(BYTE **out, DWORD *out_len, WCHAR *err, size_t err_cch) {
-    *out = NULL;
-    *out_len = 0;
-    if (g_active_profile < 0 || g_active_profile >= g_profile_count) {
-        set_error(err, err_cch, L"");
-        return FALSE;
-    }
-    KEY_PROFILE *profile = &g_profiles[g_active_profile];
-    if (!profile->master_loaded && !unwrap_profile_master_key(profile, err, err_cch)) return FALSE;
-    return crypto_box_export_contact_package(out, out_len, err, err_cch);
+    BOOL ok = profiles_activate(index, err, err_cch);
+    if (ok && g_key_select) SendMessageW(g_key_select, CB_SETCURSEL, (WPARAM)index, 0);
+    return ok;
 }
 
 static WCHAR *dup_wide(const WCHAR *s) {
@@ -546,266 +195,16 @@ static WCHAR *get_required_topic_text(HWND owner, HWND topic_edit) {
     return topic;
 }
 
-static BOOL build_archive_record(const KEY_PROFILE *profile, const WCHAR *plain, WCHAR **out) {
-    *out = NULL;
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    WSTRB b = {0};
-    if (!wstrb_appendf(&b, L"[%04u-%02u-%02u %02u:%02u:%02u] %s\r\n",
-                       st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
-                       profile && profile->name[0] ? profile->name : L"\u672a\u547d\u540d") ||
-        !wstrb_append(&b, plain ? plain : L"")) {
-        wstrb_secure_free(&b);
-        return FALSE;
-    }
-    size_t len = wcslen(plain ? plain : L"");
-    if (len == 0 || (plain[len - 1] != L'\n' && plain[len - 1] != L'\r')) {
-        if (!wstrb_append(&b, L"\r\n")) {
-            wstrb_secure_free(&b);
-            return FALSE;
-        }
-    }
-    if (!wstrb_append(&b, L"\r\n")) {
-        wstrb_secure_free(&b);
-        return FALSE;
-    }
-    *out = b.data;
-    return TRUE;
-}
-
-typedef struct ARCHIVE_BLOCK {
-    WCHAR *text;
-    WCHAR stamp[32];
-    size_t index;
-} ARCHIVE_BLOCK;
-
-static const WCHAR *find_archive_record_end(const WCHAR *start, size_t *record_cch) {
-    const WCHAR *crlf = wcsstr(start, L"\r\n\r\n");
-    const WCHAR *lf = wcsstr(start, L"\n\n");
-    const WCHAR *end = NULL;
-    size_t sep = 0;
-    if (crlf && (!lf || crlf < lf)) {
-        end = crlf;
-        sep = 4;
-    } else if (lf) {
-        end = lf;
-        sep = 2;
-    }
-    if (end) {
-        *record_cch = (size_t)(end - start) + sep;
-        return start + *record_cch;
-    }
-    *record_cch = wcslen(start);
-    return start + *record_cch;
-}
-
-static int compare_archive_blocks(const void *a, const void *b) {
-    const ARCHIVE_BLOCK *aa = (const ARCHIVE_BLOCK *)a;
-    const ARCHIVE_BLOCK *bb = (const ARCHIVE_BLOCK *)b;
-    int cmp = wcscmp(aa->stamp, bb->stamp);
-    if (cmp != 0) return cmp;
-    if (aa->index < bb->index) return -1;
-    if (aa->index > bb->index) return 1;
-    return 0;
-}
-
-static BOOL archive_text_oldest_first(const WCHAR *text, WCHAR **out) {
-    *out = NULL;
-    if (!text || !text[0]) {
-        *out = dup_wide(L"");
-        return *out != NULL;
-    }
-
-    size_t count = 0;
-    const WCHAR *p = text;
-    while (*p) {
-        size_t n = 0;
-        const WCHAR *next = find_archive_record_end(p, &n);
-        if (n > 0) ++count;
-        p = next;
-    }
-    if (count == 0) {
-        *out = dup_wide(L"");
-        return *out != NULL;
-    }
-
-    ARCHIVE_BLOCK *blocks = (ARCHIVE_BLOCK *)xalloc(sizeof(ARCHIVE_BLOCK) * count);
-    if (!blocks) return FALSE;
-
-    BOOL ok = TRUE;
-    p = text;
-    size_t idx = 0;
-    while (*p && idx < count) {
-        size_t n = 0;
-        const WCHAR *next = find_archive_record_end(p, &n);
-        if (n > 0) {
-            blocks[idx].text = (WCHAR *)xalloc((n + 1) * sizeof(WCHAR));
-            if (!blocks[idx].text) {
-                ok = FALSE;
-                break;
-            }
-            CopyMemory(blocks[idx].text, p, n * sizeof(WCHAR));
-            blocks[idx].text[n] = L'\0';
-            blocks[idx].index = idx;
-            if (n >= 21 && p[0] == L'[' && p[20] == L']') {
-                CopyMemory(blocks[idx].stamp, p, 21 * sizeof(WCHAR));
-                blocks[idx].stamp[21] = L'\0';
-            } else {
-                StringCchPrintfW(blocks[idx].stamp, ARRAYSIZE(blocks[idx].stamp), L"~%08zu", idx);
-            }
-            ++idx;
-        }
-        p = next;
-    }
-
-    if (ok) {
-        qsort(blocks, count, sizeof(ARCHIVE_BLOCK), compare_archive_blocks);
-        WSTRB b = {0};
-        for (size_t i = 0; i < count && ok; ++i) {
-            ok = wstrb_append(&b, blocks[i].text ? blocks[i].text : L"");
-        }
-        if (ok) {
-            *out = b.data;
-        } else {
-            wstrb_secure_free(&b);
-        }
-    }
-
-    for (size_t i = 0; i < count; ++i) secure_free_wide(blocks[i].text);
-    xfree(blocks);
-    return ok;
-}
-
-static BOOL append_archive_text(const KEY_PROFILE *profile, const WCHAR *plain, WCHAR *err, size_t err_cch) {
-    WCHAR path[MAX_PATH];
-    if (!get_profile_archive_path(profile, path, ARRAYSIZE(path))) {
-        set_error(err, err_cch, L"");
-        return FALSE;
-    }
-    WCHAR legacy_path[MAX_PATH];
-    get_profile_legacy_archive_path(profile, legacy_path, ARRAYSIZE(legacy_path));
-    WCHAR *record = NULL;
-    if (!build_archive_record(profile, plain, &record)) {
-        set_error(err, err_cch, L"");
-        return FALSE;
-    }
-    char *record_utf8 = NULL;
-    int record_len = 0;
-    if (!wide_to_utf8(record, &record_utf8, &record_len)) {
-        secure_free_wide(record);
-        set_error(err, err_cch, L"");
-        return FALSE;
-    }
-    secure_free_wide(record);
-
-    BYTE *file = NULL;
-    DWORD file_len = 0;
-    BYTE *old = NULL;
-    DWORD old_len = 0;
-    if (read_file_bytes(path, &file, &file_len)) {
-        if (!local_aes_gcm_decrypt(profile->master_key, file, file_len, &old, &old_len)) {
-            xfree(file);
-            secure_free_str(record_utf8);
-            set_error(err, err_cch, L"");
-            return FALSE;
-        }
-        xfree(file);
-    } else if (legacy_path[0]) {
-        read_file_bytes(legacy_path, &old, &old_len);
-    }
-
-    DWORD total = old_len + (DWORD)record_len;
-    BYTE *merged = (BYTE *)xalloc(total ? total : 1);
-    if (!merged) {
-        secure_free_str(record_utf8);
-        secure_free(old, old_len);
-        set_error(err, err_cch, L"");
-        return FALSE;
-    }
-    if (old && old_len) CopyMemory(merged, old, old_len);
-    CopyMemory(merged + old_len, record_utf8, (DWORD)record_len);
-    BYTE *protected_blob = NULL;
-    DWORD protected_len = 0;
-    BOOL ok = local_aes_gcm_encrypt(profile->master_key, merged, total, &protected_blob, &protected_len) &&
-              write_file_bytes(path, protected_blob, protected_len);
-    if (ok && legacy_path[0]) DeleteFileW(legacy_path);
-    secure_free(protected_blob, protected_len);
-    secure_free_str(record_utf8);
-    secure_free(old, old_len);
-    secure_free(merged, total);
-    if (!ok) {
-        set_error(err, err_cch, L"");
-        return FALSE;
-    }
-    return TRUE;
-}
-
-static BOOL load_archive_text(const KEY_PROFILE *profile, WCHAR **out, WCHAR *err, size_t err_cch) {
-    *out = NULL;
-    WCHAR path[MAX_PATH];
-    if (!get_profile_archive_path(profile, path, ARRAYSIZE(path))) {
-        set_error(err, err_cch, L"");
-        return FALSE;
-    }
-    BYTE *data = NULL;
-    DWORD data_len = 0;
-    if (!read_file_bytes(path, &data, &data_len)) {
-        WCHAR legacy_path[MAX_PATH];
-        if (get_profile_legacy_archive_path(profile, legacy_path, ARRAYSIZE(legacy_path)) &&
-            read_file_bytes(legacy_path, &data, &data_len)) {
-            BOOL ok = utf8_to_wide_n((const char *)data, (int)data_len, out);
-            if (ok) {
-                WCHAR *ordered = NULL;
-                if (archive_text_oldest_first(*out, &ordered)) {
-                    secure_free_wide(*out);
-                    *out = ordered;
-                }
-            }
-            if (ok) {
-                BYTE *protected_blob = NULL;
-                DWORD protected_len = 0;
-                if (local_aes_gcm_encrypt(profile->master_key, data, data_len, &protected_blob, &protected_len) &&
-                    write_file_bytes(path, protected_blob, protected_len)) {
-                    DeleteFileW(legacy_path);
-                }
-                secure_free(protected_blob, protected_len);
-            }
-            secure_free(data, data_len);
-            if (!ok) set_error(err, err_cch, L"");
-            return ok;
-        }
-        *out = dup_wide(L"");
-        return *out != NULL;
-    }
-    BYTE *plain = NULL;
-    DWORD plain_len = 0;
-    BOOL ok = local_aes_gcm_decrypt(profile->master_key, data, data_len, &plain, &plain_len) &&
-              utf8_to_wide_n((const char *)plain, (int)plain_len, out);
-    if (ok) {
-        WCHAR *ordered = NULL;
-        if (archive_text_oldest_first(*out, &ordered)) {
-            secure_free_wide(*out);
-            *out = ordered;
-        }
-    }
-    xfree(data);
-    secure_free(plain, plain_len);
-    if (!ok) {
-        set_error(err, err_cch, L"");
-        return FALSE;
-    }
-    return TRUE;
-}
-
 static void show_archive_for_active_profile(void) {
     if (!g_textbox || !IsWindow(g_textbox)) return;
-    if (g_active_profile < 0 || g_active_profile >= g_profile_count) {
+    KEY_PROFILE *profile = profiles_active();
+    if (!profile) {
         SetWindowTextW(g_textbox, L"");
         return;
     }
     WCHAR err[256] = L"";
     WCHAR *archive = NULL;
-    if (!load_archive_text(&g_profiles[g_active_profile], &archive, err, ARRAYSIZE(err))) {
+    if (!archive_load_text(profile, &archive, err, ARRAYSIZE(err))) {
         show_error(g_main_window, err[0] ? err : L"");
         return;
     }
@@ -854,7 +253,8 @@ static void do_archive(HWND hwnd) {
         leave_archive_mode();
         return;
     }
-    if (g_active_profile < 0 || g_active_profile >= g_profile_count) {
+    KEY_PROFILE *profile = profiles_active();
+    if (!profile) {
         show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
         return;
     }
@@ -869,7 +269,7 @@ static void do_archive(HWND hwnd) {
         return;
     }
     WCHAR err[256] = L"";
-    if (!append_archive_text(&g_profiles[g_active_profile], plain, err, ARRAYSIZE(err))) {
+    if (!archive_append_text(profile, plain, err, ARRAYSIZE(err))) {
         secure_free_wide(plain);
         show_error(hwnd, err[0] ? err : L"");
         return;
@@ -1089,7 +489,7 @@ static void do_import_key(HWND hwnd, HWND source_textbox) {
         return;
     }
     body += wcslen(KEY_PACKAGE_PREFIX_END);
-    if (g_profile_count >= MAX_PROFILES) {
+    if (profiles_count() >= MAX_PROFILES) {
         xfree(text);
         show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
         return;
@@ -1208,7 +608,7 @@ static BOOL worker_export_key(WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err
     *out = NULL;
     BYTE *pkg = NULL;
     DWORD pkg_len = 0;
-    if (!build_key_package(&pkg, &pkg_len, err, err_cch)) return FALSE;
+    if (!profiles_build_key_package(&pkg, &pkg_len, err, err_cch)) return FALSE;
 
     WCHAR fingerprint[32] = L"";
     if (!crypto_box_get_public_fingerprint(fingerprint, ARRAYSIZE(fingerprint), err, err_cch)) {
@@ -1243,7 +643,7 @@ static BOOL worker_import_key(WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err
         secure_free(pkg, pkg_len);
         return FALSE;
     }
-    if (g_profile_count >= MAX_PROFILES) {
+    if (profiles_count() >= MAX_PROFILES) {
         secure_free(pkg, pkg_len);
         set_error(err, err_cch, L"\u5bc6\u94a5\u6570\u91cf\u5df2\u8fbe\u5230\u4e0a\u9650\u3002");
         return FALSE;
@@ -1256,31 +656,33 @@ static BOOL worker_import_key(WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err
         return FALSE;
     }
     KEY_PROFILE imported;
-    if (!create_profile_from_master(ctx->name, master, &imported, err, err_cch)) {
+    if (!profiles_create_from_master(ctx->name, master, &imported, err, err_cch)) {
         SecureZeroMemory(master, sizeof(master));
         secure_free(pkg, pkg_len);
         return FALSE;
     }
     SecureZeroMemory(master, sizeof(master));
 
-    int original = g_active_profile;
-    int imported_index = g_profile_count;
-    g_profiles[g_profile_count++] = imported;
-    g_active_profile = imported_index;
-    BOOL ok = save_profiles() &&
+    int original = profiles_active_index();
+    int imported_index = -1;
+    if (!profiles_append_imported(&imported, &imported_index, err, err_cch)) {
+        profiles_clear_profile(&imported);
+        secure_free(pkg, pkg_len);
+        return FALSE;
+    }
+    BOOL ok = profiles_save() &&
               activate_profile(imported_index, ctx->owner, err, err_cch) &&
               crypto_box_import_contact_package(pkg, pkg_len, err, err_cch) &&
-              save_profiles();
+              profiles_save();
     secure_free(pkg, pkg_len);
     if (!ok) {
         WCHAR state_path[MAX_PATH];
-        if (get_profile_state_path(&g_profiles[imported_index], state_path, ARRAYSIZE(state_path))) {
+        KEY_PROFILE *failed_profile = profiles_get(imported_index);
+        if (failed_profile && profiles_get_state_path(failed_profile, state_path, ARRAYSIZE(state_path))) {
             secure_delete_file(state_path);
         }
-        clear_profile(&g_profiles[imported_index]);
-        g_profile_count--;
-        g_active_profile = -1;
-        if (original >= 0 && original < g_profile_count) {
+        profiles_remove_at(imported_index);
+        if (original >= 0 && original < profiles_count()) {
             WCHAR restore_err[256] = L"";
             activate_profile(original, ctx->owner, restore_err, ARRAYSIZE(restore_err));
         }
@@ -1432,28 +834,29 @@ static BOOL decrypt_sealed_with_current_profile(const BYTE *sealed, DWORD sealed
 static BOOL decrypt_clip_auto_profile(HWND hwnd, const WCHAR *clip, WCHAR **plain_w_out,
                                       WCHAR *err, size_t err_cch) {
     *plain_w_out = NULL;
-    int original = g_active_profile;
+    int original = profiles_active_index();
     WCHAR last_err[768] = L"";
     WCHAR local_decode_err[768] = L"";
     BOOL saw_local_decode_error = FALSE;
     BOOL saw_local_payload = FALSE;
 
-    for (int pass = 0; pass < g_profile_count; ++pass) {
+    int count = profiles_count();
+    for (int pass = 0; pass < count; ++pass) {
         if (work_cancelled()) {
             set_error(err, err_cch, L"");
             return FALSE;
         }
         int index;
-        if (original >= 0 && original < g_profile_count && pass == g_profile_count - 1) {
+        if (original >= 0 && original < count && pass == count - 1) {
             index = original;
         } else {
             index = pass;
-            if (original >= 0 && original < g_profile_count && index >= original) index++;
+            if (original >= 0 && original < count && index >= original) index++;
         }
-        if (index < 0 || index >= g_profile_count) continue;
+        if (index < 0 || index >= count) continue;
 
         WCHAR local_err[768] = L"";
-        if (index != g_active_profile &&
+        if (index != profiles_active_index() &&
             !activate_profile(index, hwnd, local_err, ARRAYSIZE(local_err))) {
             StringCchCopyW(last_err, ARRAYSIZE(last_err), local_err[0] ? local_err : L"");
             continue;
@@ -1487,7 +890,7 @@ static BOOL decrypt_clip_auto_profile(HWND hwnd, const WCHAR *clip, WCHAR **plai
         StringCchCopyW(last_err, ARRAYSIZE(last_err), local_err[0] ? local_err : L"");
     }
 
-    if (original >= 0 && original < g_profile_count) {
+    if (original >= 0 && original < profiles_count()) {
         WCHAR restore_err[256] = L"";
         activate_profile(original, hwnd, restore_err, ARRAYSIZE(restore_err));
     }
@@ -1807,7 +1210,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         case IDC_KEY_SELECT:
             if (HIWORD(wparam) == CBN_SELCHANGE) {
                 int sel = (int)SendMessageW(g_key_select, CB_GETCURSEL, 0, 0);
-                if (sel >= 0 && sel != g_active_profile) {
+                if (sel >= 0 && sel != profiles_active_index()) {
                     WCHAR err[256] = L"";
                     if (!activate_profile(sel, hwnd, err, ARRAYSIZE(err))) {
                         show_error(hwnd, err[0] ? err : L"\u5207\u6362\u5bc6\u94a5\u5931\u8d25\u3002");
@@ -1915,20 +1318,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     }
 
     WCHAR err[256] = L"";
-    if (!load_profiles(err, ARRAYSIZE(err))) {
+    if (!profiles_load(err, ARRAYSIZE(err))) {
         MessageBoxW(NULL, err, APP_TITLE, MB_ICONERROR | MB_OK);
         app_llm_cleanup();
         return 1;
     }
-    if (!activate_profile(g_active_profile, NULL, err, ARRAYSIZE(err))) {
-        clear_all_profiles();
+    if (!activate_profile(profiles_active_index(), NULL, err, ARRAYSIZE(err))) {
+        profiles_shutdown();
         MessageBoxW(NULL, err, APP_TITLE, MB_ICONERROR | MB_OK);
         app_llm_cleanup();
         return 1;
     }
     if (!register_windows()) {
-        if (g_crypto_ready) crypto_box_shutdown();
-        clear_all_profiles();
+        profiles_shutdown();
         MessageBoxW(NULL, L"Window initialization failed.", APP_TITLE, MB_ICONERROR | MB_OK);
         app_llm_cleanup();
         return 1;
@@ -1939,8 +1341,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
                                     CW_USEDEFAULT, CW_USEDEFAULT, 760, 520,
                                     NULL, NULL, instance, NULL);
     if (!g_main_window) {
-        if (g_crypto_ready) crypto_box_shutdown();
-        clear_all_profiles();
+        profiles_shutdown();
         MessageBoxW(NULL, L"Window initialization failed.", APP_TITLE, MB_ICONERROR | MB_OK);
         app_llm_cleanup();
         return 1;
@@ -1958,9 +1359,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     }
 
     app_llm_cleanup();
-    if (g_crypto_ready) crypto_box_shutdown();
-    clear_all_profiles();
-    SecureZeroMemory(g_active_master_key, sizeof(g_active_master_key));
+    profiles_shutdown();
     if (g_ui_font) DeleteObject(g_ui_font);
     return (int)msg.wParam;
 }

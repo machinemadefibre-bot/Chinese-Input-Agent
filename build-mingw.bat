@@ -21,7 +21,7 @@ if errorlevel 1 exit /b 1
 x86_64-w64-mingw32-gcc.exe -municode -mwindows -O2 -w -static -static-libgcc ^
   -o build\ChineseInputAgent.exe ^
   -D_WINDOWS -DHAVE_SECUREZEROMEMORY=1 ^
-  src\main.c src\app_shared.c src\app_storage.c src\app_llm.c src\crypto_box.c third_party\curve25519-donna\curve25519-donna.c build\app_mingw.res ^
+  src\main.c src\app_shared.c src\app_storage.c src\app_profiles.c src\app_archive.c src\app_llm.c src\crypto_box.c third_party\curve25519-donna\curve25519-donna.c build\app_mingw.res ^
   -luser32 -lgdi32 -lcomctl32 -ladvapi32 -lcrypt32 -lbcrypt -lncrypt -lshell32
 
 endlocal
