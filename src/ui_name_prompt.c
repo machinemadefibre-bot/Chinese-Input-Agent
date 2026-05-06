@@ -94,7 +94,6 @@ BOOL ui_prompt_key_name(HINSTANCE instance, HWND owner, HFONT ui_font,
     ZeroMemory(&state, sizeof(state));
     state.ui_font = ui_font;
     if (host) state.host = *host;
-    if (FAILED(StringCchCopyW(state.name, ARRAYSIZE(state.name), UI_TEXT_DEFAULT_IMPORT_KEY_NAME))) return FALSE;
     HWND win = CreateWindowExW(WS_EX_TOOLWINDOW, APP_NAME_PROMPT_WINDOW_CLASS_NAME,
                                UI_TEXT_DEFAULT_IMPORT_KEY_NAME, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
                                CW_USEDEFAULT, CW_USEDEFAULT, UI_NAME_WINDOW_WIDTH, UI_NAME_WINDOW_HEIGHT,

@@ -115,23 +115,6 @@ static void default_install_path(WCHAR *out, size_t cch) {
     join_path(out, cch, base_path, APP_INSTALL_SUBDIR_NAME);
 }
 
-static BOOL directory_has_anything(const WCHAR *path) {
-    WCHAR pattern[MAX_PATH];
-    if (!join_path(pattern, ARRAYSIZE(pattern), path, L"*")) return FALSE;
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return FALSE;
-    BOOL any = FALSE;
-    do {
-        if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
-            any = TRUE;
-            break;
-        }
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-    return any;
-}
-
 static BOOL ensure_directory(const WCHAR *path, WCHAR *err, size_t err_cch) {
     int rc = SHCreateDirectoryExW(NULL, path, NULL);
     if (rc == ERROR_SUCCESS || rc == ERROR_ALREADY_EXISTS || rc == ERROR_FILE_EXISTS) return TRUE;
@@ -462,11 +445,6 @@ static void start_install(HWND hwnd) {
         MessageBoxW(hwnd, L"请选择安装路径。", CIA_INSTALLER_TITLE, MB_ICONERROR | MB_OK);
         return;
     }
-    if (directory_has_anything(target)) {
-        int rc = MessageBoxW(hwnd, L"安装目录已经存在内容。继续会覆盖同名文件，但不会主动删除其他文件。\r\n\r\n继续安装吗？",
-                             CIA_INSTALLER_TITLE, MB_ICONWARNING | MB_YESNO);
-        if (rc != IDYES) return;
-    }
     INSTALL_CTX *ctx = (INSTALL_CTX *)xalloc(sizeof(*ctx));
     if (!ctx) {
         MessageBoxW(hwnd, L"内存不足。", CIA_INSTALLER_TITLE, MB_ICONERROR | MB_OK);
@@ -581,7 +559,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             if (Button_GetCheck(g_launch_check) == BST_CHECKED && text && text[0]) {
                 ShellExecuteW(hwnd, L"open", text, NULL, NULL, SW_SHOWNORMAL);
             }
-            MessageBoxW(hwnd, L"ChineseInputAgent portable 应用已安装完成。", CIA_INSTALLER_TITLE, MB_ICONINFORMATION | MB_OK);
         } else {
             SetWindowTextW(g_status, text ? text : L"安装失败。");
             MessageBoxW(hwnd, text ? text : L"安装失败。", CIA_INSTALLER_TITLE, MB_ICONERROR | MB_OK);

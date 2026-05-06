@@ -6,6 +6,7 @@
 
 typedef struct UI_WORK_MESSAGE_HOST {
     void (*set_textbox_overlay)(void *user, HWND textbox, const WCHAR *text, BOOL show);
+    void (*clear_textbox_overlay_later)(void *user, HWND textbox);
     void (*show_error)(void *user, HWND owner, const WCHAR *message);
     /* Import-key completion changes app session state; keep those side effects explicit at the boundary. */
     BOOL (*reload_crypto_after_key_import)(void *user, WCHAR *err, size_t err_cch);

@@ -29,6 +29,9 @@ static HWND g_topic_edit;
 static HFONT g_ui_font;
 static BOOL g_archive_mode;
 static CRYPTO_BOX *g_active_box;
+static HWND g_overlay_clear_textbox;
+
+static const UINT_PTR TEXTBOX_OVERLAY_CLEAR_TIMER_ID = 1;
 
 static void set_control_font(HWND hwnd);
 static void show_error(HWND owner, const WCHAR *message);
@@ -38,6 +41,7 @@ static void show_archive_for_active_profile(void);
 static void leave_archive_mode(void);
 static void refresh_main_mode_controls(void);
 static void set_textbox_overlay(HWND textbox, const WCHAR *text, BOOL show);
+static void clear_textbox_overlay_later(HWND textbox);
 static WCHAR *get_required_topic_text(HWND owner, HWND topic_edit);
 static CRYPTO_BOX *get_active_box_for_work(void *user);
 static void set_work_busy(void *user, BOOL busy);
@@ -182,6 +186,12 @@ static void set_textbox_overlay(HWND textbox, const WCHAR *text, BOOL show) {
     ui_overlay_set_text(overlay, text, show);
 }
 
+static void clear_textbox_overlay_later(HWND textbox) {
+    if (!g_main_window || !IsWindow(g_main_window) || !textbox || !IsWindow(textbox)) return;
+    g_overlay_clear_textbox = textbox;
+    SetTimer(g_main_window, TEXTBOX_OVERLAY_CLEAR_TIMER_ID, UI_OVERLAY_TRANSIENT_CLEAR_MS, NULL);
+}
+
 static void cancel_transfer_on_name_prompt_close(void *user) {
     (void)user;
     /* Preserved behavior: closing the modal import-name prompt cancels the active transfer and stops the local worker. */
@@ -226,6 +236,11 @@ static void show_work_error(void *user, HWND owner, const WCHAR *message) {
 static void work_messages_set_overlay(void *user, HWND textbox, const WCHAR *text, BOOL show) {
     (void)user;
     set_textbox_overlay(textbox, text, show);
+}
+
+static void work_messages_clear_overlay_later(void *user, HWND textbox) {
+    (void)user;
+    clear_textbox_overlay_later(textbox);
 }
 
 static void work_messages_show_error(void *user, HWND owner, const WCHAR *message) {
@@ -381,6 +396,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         UI_WORK_MESSAGE_HOST host;
         ZeroMemory(&host, sizeof(host));
         host.set_textbox_overlay = work_messages_set_overlay;
+        host.clear_textbox_overlay_later = work_messages_clear_overlay_later;
         host.show_error = work_messages_show_error;
         host.reload_crypto_after_key_import = work_messages_reload_crypto_after_key_import;
         host.refresh_key_list_after_key_import = work_messages_refresh_key_list_after_key_import;
@@ -420,6 +436,16 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     case WM_SIZE:
         layout_main(hwnd, LOWORD(lparam), HIWORD(lparam));
         return 0;
+    case WM_TIMER:
+        if (wparam == TEXTBOX_OVERLAY_CLEAR_TIMER_ID) {
+            KillTimer(hwnd, TEXTBOX_OVERLAY_CLEAR_TIMER_ID);
+            if (g_overlay_clear_textbox && IsWindow(g_overlay_clear_textbox) && !app_work_is_active()) {
+                set_textbox_overlay(g_overlay_clear_textbox, NULL, FALSE);
+            }
+            g_overlay_clear_textbox = NULL;
+            return 0;
+        }
+        break;
     case WM_GETMINMAXINFO: {
         MINMAXINFO *mmi = (MINMAXINFO *)lparam;
         mmi->ptMinTrackSize.x = UI_MAIN_MIN_TRACK_WIDTH;

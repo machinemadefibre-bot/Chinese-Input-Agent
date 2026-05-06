@@ -195,10 +195,11 @@ static BOOL fingerprints_match(const WCHAR *expected, const WCHAR *actual) {
     return CompareStringOrdinal(expected, -1, actual, -1, TRUE) == CSTR_EQUAL;
 }
 
-static BOOL build_key_import_success_message(const WCHAR *fingerprint, WCHAR **out_message,
+static BOOL build_key_import_success_message(const WCHAR *contact_name, const WCHAR *fingerprint, WCHAR **out_message,
                                              WCHAR *err, size_t err_cch) {
     WSTRB msg = {0};
-    if (!wstrb_appendf(&msg, L"\u8054\u7cfb\u4eba\u516c\u94a5\u5df2\u5bfc\u5165\u3002\r\n\r\n\u6307\u7eb9\u5df2\u81ea\u52a8\u786e\u8ba4\uff1a%s",
+    if (!wstrb_appendf(&msg, L"\u5df2\u5bfc\u5165\u8054\u7cfb\u4eba\uff1a%s\r\n\r\n\u6307\u7eb9\uff1a%s\r\n\r\n\u8bf7\u901a\u8fc7\u53ef\u4fe1\u6e20\u9053\u6838\u5bf9\u6307\u7eb9\u3002",
+                       contact_name && contact_name[0] ? contact_name : L"\u8054\u7cfb\u4eba",
                        fingerprint ? fingerprint : L"")) {
         set_error(err, err_cch, L"\u5bfc\u5165\u7ed3\u679c\u6d88\u606f\u6784\u9020\u5931\u8d25\u3002");
         return FALSE;
@@ -341,7 +342,7 @@ BOOL app_flow_import_key(const WCHAR *carrier, const WCHAR *expected_fingerprint
         if (!import_succeeded) return FALSE;
         if (active_index_out) *active_index_out = target_index;
 
-        return build_key_import_success_message(fingerprint, out_message, err, err_cch);
+        return build_key_import_success_message(target_profile->name, fingerprint, out_message, err, err_cch);
     }
     SecureZeroMemory(recipient_public, sizeof(recipient_public));
 
@@ -398,7 +399,9 @@ BOOL app_flow_import_key(const WCHAR *carrier, const WCHAR *expected_fingerprint
     }
     if (active_index_out) *active_index_out = imported_index;
 
-    return build_key_import_success_message(fingerprint, out_message, err, err_cch);
+    KEY_PROFILE *final_profile = profiles_get(imported_index);
+    return build_key_import_success_message(final_profile ? final_profile->name : name,
+                                            fingerprint, out_message, err, err_cch);
 }
 
 BOOL app_flow_decrypt_clip_auto_profile(const WCHAR *clip, APP_FLOW_CANCEL_FN cancel_fn,
