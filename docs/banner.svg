@@ -5,14 +5,14 @@
   <rect x="82" y="86" width="1036" height="248" rx="24" fill="#11182C" stroke="#2CE0C3" stroke-opacity="0.45"/>
   <text x="122" y="166" fill="#F8FAFC" font-family="Segoe UI, Arial, sans-serif" font-size="58" font-weight="700">ChineseInputAgent</text>
   <text x="126" y="218" fill="#A8F5E8" font-family="Segoe UI, Arial, sans-serif" font-size="24">Local encrypted chat camouflage for ordinary messaging apps</text>
-  <g font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="600">
+  <g font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="600" text-anchor="middle" dominant-baseline="middle">
     <rect x="126" y="258" width="154" height="44" rx="22" fill="#2CE0C3" fill-opacity="0.14" stroke="#2CE0C3" stroke-opacity="0.5"/>
-    <text x="154" y="287" fill="#D8FFF8">Win32 UI</text>
+    <text x="203" y="280" fill="#D8FFF8">Win32 UI</text>
     <rect x="302" y="258" width="174" height="44" rx="22" fill="#2CE0C3" fill-opacity="0.14" stroke="#2CE0C3" stroke-opacity="0.5"/>
-    <text x="330" y="287" fill="#D8FFF8">llama.cpp</text>
+    <text x="389" y="280" fill="#D8FFF8">llama.cpp</text>
     <rect x="498" y="258" width="184" height="44" rx="22" fill="#2CE0C3" fill-opacity="0.14" stroke="#2CE0C3" stroke-opacity="0.5"/>
-    <text x="526" y="287" fill="#D8FFF8">Top-k codec</text>
+    <text x="590" y="280" fill="#D8FFF8">Top-k codec</text>
     <rect x="704" y="258" width="152" height="44" rx="22" fill="#2CE0C3" fill-opacity="0.14" stroke="#2CE0C3" stroke-opacity="0.5"/>
-    <text x="732" y="287" fill="#D8FFF8">Portable</text>
+    <text x="780" y="280" fill="#D8FFF8">Portable</text>
   </g>
 </svg>
