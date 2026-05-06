@@ -1,14 +1,3 @@
-﻿#ifndef UNICODE
-#define UNICODE
-#endif
-#ifndef _UNICODE
-#define _UNICODE
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#define _CRT_SECURE_NO_WARNINGS
-
 #include "app_profiles.h"
 #include "app_paths.h"
 #include "app_shared.h"
@@ -25,8 +14,6 @@ static KEY_PROFILE g_profiles[APP_PROFILE_MAX_PROFILES];
 static int g_profile_count;
 static int g_active_profile = -1;
 
-#define MASTER_KEY_BYTES APP_PROFILE_MASTER_KEY_BYTES
-#define MAX_PROFILES APP_PROFILE_MAX_PROFILES
 static BOOL get_profiles_path(WCHAR *path, size_t cch) {
     return get_app_file(path, cch, APP_PROFILES_FILE_NAME);
 }
@@ -134,7 +121,7 @@ static BOOL open_or_create_profile_wrap_key(NCRYPT_PROV_HANDLE *out_provider, NC
     return TRUE;
 }
 
-static BOOL wrap_profile_master_key(const BYTE master_key[MASTER_KEY_BYTES], BYTE **out, DWORD *out_len, WCHAR *err, size_t err_cch) {
+static BOOL wrap_profile_master_key(const BYTE master_key[APP_PROFILE_MASTER_KEY_BYTES], BYTE **out, DWORD *out_len, WCHAR *err, size_t err_cch) {
     *out = NULL;
     *out_len = 0;
     NCRYPT_PROV_HANDLE provider = 0;
@@ -144,7 +131,7 @@ static BOOL wrap_profile_master_key(const BYTE master_key[MASTER_KEY_BYTES], BYT
     ZeroMemory(&padding, sizeof(padding));
     padding.pszAlgId = BCRYPT_SHA256_ALGORITHM;
     DWORD cb = 0;
-    SECURITY_STATUS ss = NCryptEncrypt(key, (PBYTE)master_key, MASTER_KEY_BYTES, &padding, NULL, 0, &cb, NCRYPT_PAD_OAEP_FLAG);
+    SECURITY_STATUS ss = NCryptEncrypt(key, (PBYTE)master_key, APP_PROFILE_MASTER_KEY_BYTES, &padding, NULL, 0, &cb, NCRYPT_PAD_OAEP_FLAG);
     if (ss != ERROR_SUCCESS || cb == 0) {
         NCryptFreeObject(key);
         NCryptFreeObject(provider);
@@ -158,7 +145,7 @@ static BOOL wrap_profile_master_key(const BYTE master_key[MASTER_KEY_BYTES], BYT
         set_error(err, err_cch, L"\u5185\u5b58\u4e0d\u8db3\u3002");
         return FALSE;
     }
-    ss = NCryptEncrypt(key, (PBYTE)master_key, MASTER_KEY_BYTES, &padding, wrapped_key, cb, &cb, NCRYPT_PAD_OAEP_FLAG);
+    ss = NCryptEncrypt(key, (PBYTE)master_key, APP_PROFILE_MASTER_KEY_BYTES, &padding, wrapped_key, cb, &cb, NCRYPT_PAD_OAEP_FLAG);
     NCryptFreeObject(key);
     NCryptFreeObject(provider);
     if (ss != ERROR_SUCCESS) {
@@ -179,12 +166,12 @@ static BOOL unwrap_profile_master_key(KEY_PROFILE *profile, WCHAR *err, size_t e
     BCRYPT_OAEP_PADDING_INFO padding;
     ZeroMemory(&padding, sizeof(padding));
     padding.pszAlgId = BCRYPT_SHA256_ALGORITHM;
-    DWORD cb = MASTER_KEY_BYTES;
+    DWORD cb = APP_PROFILE_MASTER_KEY_BYTES;
     SECURITY_STATUS ss = NCryptDecrypt(key, profile->wrapped_key, profile->wrapped_key_len, &padding,
-                                       profile->master_key, MASTER_KEY_BYTES, &cb, NCRYPT_PAD_OAEP_FLAG);
+                                       profile->master_key, APP_PROFILE_MASTER_KEY_BYTES, &cb, NCRYPT_PAD_OAEP_FLAG);
     NCryptFreeObject(key);
     NCryptFreeObject(provider);
-    if (ss != ERROR_SUCCESS || cb != MASTER_KEY_BYTES) {
+    if (ss != ERROR_SUCCESS || cb != APP_PROFILE_MASTER_KEY_BYTES) {
         SecureZeroMemory(profile->master_key, sizeof(profile->master_key));
         set_error(err, err_cch, L"Windows Hello \u89e3\u9501\u5931\u8d25\u6216\u5df2\u53d6\u6d88\u3002");
         return FALSE;
@@ -227,7 +214,7 @@ cleanup:
     return profile_db_written;
 }
 
-BOOL profiles_create_from_master(const WCHAR *name, const BYTE master_key[MASTER_KEY_BYTES], KEY_PROFILE *out, WCHAR *err, size_t err_cch) {
+BOOL profiles_create_from_master(const WCHAR *name, const BYTE master_key[APP_PROFILE_MASTER_KEY_BYTES], KEY_PROFILE *out, WCHAR *err, size_t err_cch) {
     if (!out || !master_key) {
         set_error(err, err_cch, L"Invalid profile creation request.");
         return FALSE;
@@ -238,7 +225,7 @@ BOOL profiles_create_from_master(const WCHAR *name, const BYTE master_key[MASTER
         return FALSE;
     }
     StringCchCopyW(out->name, ARRAYSIZE(out->name), name && name[0] ? name : L"");
-    CopyMemory(out->master_key, master_key, MASTER_KEY_BYTES);
+    CopyMemory(out->master_key, master_key, APP_PROFILE_MASTER_KEY_BYTES);
     out->master_loaded = TRUE;
     if (!wrap_profile_master_key(master_key, &out->wrapped_key, &out->wrapped_key_len, err, err_cch)) {
         profiles_clear_profile(out);
@@ -248,11 +235,11 @@ BOOL profiles_create_from_master(const WCHAR *name, const BYTE master_key[MASTER
 }
 
 static BOOL create_default_profile(WCHAR *err, size_t err_cch) {
-    if (g_profile_count >= MAX_PROFILES) {
+    if (g_profile_count >= APP_PROFILE_MAX_PROFILES) {
         set_error(err, err_cch, L"Profile limit reached.");
         return FALSE;
     }
-    BYTE master[MASTER_KEY_BYTES];
+    BYTE master[APP_PROFILE_MASTER_KEY_BYTES];
     if (BCryptGenRandom(NULL, master, sizeof(master), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
         set_error(err, err_cch, L"Random generation failed while creating the default profile.");
         return FALSE;
@@ -301,7 +288,7 @@ BOOL profiles_load(WCHAR *err, size_t err_cch) {
                          read_bytes_mem(&cursor, plain_end, active_id, sizeof(active_id)) &&
                          magic == PROFILES_MAGIC &&
                          version == PROFILES_VERSION &&
-                         count <= MAX_PROFILES;
+                         count <= APP_PROFILE_MAX_PROFILES;
     if (!header_parsed) {
         secure_free(profile_blob, profile_blob_len);
         secure_free(profile_plain, profile_plain_len);

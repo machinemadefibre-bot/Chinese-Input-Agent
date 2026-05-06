@@ -1,23 +1,11 @@
-#ifndef UNICODE
-#define UNICODE
-#endif
-#ifndef _UNICODE
-#define _UNICODE
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#define _CRT_SECURE_NO_WARNINGS
-
 #include "ui_name_prompt.h"
 #include "app_constants.h"
+#include "ui_ids.h"
 #include "ui_layout.h"
 #include "ui_strings.h"
 #include "win_util.h"
 
 #include <strsafe.h>
-
-#define IDC_NAME_EDIT 3001
 
 typedef struct NAME_PROMPT_STATE {
     BOOL is_done;
@@ -56,7 +44,10 @@ static LRESULT CALLBACK NamePromptWndProc(HWND hwnd, UINT msg, WPARAM wparam, LP
     case WM_COMMAND:
         if (LOWORD(wparam) == IDOK) {
             GetWindowTextW(GetDlgItem(hwnd, IDC_NAME_EDIT), state->name, ARRAYSIZE(state->name));
-            if (state->name[0] == L'\0') StringCchCopyW(state->name, ARRAYSIZE(state->name), UI_TEXT_DEFAULT_IMPORT_KEY_NAME);
+            if (state->name[0] == L'\0' &&
+                FAILED(StringCchCopyW(state->name, ARRAYSIZE(state->name), UI_TEXT_DEFAULT_IMPORT_KEY_NAME))) {
+                return 0;
+            }
             state->is_accepted = TRUE;
             DestroyWindow(hwnd);
             return 0;
@@ -67,7 +58,7 @@ static LRESULT CALLBACK NamePromptWndProc(HWND hwnd, UINT msg, WPARAM wparam, LP
         }
         break;
     case WM_CLOSE:
-        if (state && state->host.on_close) state->host.on_close(state->host.user);
+        if (state && state->host.on_window_close_requested) state->host.on_window_close_requested(state->host.user);
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
@@ -96,28 +87,45 @@ static BOOL ensure_name_prompt_class(HINSTANCE instance) {
 
 BOOL ui_prompt_key_name(HINSTANCE instance, HWND owner, HFONT ui_font,
                         const UI_NAME_PROMPT_HOST *host, WCHAR *name, size_t name_cch) {
+    if (!instance || !name || name_cch == 0) return FALSE;
+    name[0] = L'\0';
     if (!ensure_name_prompt_class(instance)) return FALSE;
     NAME_PROMPT_STATE state;
     ZeroMemory(&state, sizeof(state));
     state.ui_font = ui_font;
     if (host) state.host = *host;
-    StringCchCopyW(state.name, ARRAYSIZE(state.name), UI_TEXT_DEFAULT_IMPORT_KEY_NAME);
+    if (FAILED(StringCchCopyW(state.name, ARRAYSIZE(state.name), UI_TEXT_DEFAULT_IMPORT_KEY_NAME))) return FALSE;
     HWND win = CreateWindowExW(WS_EX_TOOLWINDOW, APP_NAME_PROMPT_WINDOW_CLASS_NAME,
                                UI_TEXT_DEFAULT_IMPORT_KEY_NAME, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
                                CW_USEDEFAULT, CW_USEDEFAULT, UI_NAME_WINDOW_WIDTH, UI_NAME_WINDOW_HEIGHT,
                                owner, NULL, instance, &state);
     if (!win) return FALSE;
-    EnableWindow(owner, FALSE);
+    if (owner) EnableWindow(owner, FALSE);
     ShowWindow(win, SW_SHOW);
     MSG msg;
-    while (!state.is_done && GetMessageW(&msg, NULL, 0, 0)) {
+    BOOL consumed_quit = FALSE;
+    BOOL message_loop_failed = FALSE;
+    while (!state.is_done) {
+        int get_message_result = GetMessageW(&msg, NULL, 0, 0);
+        if (get_message_result == -1) {
+            message_loop_failed = TRUE;
+            break;
+        }
+        if (get_message_result == 0) {
+            consumed_quit = TRUE;
+            break;
+        }
         if (IsDialogMessageW(win, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    EnableWindow(owner, TRUE);
-    SetForegroundWindow(owner);
-    if (!state.is_accepted) return FALSE;
-    StringCchCopyW(name, name_cch, state.name);
+    if (!state.is_done && IsWindow(win)) DestroyWindow(win);
+    if (owner) {
+        EnableWindow(owner, TRUE);
+        SetForegroundWindow(owner);
+    }
+    if (consumed_quit) PostQuitMessage((int)msg.wParam);
+    if (message_loop_failed || consumed_quit || !state.is_accepted) return FALSE;
+    if (FAILED(StringCchCopyW(name, name_cch, state.name))) return FALSE;
     return TRUE;
 }

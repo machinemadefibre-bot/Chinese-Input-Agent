@@ -1,16 +1,6 @@
 #ifndef CHINESE_INPUT_AGENT_APP_WORK_H
 #define CHINESE_INPUT_AGENT_APP_WORK_H
 
-#ifndef UNICODE
-#define UNICODE
-#endif
-#ifndef _UNICODE
-#define _UNICODE
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-
 #include <windows.h>
 #include <stddef.h>
 
@@ -44,6 +34,7 @@ typedef struct APP_WORK_MESSAGE {
 } APP_WORK_MESSAGE;
 
 typedef struct APP_WORK_HOST {
+    /* Bridge from background work to the owning UI session; app_work itself does not own windows. */
     HWND main_window;
     CRYPTO_BOX *(*get_active_box)(void *user);
     void (*set_busy)(void *user, BOOL busy);

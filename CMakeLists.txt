@@ -33,6 +33,7 @@ target_compile_definitions(ChineseInputAgent PRIVATE
   UNICODE
   _UNICODE
   WIN32_LEAN_AND_MEAN
+  _CRT_SECURE_NO_WARNINGS
   _WINDOWS
   HAVE_SECUREZEROMEMORY=1
 )
@@ -59,6 +60,7 @@ target_compile_definitions(ChineseInputAgentInstallerStub PRIVATE
   UNICODE
   _UNICODE
   WIN32_LEAN_AND_MEAN
+  _CRT_SECURE_NO_WARNINGS
   _WINDOWS
 )
 target_include_directories(ChineseInputAgentInstallerStub PRIVATE
@@ -75,6 +77,8 @@ target_link_libraries(ChineseInputAgentInstallerStub PRIVATE
 if(MSVC)
   target_compile_options(ChineseInputAgent PRIVATE /utf-8 /W3)
   target_compile_options(ChineseInputAgentInstallerStub PRIVATE /utf-8 /W3)
+  target_link_options(ChineseInputAgent PRIVATE /MANIFEST:NO)
+  target_link_options(ChineseInputAgentInstallerStub PRIVATE /MANIFEST:NO)
 endif()
 
 if(MINGW)

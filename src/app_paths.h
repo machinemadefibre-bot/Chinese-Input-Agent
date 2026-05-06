@@ -22,7 +22,4 @@
 #define APP_INSTALL_MODEL_NAME L"base_model.gguf"
 #define APP_INSTALL_TEMP_FILE_FORMAT L"%scia_installer_%lu%s"
 
-#define APP_INSTALL_MODEL_DOWNLOAD_URL L"https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf?download=true"
-#define APP_INSTALL_MODEL_DOWNLOAD_SHA256 L"3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597"
-
 #endif

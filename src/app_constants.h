@@ -1,8 +1,7 @@
 #ifndef CHINESE_INPUT_AGENT_APP_CONSTANTS_H
 #define CHINESE_INPUT_AGENT_APP_CONSTANTS_H
 
-#define APP_TITLE L"ChineseInputAgent"
-#define APP_DIR_NAME L"ChineseInputAgent"
+#define CIA_APP_TITLE L"ChineseInputAgent"
 
 #define APP_MAIN_WINDOW_CLASS_NAME L"ChineseInputAgentMainWindow"
 #define APP_OVERLAY_WINDOW_CLASS_NAME L"ChineseInputAgentOverlay"

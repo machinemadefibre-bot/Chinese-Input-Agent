@@ -1,14 +1,3 @@
-#ifndef UNICODE
-#define UNICODE
-#endif
-#ifndef _UNICODE
-#define _UNICODE
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#define _CRT_SECURE_NO_WARNINGS
-
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
@@ -19,17 +8,12 @@
 #include <wchar.h>
 #include <strsafe.h>
 
+#include "app_installer_config.h"
 #include "app_limits.h"
 #include "app_paths.h"
+#include "ui_ids.h"
 
-#define APP_TITLE L"ChineseInputAgent Portable 安装器"
-#define IDC_PATH_EDIT 1001
-#define IDC_BROWSE 1002
-#define IDC_INSTALL 1003
-#define IDC_CLOSE 1004
-#define IDC_LAUNCH 1005
-#define IDC_PROGRESS 1006
-#define IDC_STATUS 1007
+#define CIA_INSTALLER_TITLE L"ChineseInputAgent Portable 安装器"
 #define WM_APP_INSTALL_STATUS (WM_APP + 1)
 #define WM_APP_INSTALL_DONE (WM_APP + 2)
 #define INSTALLER_WINDOW_CLASS_NAME L"ChineseInputAgentInstallerWindow"
@@ -459,17 +443,17 @@ static void start_install(HWND hwnd) {
     WCHAR target[MAX_PATH];
     GetWindowTextW(g_path_edit, target, ARRAYSIZE(target));
     if (!target[0]) {
-        MessageBoxW(hwnd, L"请选择安装路径。", APP_TITLE, MB_ICONERROR | MB_OK);
+        MessageBoxW(hwnd, L"请选择安装路径。", CIA_INSTALLER_TITLE, MB_ICONERROR | MB_OK);
         return;
     }
     if (directory_has_anything(target)) {
         int rc = MessageBoxW(hwnd, L"安装目录已经存在内容。继续会覆盖同名文件，但不会主动删除其他文件。\r\n\r\n继续安装吗？",
-                             APP_TITLE, MB_ICONWARNING | MB_YESNO);
+                             CIA_INSTALLER_TITLE, MB_ICONWARNING | MB_YESNO);
         if (rc != IDYES) return;
     }
     INSTALL_CTX *ctx = (INSTALL_CTX *)xalloc(sizeof(*ctx));
     if (!ctx) {
-        MessageBoxW(hwnd, L"内存不足。", APP_TITLE, MB_ICONERROR | MB_OK);
+        MessageBoxW(hwnd, L"内存不足。", CIA_INSTALLER_TITLE, MB_ICONERROR | MB_OK);
         return;
     }
     StringCchCopyW(ctx->target, ARRAYSIZE(ctx->target), target);
@@ -485,7 +469,7 @@ static void start_install(HWND hwnd) {
         EnableWindow(g_install_button, TRUE);
         EnableWindow(g_close_button, TRUE);
         EnableWindow(g_path_edit, TRUE);
-        MessageBoxW(hwnd, L"无法启动安装线程。", APP_TITLE, MB_ICONERROR | MB_OK);
+        MessageBoxW(hwnd, L"无法启动安装线程。", CIA_INSTALLER_TITLE, MB_ICONERROR | MB_OK);
         return;
     }
     CloseHandle(thread);
@@ -504,7 +488,7 @@ static void layout(HWND hwnd) {
     MoveWindow(GetDlgItem(hwnd, 2000), margin, y, w - margin * 2, label_h, TRUE);
     y += label_h + 4;
     MoveWindow(g_path_edit, margin, y, w - margin * 2 - browse_w - 8, edit_h, TRUE);
-    MoveWindow(GetDlgItem(hwnd, IDC_BROWSE), w - margin - browse_w, y, browse_w, edit_h, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDC_INSTALLER_BROWSE), w - margin - browse_w, y, browse_w, edit_h, TRUE);
     y += edit_h + 12;
     MoveWindow(g_launch_check, margin, y, w - margin * 2, 24, TRUE);
     y += 32;
@@ -522,20 +506,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
                                      0, 0, 0, 0, hwnd, (HMENU)2000, g_instance, NULL);
         g_path_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                      0, 0, 0, 0, hwnd, (HMENU)IDC_PATH_EDIT, g_instance, NULL);
+                                      0, 0, 0, 0, hwnd, (HMENU)IDC_INSTALLER_PATH_EDIT, g_instance, NULL);
         HWND browse = CreateWindowExW(0, L"BUTTON", L"浏览...", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                      0, 0, 0, 0, hwnd, (HMENU)IDC_BROWSE, g_instance, NULL);
+                                      0, 0, 0, 0, hwnd, (HMENU)IDC_INSTALLER_BROWSE, g_instance, NULL);
         g_launch_check = CreateWindowExW(0, L"BUTTON", L"安装完成后启动 ChineseInputAgent",
                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                         0, 0, 0, 0, hwnd, (HMENU)IDC_LAUNCH, g_instance, NULL);
+                                         0, 0, 0, 0, hwnd, (HMENU)IDC_INSTALLER_LAUNCH, g_instance, NULL);
         g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE,
-                                     0, 0, 0, 0, hwnd, (HMENU)IDC_PROGRESS, g_instance, NULL);
+                                     0, 0, 0, 0, hwnd, (HMENU)IDC_INSTALLER_PROGRESS, g_instance, NULL);
         g_status = CreateWindowExW(0, L"STATIC", L"选择路径后点击安装。", WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                   0, 0, 0, 0, hwnd, (HMENU)IDC_STATUS, g_instance, NULL);
+                                   0, 0, 0, 0, hwnd, (HMENU)IDC_INSTALLER_STATUS, g_instance, NULL);
         g_install_button = CreateWindowExW(0, L"BUTTON", L"安装", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                                           0, 0, 0, 0, hwnd, (HMENU)IDC_INSTALL, g_instance, NULL);
+                                           0, 0, 0, 0, hwnd, (HMENU)IDC_INSTALLER_INSTALL, g_instance, NULL);
         g_close_button = CreateWindowExW(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                         0, 0, 0, 0, hwnd, (HMENU)IDC_CLOSE, g_instance, NULL);
+                                         0, 0, 0, 0, hwnd, (HMENU)IDC_INSTALLER_CLOSE, g_instance, NULL);
         HWND controls[] = {label, g_path_edit, browse, g_launch_check, g_progress, g_status, g_install_button, g_close_button};
         for (size_t i = 0; i < ARRAYSIZE(controls); ++i) set_font(controls[i]);
         WCHAR path[MAX_PATH];
@@ -551,13 +535,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
         break;
     case WM_COMMAND:
         switch (LOWORD(wparam)) {
-        case IDC_BROWSE:
+        case IDC_INSTALLER_BROWSE:
             browse_for_folder(hwnd);
             break;
-        case IDC_INSTALL:
+        case IDC_INSTALLER_INSTALL:
             start_install(hwnd);
             break;
-        case IDC_CLOSE:
+        case IDC_INSTALLER_CLOSE:
             DestroyWindow(hwnd);
             break;
         }
@@ -581,10 +565,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             if (Button_GetCheck(g_launch_check) == BST_CHECKED && text && text[0]) {
                 ShellExecuteW(hwnd, L"open", text, NULL, NULL, SW_SHOWNORMAL);
             }
-            MessageBoxW(hwnd, L"ChineseInputAgent portable 应用已安装完成。", APP_TITLE, MB_ICONINFORMATION | MB_OK);
+            MessageBoxW(hwnd, L"ChineseInputAgent portable 应用已安装完成。", CIA_INSTALLER_TITLE, MB_ICONINFORMATION | MB_OK);
         } else {
             SetWindowTextW(g_status, text ? text : L"安装失败。");
-            MessageBoxW(hwnd, text ? text : L"安装失败。", APP_TITLE, MB_ICONERROR | MB_OK);
+            MessageBoxW(hwnd, text ? text : L"安装失败。", CIA_INSTALLER_TITLE, MB_ICONERROR | MB_OK);
         }
         xfree(text);
         break;
@@ -623,7 +607,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     wc.lpszClassName = INSTALLER_WINDOW_CLASS_NAME;
     if (!RegisterClassW(&wc)) return 1;
 
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, APP_TITLE,
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, CIA_INSTALLER_TITLE,
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_SIZEBOX,
                                 CW_USEDEFAULT, CW_USEDEFAULT, 620, 280,
                                 NULL, NULL, instance, NULL);

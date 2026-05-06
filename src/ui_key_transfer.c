@@ -1,14 +1,3 @@
-#ifndef UNICODE
-#define UNICODE
-#endif
-#ifndef _UNICODE
-#define _UNICODE
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#define _CRT_SECURE_NO_WARNINGS
-
 #include "ui_key_transfer.h"
 #include "app_constants.h"
 #include "app_flow.h"
@@ -16,23 +5,19 @@
 #include "app_profiles.h"
 #include "app_shared.h"
 #include "app_work.h"
+#include "ui_ids.h"
 #include "ui_layout.h"
 #include "ui_name_prompt.h"
 #include "ui_overlay.h"
 #include "ui_strings.h"
 #include "win_util.h"
 
-#define IDC_KEY_TEXT 3002
-#define IDC_KEY_IMPORT 3003
-#define IDC_KEY_EXPORT 3004
-#define IDC_KEY_OVERLAY 3005
-#define MAX_PROFILES APP_PROFILE_MAX_PROFILES
-
+/* Owns the key-transfer window and the UI-side import/export orchestration around app_work. */
 static HWND g_key_window;
 static HWND g_key_overlay;
 static UI_KEY_TRANSFER_HOST g_host;
 
-static void show_error(HWND owner, const WCHAR *message) {
+static void show_key_transfer_error(HWND owner, const WCHAR *message) {
     if (g_host.show_error) g_host.show_error(g_host.user, owner, message);
 }
 
@@ -43,11 +28,11 @@ static void set_key_overlay(HWND textbox, const WCHAR *text, BOOL show) {
 static void do_export_key(HWND hwnd, HWND target_textbox) {
     APP_WORK_CTX *ctx = app_work_alloc(APP_WORK_KIND_EXPORT_KEY, hwnd, target_textbox);
     if (!ctx) {
-        show_error(hwnd, UI_TEXT_OPERATION_FAILED);
+        show_key_transfer_error(hwnd, UI_TEXT_KEY_EXPORT_FAILED);
         return;
     }
     set_key_overlay(target_textbox, UI_TEXT_KEY_EXPORT_OVERLAY, TRUE);
-    SetWindowTextW(target_textbox, UI_TEXT_EMPTY);
+    SetWindowTextW(target_textbox, L"");
     if (!app_work_start(ctx)) {
         set_key_overlay(target_textbox, NULL, FALSE);
         app_work_free_ctx(ctx);
@@ -57,26 +42,26 @@ static void do_export_key(HWND hwnd, HWND target_textbox) {
 static void do_import_key(HWND hwnd, HWND source_textbox) {
     WCHAR *text = win_get_window_text_alloc(source_textbox);
     if (!text) {
-        show_error(hwnd, UI_TEXT_OPERATION_FAILED);
+        show_key_transfer_error(hwnd, UI_TEXT_KEY_IMPORT_FAILED);
         return;
     }
     WCHAR *body = NULL;
     WCHAR err[256] = L"";
     if (!app_flow_extract_key_package_body(text, &body, err, ARRAYSIZE(err))) {
         xfree(text);
-        show_error(hwnd, err[0] ? err : UI_TEXT_OPERATION_FAILED);
+        show_key_transfer_error(hwnd, err[0] ? err : UI_TEXT_KEY_IMPORT_FAILED);
         return;
     }
-    if (profiles_count() >= MAX_PROFILES) {
+    if (profiles_count() >= APP_PROFILE_MAX_PROFILES) {
         secure_free_wide(body);
         xfree(text);
-        show_error(hwnd, UI_TEXT_OPERATION_FAILED);
+        show_key_transfer_error(hwnd, UI_TEXT_KEY_IMPORT_FAILED);
         return;
     }
     WCHAR name[128];
     UI_NAME_PROMPT_HOST prompt_host;
     ZeroMemory(&prompt_host, sizeof(prompt_host));
-    prompt_host.on_close = g_host.on_name_prompt_close;
+    prompt_host.on_window_close_requested = g_host.on_name_prompt_close_requested;
     prompt_host.user = g_host.user;
     if (!ui_prompt_key_name(g_host.instance, hwnd, g_host.ui_font, &prompt_host, name, ARRAYSIZE(name))) {
         secure_free_wide(body);
@@ -88,7 +73,7 @@ static void do_import_key(HWND hwnd, HWND source_textbox) {
     if (!ctx) {
         secure_free_wide(body);
         xfree(text);
-        show_error(hwnd, UI_TEXT_OPERATION_FAILED);
+        show_key_transfer_error(hwnd, UI_TEXT_KEY_IMPORT_FAILED);
         return;
     }
     ctx->input = body;
@@ -96,12 +81,12 @@ static void do_import_key(HWND hwnd, HWND source_textbox) {
     if (!ctx->name) {
         app_work_free_ctx(ctx);
         xfree(text);
-        show_error(hwnd, UI_TEXT_OPERATION_FAILED);
+        show_key_transfer_error(hwnd, UI_TEXT_KEY_IMPORT_FAILED);
         return;
     }
 
     set_key_overlay(source_textbox, UI_TEXT_KEY_IMPORT_OVERLAY, TRUE);
-    SetWindowTextW(source_textbox, UI_TEXT_EMPTY);
+    SetWindowTextW(source_textbox, L"");
     if (!app_work_start(ctx)) {
         set_key_overlay(source_textbox, NULL, FALSE);
         SetWindowTextW(source_textbox, text);
@@ -114,7 +99,7 @@ static LRESULT CALLBACK KeyTransferWndProc(HWND hwnd, UINT msg, WPARAM wparam, L
     switch (msg) {
     case WM_CREATE: {
         CREATESTRUCTW *cs = (CREATESTRUCTW *)lparam;
-        HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", UI_TEXT_EMPTY,
+        HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | ES_MULTILINE |
                                     ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
                                     0, 0, 0, 0, hwnd, (HMENU)IDC_KEY_TEXT, cs->hInstance, NULL);
@@ -165,6 +150,7 @@ static LRESULT CALLBACK KeyTransferWndProc(HWND hwnd, UINT msg, WPARAM wparam, L
         }
         break;
     case WM_CLOSE:
+        /* Key transfer uses the single global work slot, so closing the window cancels any in-flight transfer. */
         if (app_work_is_active()) app_work_cancel();
         DestroyWindow(hwnd);
         return 0;
@@ -202,7 +188,7 @@ void ui_key_transfer_show(HWND owner, const UI_KEY_TRANSFER_HOST *host) {
                                    CW_USEDEFAULT, CW_USEDEFAULT, UI_KEY_TRANSFER_INITIAL_WIDTH, UI_KEY_TRANSFER_INITIAL_HEIGHT,
                                    owner, NULL, g_host.instance, NULL);
     if (!g_key_window) {
-        show_error(owner, UI_TEXT_EMPTY);
+        show_key_transfer_error(owner, L"");
         return;
     }
     ShowWindow(g_key_window, SW_SHOW);

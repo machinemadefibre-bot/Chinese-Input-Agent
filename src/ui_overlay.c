@@ -1,15 +1,5 @@
-#ifndef UNICODE
-#define UNICODE
-#endif
-#ifndef _UNICODE
-#define _UNICODE
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#define _CRT_SECURE_NO_WARNINGS
-
 #include "ui_overlay.h"
+#include "app_constants.h"
 #include "app_shared.h"
 #include "ui_layout.h"
 #include "win_util.h"
@@ -115,12 +105,12 @@ BOOL ui_overlay_register_class(HINSTANCE instance) {
     wc.hInstance = instance;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = NULL;
-    wc.lpszClassName = UI_OVERLAY_CLASS_NAME;
+    wc.lpszClassName = APP_OVERLAY_WINDOW_CLASS_NAME;
     return RegisterClassExW(&wc) != 0;
 }
 
 HWND ui_overlay_create(HWND parent, HINSTANCE instance, int control_id) {
-    return CreateWindowExW(0, UI_OVERLAY_CLASS_NAME, L"",
+    return CreateWindowExW(0, APP_OVERLAY_WINDOW_CLASS_NAME, L"",
                            WS_CHILD | WS_CLIPSIBLINGS,
                            0, 0, 0, 0, parent, (HMENU)(INT_PTR)control_id, instance, NULL);
 }

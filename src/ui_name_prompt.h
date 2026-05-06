@@ -1,21 +1,12 @@
 #ifndef CHINESE_INPUT_AGENT_UI_NAME_PROMPT_H
 #define CHINESE_INPUT_AGENT_UI_NAME_PROMPT_H
 
-#ifndef UNICODE
-#define UNICODE
-#endif
-#ifndef _UNICODE
-#define _UNICODE
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-
 #include <windows.h>
 #include <stddef.h>
 
 typedef struct UI_NAME_PROMPT_HOST {
-    void (*on_close)(void *user);
+    /* Lets the owner preserve app-level WM_CLOSE behavior without making the prompt depend on work/LLM modules. */
+    void (*on_window_close_requested)(void *user);
     void *user;
 } UI_NAME_PROMPT_HOST;
 

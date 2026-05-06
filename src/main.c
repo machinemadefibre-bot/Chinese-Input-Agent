@@ -1,51 +1,21 @@
-#ifndef UNICODE
-#define UNICODE
-#endif
-#ifndef _UNICODE
-#define _UNICODE
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#define _CRT_SECURE_NO_WARNINGS
-
 #include <windows.h>
 #include <commctrl.h>
-#include <bcrypt.h>
-#include <ncrypt.h>
-#include <wincrypt.h>
-#include <shlobj.h>
-#include <strsafe.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdarg.h>
 
 #include "app_constants.h"
 #include "app_limits.h"
 #include "app_shared.h"
 #include "app_llm.h"
-#include "app_storage.h"
 #include "app_profiles.h"
 #include "app_archive.h"
 #include "app_work.h"
 #include "ui_overlay.h"
 #include "ui_key_transfer.h"
+#include "ui_ids.h"
 #include "ui_layout.h"
 #include "ui_name_prompt.h"
 #include "ui_work_messages.h"
 #include "ui_strings.h"
 #include "win_util.h"
-
-#define IDC_TEXTBOX 1001
-#define IDC_ENCRYPT 1002
-#define IDC_DECRYPT 1003
-#define IDC_CLEAR 1004
-#define IDC_KEY_SELECT 1006
-#define IDC_KEY_TRANSFER 1007
-#define IDC_TOPIC 1008
-#define IDC_TEXT_OVERLAY 1009
-
-#define MASTER_KEY_BYTES APP_PROFILE_MASTER_KEY_BYTES
 
 #ifndef EM_SETCUEBANNER
 #define EM_SETCUEBANNER 0x1501
@@ -121,12 +91,12 @@ static BOOL activate_profile(int index, HWND owner, WCHAR *err, size_t err_cch) 
 static WCHAR *get_required_topic_text(HWND owner, HWND topic_edit) {
     WCHAR *topic = win_get_window_text_alloc(topic_edit);
     if (!topic) {
-        show_error(owner, UI_TEXT_EMPTY);
+        show_error(owner, L"");
         return NULL;
     }
     if (topic[0] == L'\0') {
         xfree(topic);
-        show_error(owner, UI_TEXT_EMPTY);
+        show_error(owner, L"");
         return NULL;
     }
     return topic;
@@ -136,13 +106,13 @@ static void show_archive_for_active_profile(void) {
     if (!g_textbox || !IsWindow(g_textbox)) return;
     KEY_PROFILE *profile = profiles_active();
     if (!profile) {
-        SetWindowTextW(g_textbox, UI_TEXT_EMPTY);
+        SetWindowTextW(g_textbox, L"");
         return;
     }
     WCHAR err[256] = L"";
     WCHAR *archive = NULL;
     if (!archive_load_text(profile, &archive, err, ARRAYSIZE(err))) {
-        show_error(g_main_window, err[0] ? err : UI_TEXT_EMPTY);
+        show_error(g_main_window, err[0] ? err : L"");
         return;
     }
     set_textbox_overlay(g_textbox, NULL, FALSE);
@@ -181,7 +151,7 @@ static void enter_archive_mode(void) {
 static void leave_archive_mode(void) {
     g_archive_mode = FALSE;
     set_textbox_overlay(g_textbox, NULL, FALSE);
-    if (g_textbox) SetWindowTextW(g_textbox, UI_TEXT_EMPTY);
+    if (g_textbox) SetWindowTextW(g_textbox, L"");
     refresh_main_mode_controls();
 }
 
@@ -192,12 +162,12 @@ static void do_archive(HWND hwnd) {
     }
     KEY_PROFILE *profile = profiles_active();
     if (!profile) {
-        show_error(hwnd, UI_TEXT_OPERATION_FAILED);
+        show_error(hwnd, UI_TEXT_ARCHIVE_FAILED);
         return;
     }
     WCHAR *plain = win_get_window_text_alloc(g_textbox);
     if (!plain) {
-        show_error(hwnd, UI_TEXT_OPERATION_FAILED);
+        show_error(hwnd, UI_TEXT_ARCHIVE_FAILED);
         return;
     }
     if (plain[0] == L'\0') {
@@ -208,7 +178,7 @@ static void do_archive(HWND hwnd) {
     WCHAR err[256] = L"";
     if (!archive_append_text(profile, plain, err, ARRAYSIZE(err))) {
         secure_free_wide(plain);
-        show_error(hwnd, err[0] ? err : UI_TEXT_EMPTY);
+        show_error(hwnd, err[0] ? err : L"");
         return;
     }
     secure_free_wide(plain);
@@ -232,14 +202,15 @@ static void set_textbox_overlay(HWND textbox, const WCHAR *text, BOOL show) {
     ui_overlay_set_text(overlay, text, show);
 }
 
-static void on_name_prompt_close(void *user) {
+static void cancel_transfer_on_name_prompt_close(void *user) {
     (void)user;
+    /* Preserved behavior: closing the modal import-name prompt cancels the active transfer and stops the local worker. */
     app_work_cancel();
     shutdown_local_llm_worker();
 }
 
 static void show_error(HWND owner, const WCHAR *message) {
-    win_show_error(owner, APP_TITLE, message);
+    win_show_error(owner, CIA_APP_TITLE, message);
 }
 
 static void key_transfer_show_error(void *user, HWND owner, const WCHAR *message) {
@@ -253,7 +224,7 @@ static void show_key_transfer(HWND owner) {
     host.instance = g_instance;
     host.ui_font = g_ui_font;
     host.show_error = key_transfer_show_error;
-    host.on_name_prompt_close = on_name_prompt_close;
+    host.on_name_prompt_close_requested = cancel_transfer_on_name_prompt_close;
     ui_key_transfer_show(owner, &host);
 }
 
@@ -282,12 +253,12 @@ static void work_messages_show_error(void *user, HWND owner, const WCHAR *messag
     show_error(owner, message);
 }
 
-static BOOL work_messages_reload_active_crypto(void *user, WCHAR *err, size_t err_cch) {
+static BOOL work_messages_reload_crypto_after_key_import(void *user, WCHAR *err, size_t err_cch) {
     (void)user;
     return reload_active_crypto(err, err_cch);
 }
 
-static void work_messages_refresh_key_combo(void *user) {
+static void work_messages_refresh_key_list_after_key_import(void *user) {
     (void)user;
     refresh_key_combo();
 }
@@ -305,7 +276,7 @@ static void configure_app_work(HWND main_window) {
 static void do_encrypt(HWND hwnd) {
     WCHAR *plain_w = win_get_window_text_alloc(g_textbox);
     if (!plain_w) {
-        show_error(hwnd, UI_TEXT_OPERATION_FAILED);
+        show_error(hwnd, UI_TEXT_ENCRYPT_FAILED);
         return;
     }
     if (plain_w[0] == L'\0') {
@@ -321,13 +292,13 @@ static void do_encrypt(HWND hwnd) {
     if (!ctx) {
         secure_free_wide(plain_w);
         xfree(topic);
-        show_error(hwnd, UI_TEXT_OPERATION_FAILED);
+        show_error(hwnd, UI_TEXT_ENCRYPT_FAILED);
         return;
     }
     ctx->input = plain_w;
     ctx->topic = topic;
     set_textbox_overlay(g_textbox, UI_TEXT_ENCRYPT_OVERLAY, TRUE);
-    SetWindowTextW(g_textbox, UI_TEXT_EMPTY);
+    SetWindowTextW(g_textbox, L"");
     if (!app_work_start(ctx)) {
         set_textbox_overlay(g_textbox, NULL, FALSE);
         SetWindowTextW(g_textbox, plain_w);
@@ -338,7 +309,7 @@ static void do_encrypt(HWND hwnd) {
 static void do_decrypt(HWND hwnd) {
     WCHAR *clip = NULL;
     if (!win_get_clipboard_text(hwnd, &clip)) {
-        show_error(hwnd, UI_TEXT_OPERATION_FAILED);
+        show_error(hwnd, UI_TEXT_DECRYPT_FAILED);
         return;
     }
     if (clip[0] == L'\0') {
@@ -348,7 +319,7 @@ static void do_decrypt(HWND hwnd) {
     APP_WORK_CTX *ctx = app_work_alloc(APP_WORK_KIND_DECRYPT, hwnd, g_textbox);
     if (!ctx) {
         xfree(clip);
-        show_error(hwnd, UI_TEXT_OPERATION_FAILED);
+        show_error(hwnd, UI_TEXT_DECRYPT_FAILED);
         return;
     }
     ctx->input = clip;
@@ -397,19 +368,19 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         ZeroMemory(&host, sizeof(host));
         host.set_textbox_overlay = work_messages_set_overlay;
         host.show_error = work_messages_show_error;
-        host.reload_active_crypto = work_messages_reload_active_crypto;
-        host.refresh_key_combo = work_messages_refresh_key_combo;
+        host.reload_crypto_after_key_import = work_messages_reload_crypto_after_key_import;
+        host.refresh_key_list_after_key_import = work_messages_refresh_key_list_after_key_import;
         return ui_work_handle_message(hwnd, msg, wparam, lparam, &host);
     }
     case WM_CREATE: {
-        g_key_select = CreateWindowExW(0, WC_COMBOBOXW, UI_TEXT_EMPTY,
+        g_key_select = CreateWindowExW(0, WC_COMBOBOXW, L"",
                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
                                        0, 0, 0, 0, hwnd, (HMENU)IDC_KEY_SELECT, g_instance, NULL);
-        g_topic_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", UI_TEXT_EMPTY,
+        g_topic_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
                                        0, 0, 0, 0, hwnd, (HMENU)IDC_TOPIC, g_instance, NULL);
         SendMessageW(g_topic_edit, EM_SETCUEBANNER, TRUE, (LPARAM)UI_TEXT_TOPIC_CUE);
-        g_textbox = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", UI_TEXT_EMPTY,
+        g_textbox = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | ES_MULTILINE |
                                     ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
                                     0, 0, 0, 0, hwnd, (HMENU)IDC_TEXTBOX, g_instance, NULL);
@@ -527,32 +498,32 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
 
     WCHAR err[256] = L"";
     if (!profiles_load(err, ARRAYSIZE(err))) {
-        MessageBoxW(NULL, err, APP_TITLE, MB_ICONERROR | MB_OK);
+        MessageBoxW(NULL, err, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
         app_llm_cleanup();
         return 1;
     }
     if (!activate_profile(profiles_active_index(), NULL, err, ARRAYSIZE(err))) {
         profiles_shutdown();
-        MessageBoxW(NULL, err, APP_TITLE, MB_ICONERROR | MB_OK);
+        MessageBoxW(NULL, err, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
         app_llm_cleanup();
         return 1;
     }
     if (!register_windows()) {
         close_active_crypto();
         profiles_shutdown();
-        MessageBoxW(NULL, UI_TEXT_WINDOW_INIT_FAILED, APP_TITLE, MB_ICONERROR | MB_OK);
+        MessageBoxW(NULL, UI_TEXT_WINDOW_INIT_FAILED, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
         app_llm_cleanup();
         return 1;
     }
 
-    g_main_window = CreateWindowExW(0, APP_MAIN_WINDOW_CLASS_NAME, APP_TITLE,
+    g_main_window = CreateWindowExW(0, APP_MAIN_WINDOW_CLASS_NAME, CIA_APP_TITLE,
                                     WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                     CW_USEDEFAULT, CW_USEDEFAULT, UI_MAIN_INITIAL_WIDTH, UI_MAIN_INITIAL_HEIGHT,
                                     NULL, NULL, instance, NULL);
     if (!g_main_window) {
         close_active_crypto();
         profiles_shutdown();
-        MessageBoxW(NULL, UI_TEXT_WINDOW_INIT_FAILED, APP_TITLE, MB_ICONERROR | MB_OK);
+        MessageBoxW(NULL, UI_TEXT_WINDOW_INIT_FAILED, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
         app_llm_cleanup();
         return 1;
     }

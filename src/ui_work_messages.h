@@ -1,24 +1,15 @@
 #ifndef CHINESE_INPUT_AGENT_UI_WORK_MESSAGES_H
 #define CHINESE_INPUT_AGENT_UI_WORK_MESSAGES_H
 
-#ifndef UNICODE
-#define UNICODE
-#endif
-#ifndef _UNICODE
-#define _UNICODE
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-
 #include <windows.h>
 #include <stddef.h>
 
 typedef struct UI_WORK_MESSAGE_HOST {
     void (*set_textbox_overlay)(void *user, HWND textbox, const WCHAR *text, BOOL show);
     void (*show_error)(void *user, HWND owner, const WCHAR *message);
-    BOOL (*reload_active_crypto)(void *user, WCHAR *err, size_t err_cch);
-    void (*refresh_key_combo)(void *user);
+    /* Import-key completion changes app session state; keep those side effects explicit at the boundary. */
+    BOOL (*reload_crypto_after_key_import)(void *user, WCHAR *err, size_t err_cch);
+    void (*refresh_key_list_after_key_import)(void *user);
     void *user;
 } UI_WORK_MESSAGE_HOST;
 

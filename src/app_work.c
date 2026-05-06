@@ -1,26 +1,19 @@
-#ifndef UNICODE
-#define UNICODE
-#endif
-#ifndef _UNICODE
-#define _UNICODE
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#define _CRT_SECURE_NO_WARNINGS
-
 #include "app_work.h"
 #include "app_flow.h"
-#include "app_limits.h"
 #include "app_shared.h"
-#include "ui_strings.h"
 #include "win_util.h"
+
+static const WCHAR WORK_START_FAILED_TEXT[] = L"\u64cd\u4f5c\u5931\u8d25\u3002";
+static const WCHAR WORK_BACKGROUND_FAILED_TEXT[] = L"\u540e\u53f0\u4efb\u52a1\u5931\u8d25\u3002";
+static const WCHAR WORK_PROGRESS_PREFIX[] = L"\u751f\u6210\u8fdb\u5ea6 [";
+static const size_t WORK_PROGRESS_BAR_WIDTH = 24;
 
 static volatile LONG g_work_active;
 static volatile LONG g_cancel_work;
 static APP_WORK_HOST g_host;
 
 static DWORD WINAPI work_thread_proc(LPVOID param);
+static void reset_work_state_flags(void);
 
 void app_work_configure(const APP_WORK_HOST *host) {
     if (host) {
@@ -49,7 +42,7 @@ void app_work_free_ctx(APP_WORK_CTX *ctx) {
 
 void app_work_free_message(APP_WORK_MESSAGE *message) {
     if (!message) return;
-    xfree(message->text);
+    secure_free_wide(message->text);
     xfree(message);
 }
 
@@ -66,30 +59,37 @@ BOOL app_work_cancelled(void) {
 }
 
 void app_work_complete_message_handled(void) {
+    reset_work_state_flags();
+    if (g_host.set_busy) g_host.set_busy(g_host.user, FALSE);
+}
+
+static void reset_work_state_flags(void) {
     InterlockedExchange(&g_work_active, 0);
     InterlockedExchange(&g_cancel_work, 0);
-    if (g_host.set_busy) g_host.set_busy(g_host.user, FALSE);
 }
 
 static void show_work_start_error(HWND owner) {
     if (g_host.show_error) {
-        g_host.show_error(g_host.user, owner, UI_TEXT_OPERATION_FAILED);
+        g_host.show_error(g_host.user, owner, WORK_START_FAILED_TEXT);
     }
 }
 
 BOOL app_work_start(APP_WORK_CTX *ctx) {
+    if (!ctx) {
+        show_work_start_error(NULL);
+        return FALSE;
+    }
     if (InterlockedCompareExchange(&g_work_active, 1, 0) != 0) {
-        show_work_start_error(ctx ? ctx->owner : NULL);
+        show_work_start_error(ctx->owner);
         return FALSE;
     }
     InterlockedExchange(&g_cancel_work, 0);
     if (g_host.set_busy) g_host.set_busy(g_host.user, TRUE);
     HANDLE thread = CreateThread(NULL, 0, work_thread_proc, ctx, 0, NULL);
     if (!thread) {
-        InterlockedExchange(&g_work_active, 0);
-        InterlockedExchange(&g_cancel_work, 0);
+        reset_work_state_flags();
         if (g_host.set_busy) g_host.set_busy(g_host.user, FALSE);
-        show_work_start_error(ctx ? ctx->owner : NULL);
+        show_work_start_error(ctx->owner);
         return FALSE;
     }
     CloseHandle(thread);
@@ -118,14 +118,20 @@ static BOOL post_work_text(UINT msg, HWND target_textbox, const WCHAR *text) {
     return post_work_text_kind(msg, target_textbox, text, 0);
 }
 
+static void finish_unposted_terminal_work(UINT msg) {
+    /* Without a terminal UI message, no handler will clear the active/cancel flags. */
+    if (g_host.main_window && PostMessageW(g_host.main_window, msg, 0, 0)) return;
+    reset_work_state_flags();
+}
+
 void app_work_post_llm_stream_progress(HWND target_textbox, const WCHAR *partial,
                                        size_t tokens_done, size_t tokens_total, double tps) {
-    const size_t bar_width = UI_WORK_PROGRESS_BAR_WIDTH;
+    const size_t bar_width = WORK_PROGRESS_BAR_WIDTH;
     if (tokens_total == 0) tokens_total = 1;
     if (tokens_done > tokens_total) tokens_done = tokens_total;
     size_t filled = (tokens_done * bar_width) / tokens_total;
     WSTRB progress_builder = {0};
-    if (!wstrb_append(&progress_builder, UI_TEXT_GENERATION_PROGRESS_PREFIX)) goto cleanup;
+    if (!wstrb_append(&progress_builder, WORK_PROGRESS_PREFIX)) goto cleanup;
     for (size_t i = 0; i < bar_width; ++i) {
         if (!wstrb_append_char(&progress_builder, i < filled ? L'#' : L'-')) goto cleanup;
     }
@@ -183,9 +189,15 @@ static BOOL worker_decrypt(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t er
 
 static DWORD WINAPI work_thread_proc(LPVOID param) {
     APP_WORK_CTX *ctx = (APP_WORK_CTX *)param;
+    if (!ctx) {
+        reset_work_state_flags();
+        return 0;
+    }
     WCHAR *result = NULL;
     WCHAR err[256] = L"";
     BOOL work_succeeded = FALSE;
+    UINT terminal_msg = WM_APP_WORK_ERROR;
+    const WCHAR *terminal_text = WORK_BACKGROUND_FAILED_TEXT;
 
     if (ctx->kind == APP_WORK_KIND_ENCRYPT) {
         work_succeeded = worker_encrypt(ctx, &result, err, ARRAYSIZE(err));
@@ -200,11 +212,17 @@ static DWORD WINAPI work_thread_proc(LPVOID param) {
     }
 
     if (work_succeeded && !app_work_cancelled()) {
-        post_work_text_kind(WM_APP_WORK_DONE, ctx->target_textbox, result ? result : L"", ctx->kind);
+        terminal_msg = WM_APP_WORK_DONE;
+        terminal_text = result ? result : L"";
     } else if (app_work_cancelled()) {
-        post_work_text_kind(WM_APP_WORK_CANCELLED, ctx->target_textbox, L"", ctx->kind);
+        terminal_msg = WM_APP_WORK_CANCELLED;
+        terminal_text = L"";
     } else {
-        post_work_text_kind(WM_APP_WORK_ERROR, ctx->target_textbox, err[0] ? err : UI_TEXT_BACKGROUND_WORK_FAILED, ctx->kind);
+        terminal_msg = WM_APP_WORK_ERROR;
+        terminal_text = err[0] ? err : WORK_BACKGROUND_FAILED_TEXT;
+    }
+    if (!post_work_text_kind(terminal_msg, ctx->target_textbox, terminal_text, ctx->kind)) {
+        finish_unposted_terminal_work(terminal_msg);
     }
     secure_free_wide(result);
     app_work_free_ctx(ctx);

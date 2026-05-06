@@ -1,14 +1,3 @@
-#ifndef UNICODE
-#define UNICODE
-#endif
-#ifndef _UNICODE
-#define _UNICODE
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#define _CRT_SECURE_NO_WARNINGS
-
 #include "app_flow.h"
 
 #include "app_llm.h"
@@ -18,9 +7,6 @@
 #include <bcrypt.h>
 #include <strsafe.h>
 #include <stdint.h>
-
-#define MASTER_KEY_BYTES APP_PROFILE_MASTER_KEY_BYTES
-#define MAX_PROFILES APP_PROFILE_MAX_PROFILES
 
 /* Carrier protocol text and seeds. Keep stable for existing encoded key/message payloads. */
 static const WCHAR KEY_PACKAGE_PREFIX_START[] = L"\u4f60\u597d\uff0c\u6211\u662f\u7f16\u53f7";
@@ -206,13 +192,13 @@ BOOL app_flow_import_key(const WCHAR *carrier, const WCHAR *name, int *active_in
         secure_free(pkg, pkg_len);
         return FALSE;
     }
-    if (profiles_count() >= MAX_PROFILES) {
+    if (profiles_count() >= APP_PROFILE_MAX_PROFILES) {
         secure_free(pkg, pkg_len);
         set_error(err, err_cch, L"\u5bc6\u94a5\u6570\u91cf\u5df2\u8fbe\u5230\u4e0a\u9650\u3002");
         return FALSE;
     }
 
-    BYTE master[MASTER_KEY_BYTES];
+    BYTE master[APP_PROFILE_MASTER_KEY_BYTES];
     if (BCryptGenRandom(NULL, master, sizeof(master), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
         secure_free(pkg, pkg_len);
         set_error(err, err_cch, L"\u65e0\u6cd5\u751f\u6210\u672c\u5730\u968f\u673a\u5bc6\u94a5\u3002");

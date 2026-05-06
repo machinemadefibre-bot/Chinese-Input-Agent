@@ -1,16 +1,6 @@
 #ifndef CHINESE_INPUT_AGENT_WIN_UTIL_H
 #define CHINESE_INPUT_AGENT_WIN_UTIL_H
 
-#ifndef UNICODE
-#define UNICODE
-#endif
-#ifndef _UNICODE
-#define _UNICODE
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-
 #include <windows.h>
 #include <stddef.h>
 
