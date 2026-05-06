@@ -10,12 +10,14 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "app_profiles.h"
+#include "app_paths.h"
 #include "app_shared.h"
 #include "app_storage.h"
 #include <bcrypt.h>
 #include <ncrypt.h>
 #include <strsafe.h>
 
+/* Persisted profile database format. Keep these values stable unless a migration is added. */
 #define PROFILES_MAGIC 0x31505348u
 #define PROFILES_VERSION 1u
 
@@ -26,27 +28,27 @@ static int g_active_profile = -1;
 #define MASTER_KEY_BYTES APP_PROFILE_MASTER_KEY_BYTES
 #define MAX_PROFILES APP_PROFILE_MAX_PROFILES
 static BOOL get_profiles_path(WCHAR *path, size_t cch) {
-    return get_app_file(path, cch, L"profiles.dat");
+    return get_app_file(path, cch, APP_PROFILES_FILE_NAME);
 }
 
 BOOL profiles_get_state_path(const KEY_PROFILE *profile, WCHAR *path, size_t cch) {
     WCHAR name[80];
     if (!profile || !profile->id[0]) return FALSE;
-    if (FAILED(StringCchPrintfW(name, ARRAYSIZE(name), L"state_%s.dat", profile->id))) return FALSE;
+    if (FAILED(StringCchPrintfW(name, ARRAYSIZE(name), APP_PROFILE_STATE_FILE_FORMAT, profile->id))) return FALSE;
     return get_app_file(path, cch, name);
 }
 
 BOOL profiles_get_archive_path(const KEY_PROFILE *profile, WCHAR *path, size_t cch) {
     WCHAR name[96];
     if (!profile || !profile->id[0]) return FALSE;
-    if (FAILED(StringCchPrintfW(name, ARRAYSIZE(name), L"archive_%s.dat", profile->id))) return FALSE;
+    if (FAILED(StringCchPrintfW(name, ARRAYSIZE(name), APP_PROFILE_ARCHIVE_FILE_FORMAT, profile->id))) return FALSE;
     return get_app_file(path, cch, name);
 }
 
 BOOL profiles_get_legacy_archive_path(const KEY_PROFILE *profile, WCHAR *path, size_t cch) {
     WCHAR name[96];
     if (!profile || !profile->id[0]) return FALSE;
-    if (FAILED(StringCchPrintfW(name, ARRAYSIZE(name), L"archive_%s.txt", profile->id))) return FALSE;
+    if (FAILED(StringCchPrintfW(name, ARRAYSIZE(name), APP_PROFILE_LEGACY_ARCHIVE_FILE_FORMAT, profile->id))) return FALSE;
     return get_app_file(path, cch, name);
 }
 
@@ -82,6 +84,7 @@ static BOOL open_or_create_profile_wrap_key(NCRYPT_PROV_HANDLE *out_provider, NC
     NCRYPT_PROV_HANDLE provider = 0;
     NCRYPT_KEY_HANDLE key = 0;
     WCHAR key_name[128];
+    /* This label identifies the persisted Windows Hello wrapping key. Changing it would orphan existing profiles. */
     if (!get_scoped_wrap_key_name(L"Profile Wrap Key Hello v2", key_name, ARRAYSIZE(key_name))) {
         set_error(err, err_cch, L"\u65e0\u6cd5\u521b\u5efa Windows Hello \u5bc6\u94a5\u540d\u79f0\u3002");
         return FALSE;

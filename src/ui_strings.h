@@ -1,0 +1,37 @@
+#ifndef CHINESE_INPUT_AGENT_UI_STRINGS_H
+#define CHINESE_INPUT_AGENT_UI_STRINGS_H
+
+#define UI_TEXT_EMPTY L""
+#define UI_TEXT_OPERATION_FAILED L"\u64cd\u4f5c\u5931\u8d25\u3002"
+
+#define UI_TEXT_ENCRYPT L"\u52a0\u5bc6"
+#define UI_TEXT_DECRYPT L"\u89e3\u5bc6"
+#define UI_TEXT_ARCHIVE L"\u5f52\u6863"
+#define UI_TEXT_BACK L"\u8fd4\u56de"
+#define UI_TEXT_STOP L"\u505c\u6b62"
+#define UI_TEXT_IMPORT L"\u5bfc\u5165"
+#define UI_TEXT_EXPORT L"\u5bfc\u51fa"
+#define UI_TEXT_IMPORT_EXPORT_KEY L"\u5bfc\u5165/\u5bfc\u51fa\u5bc6\u94a5"
+#define UI_TEXT_OK L"\u786e\u5b9a"
+#define UI_TEXT_CANCEL L"\u53d6\u6d88"
+
+#define UI_TEXT_TOPIC_CUE L"\u8bf7\u5148\u8f93\u5165\u8ba8\u8bba\u7684\u4e3b\u9898"
+#define UI_TEXT_ENCRYPT_OVERLAY L"\u6b63\u5728\u52a0\u5bc6\u5e76\u6df7\u6dc6\uff0c\u8bf7\u7a0d\u5019..."
+#define UI_TEXT_DECRYPT_OVERLAY L"\u6b63\u5728\u4ece\u526a\u8d34\u677f\u89e3\u5bc6\uff0c\u8bf7\u7a0d\u5019..."
+#define UI_TEXT_KEY_EXPORT_OVERLAY L"\u6b63\u5728\u751f\u6210\u8054\u7cfb\u4eba\u516c\u94a5\u5305\u8f7d\u4f53\u6587\u672c\uff0c\u8bf7\u7a0d\u5019..."
+#define UI_TEXT_KEY_IMPORT_OVERLAY L"\u6b63\u5728\u89e3\u6790\u8054\u7cfb\u4eba\u516c\u94a5\u5305\u8f7d\u4f53\u6587\u672c\uff0c\u8bf7\u7a0d\u5019..."
+
+#define UI_TEXT_NAME_PROMPT_LABEL L"\u7ed9\u5bfc\u5165\u7684\u5bc6\u94a5\u547d\u540d"
+#define UI_TEXT_DEFAULT_IMPORT_KEY_NAME L"\u5bfc\u5165\u5bc6\u94a5"
+
+#define UI_TEXT_WORK_FAILED_UNFINISHED L"\u4efb\u52a1\u5931\u8d25\uff0c\u672a\u5199\u5165\u672a\u5b8c\u6210\u5185\u5bb9"
+#define UI_TEXT_BACKGROUND_WORK_FAILED L"\u540e\u53f0\u4efb\u52a1\u5931\u8d25\u3002"
+#define UI_TEXT_GENERATION_PROGRESS_PREFIX L"\u751f\u6210\u8fdb\u5ea6 ["
+#define UI_TEXT_IMPORT_REFRESH_FAILED L"\u5bc6\u94a5\u5bfc\u5165\u540e\u5237\u65b0\u52a0\u5bc6\u72b6\u6001\u5931\u8d25\u3002"
+#define UI_TEXT_CONTACT_FINGERPRINT_TITLE L"\u8054\u7cfb\u4eba\u6307\u7eb9\u786e\u8ba4"
+#define UI_TEXT_SWITCH_KEY_FAILED L"\u5207\u6362\u5bc6\u94a5\u5931\u8d25\u3002"
+
+#define UI_TEXT_WINDOW_INIT_FAILED L"Window initialization failed."
+#define UI_TEXT_NO_ACTIVE_PROFILE L"No active profile is selected."
+
+#endif

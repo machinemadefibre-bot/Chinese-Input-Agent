@@ -21,9 +21,9 @@
 
 int curve25519_donna(uint8_t *out, const uint8_t *secret, const uint8_t *basepoint);
 
+/* Crypto state and message wire-format constants. Do not change without a migration. */
 #define STATE_MAGIC 0x31454943u
 #define STATE_VERSION 4u
-
 #define MASTER_KEY_BYTES 32
 #define X25519_KEY_BYTES 32
 #define CONTACT_CHECKSUM_BYTES 8

@@ -10,6 +10,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "app_llm.h"
+#include "app_limits.h"
 #include "app_shared.h"
 
 typedef struct LOCAL_LLM_WORKER {
@@ -74,7 +75,7 @@ static BOOL read_line_handle_cancelable(HANDLE h, HANDLE process, STRB *line, BO
                 if (cancelled) *cancelled = TRUE;
                 return FALSE;
             }
-            Sleep(50);
+            Sleep(APP_LLM_PIPE_POLL_MS);
             continue;
         }
         char ch = 0;
@@ -84,7 +85,7 @@ static BOOL read_line_handle_cancelable(HANDLE h, HANDLE process, STRB *line, BO
         }
         if (ch == '\n') return TRUE;
         if (ch == '\r') continue;
-        if (line->len > 1024 * 1024) return FALSE;
+        if (line->len > APP_LLM_MAX_JSON_LINE_BYTES) return FALSE;
         if (!strb_append_n(line, &ch, 1)) return FALSE;
     }
 }
@@ -271,7 +272,7 @@ static void close_local_llm_worker_locked(BOOL terminate) {
     if (g_llm_worker.process.hProcess) {
         if (terminate) {
             TerminateProcess(g_llm_worker.process.hProcess, 1);
-            WaitForSingleObject(g_llm_worker.process.hProcess, 2000);
+            WaitForSingleObject(g_llm_worker.process.hProcess, APP_LLM_TERMINATE_WAIT_MS);
         }
         CloseHandle(g_llm_worker.process.hProcess);
     }
@@ -537,7 +538,7 @@ void shutdown_local_llm_worker(void) {
         if (strb_appendf(&request, "{\"id\":%lu,\"cmd\":\"shutdown\"}\n",
                         (unsigned long)(++g_llm_worker.next_id))) {
             write_all_handle(g_llm_worker.stdin_write, request.data, (DWORD)request.len);
-            WaitForSingleObject(g_llm_worker.process.hProcess, 3000);
+            WaitForSingleObject(g_llm_worker.process.hProcess, APP_LLM_SHUTDOWN_WAIT_MS);
         }
         strb_free(&request);
     }

@@ -33,6 +33,7 @@ function Get-RepoSlice {
 function Test-InstallerDownloadsWorkerDefaultModel {
     $packageBat = Read-RepoFile "package-mingw.bat"
     $installer = Read-RepoFile "src\installer.c"
+    $appPaths = Read-RepoFile "src\app_paths.h"
     $workerCpp = Read-RepoFile "tools\payload_watermark\cia_llama_worker.cpp"
 
     $workerNamesMatch = [regex]::Match(
@@ -48,9 +49,10 @@ function Test-InstallerDownloadsWorkerDefaultModel {
             Sort-Object -Unique
     )
     Assert-True ($workerNames -contains "base_model.gguf") "worker should search for installer-downloaded base_model.gguf"
-    Assert-True $installer.Contains("MODEL_DOWNLOAD_URL") "installer should define a model download URL"
-    Assert-True $installer.Contains("MODEL_DOWNLOAD_SHA256") "installer should verify the downloaded model"
-    Assert-True $installer.Contains("MODEL_INSTALL_NAME L`"base_model.gguf`"") "installer should write the worker default model name"
+    Assert-True $appPaths.Contains("APP_INSTALL_MODEL_DOWNLOAD_URL") "installer should define a model download URL"
+    Assert-True $appPaths.Contains("APP_INSTALL_MODEL_DOWNLOAD_SHA256") "installer should verify the downloaded model"
+    Assert-True $appPaths.Contains("APP_INSTALL_MODEL_NAME L`"base_model.gguf`"") "installer should write the worker default model name"
+    Assert-True $installer.Contains("APP_INSTALL_MODEL_NAME") "installer should use the centralized worker default model name"
     Assert-True (-not $packageBat.Contains("copy /y `"%MODEL_SRC%`"")) "portable package should not embed the GGUF model"
 }
 

@@ -18,7 +18,10 @@ set(APP_SOURCES
   src/app_llm.c
   src/app_flow.c
   src/app_work.c
+  src/ui_key_transfer.c
+  src/ui_name_prompt.c
   src/ui_overlay.c
+  src/ui_work_messages.c
   src/win_util.c
   src/crypto_box.c
   third_party/curve25519-donna/curve25519-donna.c

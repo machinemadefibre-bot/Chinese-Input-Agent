@@ -10,12 +10,13 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "app_shared.h"
+#include "app_constants.h"
+#include "app_limits.h"
+#include "app_paths.h"
 #include <shlobj.h>
 #include <wincrypt.h>
 #include <stdio.h>
 #include <stdarg.h>
-
-#define APP_DIR_NAME L"ChineseInputAgent"
 
 void *xalloc(SIZE_T bytes) {
     return HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, bytes ? bytes : 1);
@@ -244,7 +245,7 @@ void strip_last_path_component_early(WCHAR *path) {
 BOOL get_app_dir(WCHAR *path, size_t cch) {
     if (!path || cch == 0) return FALSE;
     WCHAR exe[MAX_PATH];
-    DWORD env_len = GetEnvironmentVariableW(L"CIA_DATA_DIR", path, (DWORD)cch);
+    DWORD env_len = GetEnvironmentVariableW(APP_ENV_DATA_DIR, path, (DWORD)cch);
     if (env_len > 0) {
         if (env_len >= cch) {
             path[0] = L'\0';
@@ -260,7 +261,7 @@ BOOL get_app_dir(WCHAR *path, size_t cch) {
     if (GetModuleFileNameW(NULL, exe, ARRAYSIZE(exe))) {
         strip_last_path_component_early(exe);
         WCHAR portable[MAX_PATH];
-        if (SUCCEEDED(StringCchPrintfW(portable, ARRAYSIZE(portable), L"%s\\data", exe)) &&
+        if (SUCCEEDED(StringCchPrintfW(portable, ARRAYSIZE(portable), L"%s\\%s", exe, APP_PORTABLE_DATA_DIR_NAME)) &&
             SUCCEEDED(StringCchCopyW(path, cch, portable))) {
             if (dir_exists_w(path) || CreateDirectoryW(path, NULL) || GetLastError() == ERROR_ALREADY_EXISTS) {
                 return TRUE;
@@ -293,8 +294,8 @@ static uint64_t fnv1a_path_hash(const WCHAR *text) {
 BOOL get_scoped_wrap_key_name(const WCHAR *label, WCHAR *out, size_t cch) {
     WCHAR dir[MAX_PATH];
     if (!get_app_dir(dir, ARRAYSIZE(dir))) return FALSE;
-    return SUCCEEDED(StringCchPrintfW(out, cch, L"ChineseInputAgent %s %016llx",
-                                     label ? label : L"Key",
+    return SUCCEEDED(StringCchPrintfW(out, cch, APP_WRAP_KEY_NAME_FORMAT,
+                                     label ? label : APP_WRAP_KEY_DEFAULT_LABEL,
                                      (unsigned long long)fnv1a_path_hash(dir)));
 }
 
@@ -304,7 +305,7 @@ BOOL read_file_bytes(const WCHAR *path, BYTE **out, DWORD *out_len) {
     HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return FALSE;
     LARGE_INTEGER size;
-    if (!GetFileSizeEx(h, &size) || size.QuadPart <= 0 || size.QuadPart > 64 * 1024 * 1024) {
+    if (!GetFileSizeEx(h, &size) || size.QuadPart <= 0 || size.QuadPart > APP_MAX_READ_FILE_BYTES) {
         CloseHandle(h);
         return FALSE;
     }
@@ -343,7 +344,7 @@ BOOL write_file_bytes_atomic(const WCHAR *path, const BYTE *bytes, DWORD len) {
     if (FAILED(StringCchCopyW(target_dir, ARRAYSIZE(target_dir), path))) return FALSE;
     strip_last_path_component(target_dir);
     if (!target_dir[0]) return FALSE;
-    if (!GetTempFileNameW(target_dir, L"cia", 0, temp_path)) return FALSE;
+    if (!GetTempFileNameW(target_dir, APP_TEMP_FILE_PREFIX, 0, temp_path)) return FALSE;
 
     HANDLE h = CreateFileW(temp_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, NULL);
@@ -416,8 +417,8 @@ static BOOL find_native_worker_at_root(const WCHAR *root,
                                        WCHAR *workdir, size_t workdir_cch,
                                        WCHAR *python, size_t python_cch) {
     WCHAR tools[MAX_PATH];
-    if (!join_path(tools, ARRAYSIZE(tools), root, L"tools\\payload_watermark")) return FALSE;
-    if (!join_path(worker, worker_cch, tools, L"cia_llama_worker.exe") || !file_exists_w(worker)) return FALSE;
+    if (!join_path(tools, ARRAYSIZE(tools), root, APP_WORKER_TOOLS_DIR)) return FALSE;
+    if (!join_path(worker, worker_cch, tools, APP_WORKER_EXE_NAME) || !file_exists_w(worker)) return FALSE;
     if (FAILED(StringCchCopyW(workdir, workdir_cch, tools))) return FALSE;
     if (python && python_cch) python[0] = L'\0';
     return TRUE;
@@ -427,7 +428,7 @@ static BOOL find_native_worker_at_dir(const WCHAR *dir,
                                       WCHAR *worker, size_t worker_cch,
                                       WCHAR *workdir, size_t workdir_cch,
                                       WCHAR *python, size_t python_cch) {
-    if (!join_path(worker, worker_cch, dir, L"cia_llama_worker.exe") || !file_exists_w(worker)) return FALSE;
+    if (!join_path(worker, worker_cch, dir, APP_WORKER_EXE_NAME) || !file_exists_w(worker)) return FALSE;
     if (FAILED(StringCchCopyW(workdir, workdir_cch, dir))) return FALSE;
     if (python && python_cch) python[0] = L'\0';
     return TRUE;
@@ -445,7 +446,7 @@ BOOL find_local_worker(WCHAR *script, size_t script_cch, WCHAR *workdir, size_t 
     StringCchCopyW(candidate, ARRAYSIZE(candidate), exe);
     strip_last_path_component(candidate);
     WCHAR packaged_worker[MAX_PATH];
-    if (join_path(packaged_worker, ARRAYSIZE(packaged_worker), candidate, L"llama_worker_package") &&
+    if (join_path(packaged_worker, ARRAYSIZE(packaged_worker), candidate, APP_WORKER_PACKAGE_DIR_NAME) &&
         find_native_worker_at_dir(packaged_worker, script, script_cch, workdir, workdir_cch, python, python_cch)) return TRUE;
     if (find_native_worker_at_root(candidate, script, script_cch, workdir, workdir_cch, python, python_cch)) return TRUE;
 
@@ -465,7 +466,7 @@ BOOL make_temp_path(WCHAR *path, size_t cch) {
     WCHAR dir[MAX_PATH];
     if (!GetTempPathW(ARRAYSIZE(dir), dir)) return FALSE;
     WCHAR generated_path[MAX_PATH];
-    if (!GetTempFileNameW(dir, L"cia", 0, generated_path)) return FALSE;
+    if (!GetTempFileNameW(dir, APP_TEMP_FILE_PREFIX, 0, generated_path)) return FALSE;
     return SUCCEEDED(StringCchCopyW(path, cch, generated_path));
 }
 
@@ -475,8 +476,8 @@ void secure_delete_file(const WCHAR *path) {
                            FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
         LARGE_INTEGER size;
-        if (GetFileSizeEx(h, &size) && size.QuadPart > 0 && size.QuadPart <= 128LL * 1024LL * 1024LL) {
-            BYTE zeros[4096];
+        if (GetFileSizeEx(h, &size) && size.QuadPart > 0 && size.QuadPart <= APP_SECURE_DELETE_MAX_BYTES) {
+            BYTE zeros[APP_SECURE_DELETE_BUFFER_BYTES];
             ZeroMemory(zeros, sizeof(zeros));
             LARGE_INTEGER pos;
             pos.QuadPart = 0;
@@ -528,7 +529,7 @@ BOOL append_process_log(WCHAR *err, size_t err_cch, const WCHAR *prefix, const W
     if (read_utf8_text_file(log_path, &log) && log && log[0]) {
         size_t len = wcslen(log);
         const WCHAR *tail = log;
-        if (len > 900) tail = log + len - 900;
+        if (len > APP_PROCESS_LOG_TAIL_CHARS) tail = log + len - APP_PROCESS_LOG_TAIL_CHARS;
         set_error(err, err_cch, L"%s: %s", prefix, tail);
         secure_free_wide(log);
         return TRUE;

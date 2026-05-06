@@ -16,6 +16,7 @@
 #include <string.h>
 
 #define MASTER_KEY_BYTES APP_STORAGE_MASTER_KEY_BYTES
+/* Local encrypted blob format constants. Keep stable for existing profile/archive files. */
 #define LOCAL_BLOB_HEADER_BYTES APP_STORAGE_LOCAL_BLOB_HEADER_BYTES
 #define LOCAL_BLOB_NONCE_BYTES APP_STORAGE_LOCAL_BLOB_NONCE_BYTES
 #define LOCAL_BLOB_TAG_BYTES APP_STORAGE_LOCAL_BLOB_TAG_BYTES

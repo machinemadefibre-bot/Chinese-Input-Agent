@@ -22,6 +22,7 @@
 #define MASTER_KEY_BYTES APP_PROFILE_MASTER_KEY_BYTES
 #define MAX_PROFILES APP_PROFILE_MAX_PROFILES
 
+/* Carrier protocol text and seeds. Keep stable for existing encoded key/message payloads. */
 static const WCHAR KEY_PACKAGE_PREFIX_START[] = L"\u4f60\u597d\uff0c\u6211\u662f\u7f16\u53f7";
 static const WCHAR KEY_PACKAGE_PREFIX_END[] = L"\uff0c\u8fd9\u662f\u6211\u7684\u81ea\u6211\u4ecb\u7ecd\u3002";
 static const WCHAR KEY_PACKAGE_TOPK_SEED[] = L"ChineseInputAgent key-exchange top-k payload v1";
@@ -49,6 +50,7 @@ static BOOL append_hex_bytes(WCHAR *dst, size_t dst_cch, size_t offset, const BY
 
 static BOOL format_topk_seed_from_public_key(WCHAR *seed, size_t seed_cch, const BYTE *public_key,
                                              DWORD public_key_len, WCHAR *err, size_t err_cch) {
+    /* Message carrier seed prefix is part of the decode contract. */
     const WCHAR prefix[] = L"ChineseInputAgent top-k payload seed v1:";
     size_t prefix_len = wcslen(prefix);
     BOOL seed_built = SUCCEEDED(StringCchCopyW(seed, seed_cch, prefix)) &&

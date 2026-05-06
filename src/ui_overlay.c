@@ -11,6 +11,7 @@
 
 #include "ui_overlay.h"
 #include "app_shared.h"
+#include "ui_layout.h"
 #include "win_util.h"
 
 #include <strsafe.h>
@@ -82,7 +83,7 @@ static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARA
             HFONT old_font = NULL;
             if (state && state->font) old_font = (HFONT)SelectObject(mem, state->font);
             SetBkMode(mem, TRANSPARENT);
-            SetTextColor(mem, RGB(128, 128, 128));
+            SetTextColor(mem, RGB(UI_OVERLAY_TEXT_RGB, UI_OVERLAY_TEXT_RGB, UI_OVERLAY_TEXT_RGB));
             RECT text_rc = local_rc;
             DrawTextW(mem, state && state->text ? state->text : L"", -1, &text_rc,
                       DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
@@ -128,11 +129,11 @@ void ui_overlay_layout(HWND overlay, HWND textbox) {
     if (!overlay || !textbox || !IsWindow(overlay) || !IsWindow(textbox)) return;
     RECT edit_rc;
     GetClientRect(textbox, &edit_rc);
-    int overlay_w = edit_rc.right - edit_rc.left - 16;
-    int overlay_h = edit_rc.bottom - edit_rc.top - 16;
+    int overlay_w = edit_rc.right - edit_rc.left - UI_OVERLAY_TOTAL_INSET;
+    int overlay_h = edit_rc.bottom - edit_rc.top - UI_OVERLAY_TOTAL_INSET;
     if (overlay_w < 1) overlay_w = 1;
     if (overlay_h < 1) overlay_h = 1;
-    MoveWindow(overlay, 8, 8, overlay_w, overlay_h, TRUE);
+    MoveWindow(overlay, UI_OVERLAY_INSET, UI_OVERLAY_INSET, overlay_w, overlay_h, TRUE);
     SetWindowPos(overlay, HWND_TOP, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }

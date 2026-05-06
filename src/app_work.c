@@ -11,7 +11,9 @@
 
 #include "app_work.h"
 #include "app_flow.h"
+#include "app_limits.h"
 #include "app_shared.h"
+#include "ui_strings.h"
 #include "win_util.h"
 
 static volatile LONG g_work_active;
@@ -71,7 +73,7 @@ void app_work_complete_message_handled(void) {
 
 static void show_work_start_error(HWND owner) {
     if (g_host.show_error) {
-        g_host.show_error(g_host.user, owner, L"\u64cd\u4f5c\u5931\u8d25\u3002");
+        g_host.show_error(g_host.user, owner, UI_TEXT_OPERATION_FAILED);
     }
 }
 
@@ -118,12 +120,12 @@ static BOOL post_work_text(UINT msg, HWND target_textbox, const WCHAR *text) {
 
 void app_work_post_llm_stream_progress(HWND target_textbox, const WCHAR *partial,
                                        size_t tokens_done, size_t tokens_total, double tps) {
-    const size_t bar_width = 24;
+    const size_t bar_width = UI_WORK_PROGRESS_BAR_WIDTH;
     if (tokens_total == 0) tokens_total = 1;
     if (tokens_done > tokens_total) tokens_done = tokens_total;
     size_t filled = (tokens_done * bar_width) / tokens_total;
     WSTRB progress_builder = {0};
-    if (!wstrb_append(&progress_builder, L"\u751f\u6210\u8fdb\u5ea6 [")) goto cleanup;
+    if (!wstrb_append(&progress_builder, UI_TEXT_GENERATION_PROGRESS_PREFIX)) goto cleanup;
     for (size_t i = 0; i < bar_width; ++i) {
         if (!wstrb_append_char(&progress_builder, i < filled ? L'#' : L'-')) goto cleanup;
     }
@@ -202,7 +204,7 @@ static DWORD WINAPI work_thread_proc(LPVOID param) {
     } else if (app_work_cancelled()) {
         post_work_text_kind(WM_APP_WORK_CANCELLED, ctx->target_textbox, L"", ctx->kind);
     } else {
-        post_work_text_kind(WM_APP_WORK_ERROR, ctx->target_textbox, err[0] ? err : L"\u540e\u53f0\u4efb\u52a1\u5931\u8d25\u3002", ctx->kind);
+        post_work_text_kind(WM_APP_WORK_ERROR, ctx->target_textbox, err[0] ? err : UI_TEXT_BACKGROUND_WORK_FAILED, ctx->kind);
     }
     secure_free_wide(result);
     app_work_free_ctx(ctx);

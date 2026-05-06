@@ -19,6 +19,9 @@
 #include <wchar.h>
 #include <strsafe.h>
 
+#include "app_limits.h"
+#include "app_paths.h"
+
 #define APP_TITLE L"ChineseInputAgent Portable 安装器"
 #define IDC_PATH_EDIT 1001
 #define IDC_BROWSE 1002
@@ -29,10 +32,8 @@
 #define IDC_STATUS 1007
 #define WM_APP_INSTALL_STATUS (WM_APP + 1)
 #define WM_APP_INSTALL_DONE (WM_APP + 2)
-#define MODEL_DOWNLOAD_URL L"https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf?download=true"
-#define MODEL_DOWNLOAD_SHA256 L"3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597"
-#define MODEL_INSTALL_NAME L"base_model.gguf"
-
+#define INSTALLER_WINDOW_CLASS_NAME L"ChineseInputAgentInstallerWindow"
+/* Installer payload trailer format. Keep this stable for packaged installers. */
 static const unsigned char PAYLOAD_MAGIC[16] = {
     'C','I','A','I','N','S','T','P','K','G','0','0','0','1','\r','\n'
 };
@@ -106,12 +107,12 @@ static void default_install_path(WCHAR *out, size_t cch) {
         got = GetEnvironmentVariableW(L"USERPROFILE", out, (DWORD)cch);
     }
     if (got == 0 || got >= cch) {
-        StringCchCopyW(out, cch, L"C:\\ChineseInputAgent");
+        StringCchCopyW(out, cch, APP_INSTALL_FALLBACK_ROOT);
         return;
     }
     WCHAR base_path[MAX_PATH];
     StringCchCopyW(base_path, ARRAYSIZE(base_path), out);
-    join_path(out, cch, base_path, L"ChineseInputAgent");
+    join_path(out, cch, base_path, APP_INSTALL_SUBDIR_NAME);
 }
 
 static BOOL directory_has_anything(const WCHAR *path) {
@@ -141,7 +142,7 @@ static BOOL ensure_directory(const WCHAR *path, WCHAR *err, size_t err_cch) {
 static BOOL temp_file_path(const WCHAR *suffix, WCHAR *out, size_t cch) {
     WCHAR dir[MAX_PATH];
     if (!GetTempPathW(ARRAYSIZE(dir), dir)) return FALSE;
-    return SUCCEEDED(StringCchPrintfW(out, cch, L"%scia_installer_%lu%s", dir, (unsigned long)GetCurrentProcessId(), suffix));
+    return SUCCEEDED(StringCchPrintfW(out, cch, APP_INSTALL_TEMP_FILE_FORMAT, dir, (unsigned long)GetCurrentProcessId(), suffix));
 }
 
 static BOOL read_payload_trailer(FILE *self, int64_t file_size, PAYLOAD_TRAILER *trailer) {
@@ -190,7 +191,7 @@ static BOOL extract_embedded_zip(const WCHAR *zip_path, WCHAR *err, size_t err_c
         return FALSE;
     }
 
-    BYTE *copy_buffer = (BYTE *)xalloc(1024 * 1024);
+    BYTE *copy_buffer = (BYTE *)xalloc(APP_INSTALL_COPY_BUFFER_BYTES);
     if (!copy_buffer) {
         fclose(zip);
         fclose(self);
@@ -201,7 +202,7 @@ static BOOL extract_embedded_zip(const WCHAR *zip_path, WCHAR *err, size_t err_c
     uint64_t left = trailer.size;
     uint64_t bytes_copied = 0;
     while (left > 0) {
-        size_t chunk = left > 1024 * 1024 ? 1024 * 1024 : (size_t)left;
+        size_t chunk = left > APP_INSTALL_COPY_BUFFER_BYTES ? APP_INSTALL_COPY_BUFFER_BYTES : (size_t)left;
         size_t bytes_read = fread(copy_buffer, 1, chunk, self);
         if (bytes_read != chunk || fwrite(copy_buffer, 1, chunk, zip) != chunk) {
             xfree(copy_buffer);
@@ -296,7 +297,7 @@ static BOOL write_model_download_script(const WCHAR *script_path, const WCHAR *t
         L"$ErrorActionPreference = 'Stop'\r\n"
         L"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12\r\n"
         L"$target = %s\r\n"
-        L"$modelsDir = Join-Path $target 'models'\r\n"
+        L"$modelsDir = Join-Path $target '%s'\r\n"
         L"$modelPath = Join-Path $modelsDir '%s'\r\n"
         L"$tmpPath = $modelPath + '.download'\r\n"
         L"$url = '%s'\r\n"
@@ -320,9 +321,10 @@ static BOOL write_model_download_script(const WCHAR *script_path, const WCHAR *t
         L"}\r\n"
         L"Move-Item -LiteralPath $tmpPath -Destination $modelPath -Force\r\n",
         target_q,
-        MODEL_INSTALL_NAME,
-        MODEL_DOWNLOAD_URL,
-        MODEL_DOWNLOAD_SHA256
+        APP_INSTALL_MODELS_DIR_NAME,
+        APP_INSTALL_MODEL_NAME,
+        APP_INSTALL_MODEL_DOWNLOAD_URL,
+        APP_INSTALL_MODEL_DOWNLOAD_SHA256
     );
     xfree(target_q);
     if (FAILED(hr)) {
@@ -408,13 +410,13 @@ static DWORD WINAPI install_thread_proc(LPVOID param) {
     if (!write_model_download_script(ps1_path, ctx->target, err, ARRAYSIZE(err))) goto fail;
     if (!run_powershell_script(ps1_path, err, ARRAYSIZE(err))) goto fail;
 
-    if (!join_path(exe_path, ARRAYSIZE(exe_path), ctx->target, L"ChineseInputAgent.exe") ||
+    if (!join_path(exe_path, ARRAYSIZE(exe_path), ctx->target, APP_INSTALL_EXE_NAME) ||
         GetFileAttributesW(exe_path) == INVALID_FILE_ATTRIBUTES) {
         StringCchCopyW(err, ARRAYSIZE(err), L"安装完成校验失败：没有找到 ChineseInputAgent.exe。");
         goto fail;
     }
-    if (!join_path(models_path, ARRAYSIZE(models_path), ctx->target, L"models") ||
-        !join_path(model_path, ARRAYSIZE(model_path), models_path, MODEL_INSTALL_NAME) ||
+    if (!join_path(models_path, ARRAYSIZE(models_path), ctx->target, APP_INSTALL_MODELS_DIR_NAME) ||
+        !join_path(model_path, ARRAYSIZE(model_path), models_path, APP_INSTALL_MODEL_NAME) ||
         GetFileAttributesW(model_path) == INVALID_FILE_ATTRIBUTES) {
         StringCchCopyW(err, ARRAYSIZE(err), L"安装完成校验失败：没有找到 base_model.gguf。");
         goto fail;
@@ -446,7 +448,7 @@ static void browse_for_folder(HWND hwnd) {
     WCHAR path[MAX_PATH];
     if (SHGetPathFromIDListW(pidl, path)) {
         WCHAR final_path[MAX_PATH];
-        if (join_path(final_path, ARRAYSIZE(final_path), path, L"ChineseInputAgent")) {
+        if (join_path(final_path, ARRAYSIZE(final_path), path, APP_INSTALL_SUBDIR_NAME)) {
             SetWindowTextW(g_path_edit, final_path);
         }
     }
@@ -618,7 +620,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wc.lpszClassName = L"ChineseInputAgentInstallerWindow";
+    wc.lpszClassName = INSTALLER_WINDOW_CLASS_NAME;
     if (!RegisterClassW(&wc)) return 1;
 
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, APP_TITLE,
