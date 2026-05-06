@@ -15,7 +15,6 @@
 
 #define APP_TEMP_FILE_PREFIX L"cia"
 
-#define APP_INSTALL_FALLBACK_ROOT L"C:\\ChineseInputAgent"
 #define APP_INSTALL_SUBDIR_NAME L"ChineseInputAgent"
 #define APP_INSTALL_EXE_NAME L"ChineseInputAgent.exe"
 #define APP_INSTALL_MODELS_DIR_NAME L"models"

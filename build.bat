@@ -42,10 +42,27 @@ exit /b 0
 :load_msvc_env
 where cl.exe >nul 2>nul
 if not errorlevel 1 exit /b 0
-set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-if not exist "%VSWHERE%" exit /b 0
-for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_ROOT=%%I"
+call :find_vsroot
 if defined VS_ROOT if exist "%VS_ROOT%\Common7\Tools\VsDevCmd.bat" call "%VS_ROOT%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 >nul
+exit /b 0
+
+:find_vsroot
+set "VS_ROOT="
+for /f "delims=" %%I in ('where vswhere.exe 2^>nul') do if not defined VSWHERE_EXE set "VSWHERE_EXE=%%I"
+if not defined VSWHERE_EXE call :find_vswhere_from_registry
+if defined VSWHERE_EXE for /f "usebackq delims=" %%I in (`"%VSWHERE_EXE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS_ROOT=%%I"
+if defined VS_ROOT exit /b 0
+for /f "tokens=2,*" %%A in ('reg query "HKLM\SOFTWARE\Microsoft\VisualStudio\SxS\VS7" /v 17.0 2^>nul') do if not defined VS_ROOT set "VS_ROOT=%%B"
+if defined VS_ROOT exit /b 0
+for /f "tokens=2,*" %%A in ('reg query "HKCU\SOFTWARE\Microsoft\VisualStudio\SxS\VS7" /v 17.0 2^>nul') do if not defined VS_ROOT set "VS_ROOT=%%B"
+exit /b 0
+
+:find_vswhere_from_registry
+set "VS_INSTALLER_DIR="
+for /f "delims=" %%K in ('reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" /s /f "Microsoft Visual Studio Installer" /d 2^>nul ^| findstr /B /C:"HKEY"') do (
+    if not defined VS_INSTALLER_DIR for /f "tokens=2,*" %%A in ('reg query "%%K" /v InstallLocation 2^>nul') do set "VS_INSTALLER_DIR=%%~B"
+)
+if defined VS_INSTALLER_DIR if exist "%VS_INSTALLER_DIR%\vswhere.exe" set "VSWHERE_EXE=%VS_INSTALLER_DIR%\vswhere.exe"
 exit /b 0
 
 :find_cmake

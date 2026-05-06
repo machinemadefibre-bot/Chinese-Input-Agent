@@ -182,11 +182,14 @@ A/B 独立安装通信测试：
 test-ab-installs.bat
 ```
 
-`test-ab-installs.bat` 默认使用：
+`test-ab-installs.bat` 默认会在仓库的 `build\ab-installs` 下创建 A/B 两个测试安装目录。也可以通过参数或环境变量指定真实 A/B 安装目录：
 
-```text
-S:\Program Files\ChineseInputAgent-A
-S:\Program Files\ChineseInputAgent-B
+```bat
+test-ab-installs.bat -AInstallDir <A安装目录> -BInstallDir <B安装目录>
+
+set CIA_TEST_A_INSTALL_DIR=<A安装目录>
+set CIA_TEST_B_INSTALL_DIR=<B安装目录>
+test-ab-installs.bat
 ```
 
 它会在两个安装目录各自的 `data\ab_exchange_test` 下创建独立测试 state，覆盖密钥交换、一来一回通信、单方向多条消息、乱序、丢包和重启后继续通信。

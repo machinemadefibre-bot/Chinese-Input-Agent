@@ -85,13 +85,29 @@ static BOOL join_path(WCHAR *out, size_t cch, const WCHAR *base, const WCHAR *le
     return SUCCEEDED(StringCchPrintfW(out, cch, L"%s%s%s", base ? base : L"", sep, leaf ? leaf : L""));
 }
 
+static void strip_last_path_component(WCHAR *path) {
+    if (!path) return;
+    size_t len = wcslen(path);
+    while (len > 0 && (path[len - 1] == L'\\' || path[len - 1] == L'/')) path[--len] = L'\0';
+    WCHAR *last_backslash = wcsrchr(path, L'\\');
+    WCHAR *last_slash = wcsrchr(path, L'/');
+    WCHAR *last = last_backslash;
+    if (!last || (last_slash && last_slash > last)) last = last_slash;
+    if (last) *last = L'\0';
+}
+
 static void default_install_path(WCHAR *out, size_t cch) {
     DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", out, (DWORD)cch);
     if (got == 0 || got >= cch) {
         got = GetEnvironmentVariableW(L"USERPROFILE", out, (DWORD)cch);
     }
     if (got == 0 || got >= cch) {
-        StringCchCopyW(out, cch, APP_INSTALL_FALLBACK_ROOT);
+        WCHAR exe[MAX_PATH];
+        if (GetModuleFileNameW(NULL, exe, ARRAYSIZE(exe))) {
+            strip_last_path_component(exe);
+            if (join_path(out, cch, exe, APP_INSTALL_SUBDIR_NAME)) return;
+        }
+        StringCchCopyW(out, cch, APP_INSTALL_SUBDIR_NAME);
         return;
     }
     WCHAR base_path[MAX_PATH];

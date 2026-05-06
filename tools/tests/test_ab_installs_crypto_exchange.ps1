@@ -1,6 +1,6 @@
 param(
-    [string]$AInstallDir = "S:\Program Files\ChineseInputAgent-A",
-    [string]$BInstallDir = "S:\Program Files\ChineseInputAgent-B",
+    [string]$AInstallDir = $env:CIA_TEST_A_INSTALL_DIR,
+    [string]$BInstallDir = $env:CIA_TEST_B_INSTALL_DIR,
     [switch]$KeepState
 )
 
@@ -11,6 +11,38 @@ $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $buildDir = Join-Path $repoRoot "build\tests\ab_crypto_exchange"
 $testExe = Join-Path $buildDir "ab_crypto_exchange_test.exe"
 $testSource = Join-Path $PSScriptRoot "ab_crypto_exchange_test.c"
+
+$usingDefaultAInstallDir = $false
+$usingDefaultBInstallDir = $false
+if ([string]::IsNullOrWhiteSpace($AInstallDir)) {
+    $AInstallDir = Join-Path $repoRoot "build\ab-installs\ChineseInputAgent-A"
+    $usingDefaultAInstallDir = $true
+}
+if ([string]::IsNullOrWhiteSpace($BInstallDir)) {
+    $BInstallDir = Join-Path $repoRoot "build\ab-installs\ChineseInputAgent-B"
+    $usingDefaultBInstallDir = $true
+}
+
+function Initialize-DefaultInstall {
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallDir,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    if (-not (Test-Path -LiteralPath $InstallDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $InstallDir | Out-Null
+    }
+
+    $sourceExe = Join-Path $repoRoot "build\ChineseInputAgent.exe"
+    if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) {
+        $sourceExe = Join-Path $repoRoot "dist\ChineseInputAgent\ChineseInputAgent.exe"
+    }
+    if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) {
+        throw "Default $Label install requires build\ChineseInputAgent.exe or dist\ChineseInputAgent\ChineseInputAgent.exe. Run build-mingw.bat first, or pass -${Label}InstallDir."
+    }
+
+    Copy-Item -LiteralPath $sourceExe -Destination (Join-Path $InstallDir "ChineseInputAgent-$Label.exe") -Force
+}
 
 function Resolve-AppExe {
     param(
@@ -62,6 +94,9 @@ function Resolve-CCompiler {
 
     throw "No MinGW C compiler found. Install MSYS2 UCRT64 or add x86_64-w64-mingw32-gcc.exe/gcc.exe to PATH."
 }
+
+if ($usingDefaultAInstallDir) { Initialize-DefaultInstall -InstallDir $AInstallDir -Label "A" }
+if ($usingDefaultBInstallDir) { Initialize-DefaultInstall -InstallDir $BInstallDir -Label "B" }
 
 $aExe = Resolve-AppExe -InstallDir $AInstallDir -Label "A"
 $bExe = Resolve-AppExe -InstallDir $BInstallDir -Label "B"
