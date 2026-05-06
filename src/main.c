@@ -43,6 +43,8 @@ static CRYPTO_BOX *get_active_box_for_work(void *user);
 static void set_work_busy(void *user, BOOL busy);
 static void show_work_error(void *user, HWND owner, const WCHAR *message);
 static void configure_app_work(HWND main_window);
+static BOOL save_chat_plaintext(int profile_index, const WCHAR *sender, const WCHAR *plain,
+                                WCHAR *err, size_t err_cch);
 
 static void refresh_key_combo(void) {
     if (!g_key_select) return;
@@ -155,32 +157,11 @@ static void leave_archive_mode(void) {
 }
 
 static void do_archive(HWND hwnd) {
+    (void)hwnd;
     if (g_archive_mode) {
         leave_archive_mode();
         return;
     }
-    KEY_PROFILE *profile = profiles_active();
-    if (!profile) {
-        show_error(hwnd, UI_TEXT_ARCHIVE_FAILED);
-        return;
-    }
-    WCHAR *plain = win_get_window_text_alloc(g_textbox);
-    if (!plain) {
-        show_error(hwnd, UI_TEXT_ARCHIVE_FAILED);
-        return;
-    }
-    if (plain[0] == L'\0') {
-        secure_free_wide(plain);
-        enter_archive_mode();
-        return;
-    }
-    WCHAR err[256] = L"";
-    if (!archive_append_text(profile, plain, err, ARRAYSIZE(err))) {
-        secure_free_wide(plain);
-        show_error(hwnd, err[0] ? err : L"");
-        return;
-    }
-    secure_free_wide(plain);
     enter_archive_mode();
 }
 
@@ -262,6 +243,24 @@ static void work_messages_refresh_key_list_after_key_import(void *user) {
     refresh_key_combo();
 }
 
+static BOOL save_chat_plaintext(int profile_index, const WCHAR *sender, const WCHAR *plain,
+                                WCHAR *err, size_t err_cch) {
+    KEY_PROFILE *profile = profiles_get(profile_index);
+    if (!profile) {
+        set_error(err, err_cch, UI_TEXT_NO_ACTIVE_PROFILE);
+        return FALSE;
+    }
+    return archive_append_text(profile, sender, plain, err, err_cch);
+}
+
+static BOOL work_messages_save_decrypted_plaintext(void *user, int profile_index, const WCHAR *plain,
+                                                   WCHAR *err, size_t err_cch) {
+    (void)user;
+    KEY_PROFILE *profile = profiles_get(profile_index);
+    const WCHAR *sender = profile && profile->name[0] ? profile->name : NULL;
+    return save_chat_plaintext(profile_index, sender, plain, err, err_cch);
+}
+
 static void configure_app_work(HWND main_window) {
     APP_WORK_HOST host;
     ZeroMemory(&host, sizeof(host));
@@ -287,8 +286,16 @@ static void do_encrypt(HWND hwnd) {
         secure_free_wide(plain_w);
         return;
     }
+    WCHAR *plain_for_history = win_dup_wide(plain_w);
+    if (!plain_for_history) {
+        secure_free_wide(plain_w);
+        xfree(topic);
+        show_error(hwnd, UI_TEXT_CHAT_HISTORY_SAVE_FAILED);
+        return;
+    }
     APP_WORK_CTX *ctx = app_work_alloc(APP_WORK_KIND_ENCRYPT, hwnd, g_textbox);
     if (!ctx) {
+        secure_free_wide(plain_for_history);
         secure_free_wide(plain_w);
         xfree(topic);
         show_error(hwnd, UI_TEXT_ENCRYPT_FAILED);
@@ -302,6 +309,14 @@ static void do_encrypt(HWND hwnd) {
         set_textbox_overlay(g_textbox, NULL, FALSE);
         SetWindowTextW(g_textbox, plain_w);
         app_work_free_ctx(ctx);
+        secure_free_wide(plain_for_history);
+    } else {
+        WCHAR err[256] = L"";
+        if (!save_chat_plaintext(profiles_active_index(), UI_TEXT_SENDER_SELF,
+                                 plain_for_history, err, ARRAYSIZE(err))) {
+            show_error(hwnd, err[0] ? err : UI_TEXT_CHAT_HISTORY_SAVE_FAILED);
+        }
+        secure_free_wide(plain_for_history);
     }
 }
 
@@ -369,6 +384,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         host.show_error = work_messages_show_error;
         host.reload_crypto_after_key_import = work_messages_reload_crypto_after_key_import;
         host.refresh_key_list_after_key_import = work_messages_refresh_key_list_after_key_import;
+        host.save_decrypted_plaintext = work_messages_save_decrypted_plaintext;
         return ui_work_handle_message(hwnd, msg, wparam, lparam, &host);
     }
     case WM_CREATE: {

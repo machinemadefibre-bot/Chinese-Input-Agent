@@ -37,6 +37,7 @@ void app_work_free_ctx(APP_WORK_CTX *ctx) {
     secure_free_wide(ctx->input);
     xfree(ctx->topic);
     xfree(ctx->name);
+    secure_free_wide(ctx->expected_fingerprint);
     xfree(ctx);
 }
 
@@ -96,11 +97,13 @@ BOOL app_work_start(APP_WORK_CTX *ctx) {
     return TRUE;
 }
 
-static BOOL post_work_text_kind(UINT msg, HWND target_textbox, const WCHAR *text, APP_WORK_KIND kind) {
+static BOOL post_work_text_kind(UINT msg, HWND target_textbox, const WCHAR *text,
+                                APP_WORK_KIND kind, int profile_index) {
     APP_WORK_MESSAGE *message = (APP_WORK_MESSAGE *)xalloc(sizeof(*message));
     if (!message) return FALSE;
     message->kind = kind;
     message->target_textbox = target_textbox;
+    message->profile_index = profile_index;
     message->text = win_dup_wide(text ? text : L"");
     if (!message->text) {
         xfree(message);
@@ -115,7 +118,7 @@ static BOOL post_work_text_kind(UINT msg, HWND target_textbox, const WCHAR *text
 }
 
 static BOOL post_work_text(UINT msg, HWND target_textbox, const WCHAR *text) {
-    return post_work_text_kind(msg, target_textbox, text, 0);
+    return post_work_text_kind(msg, target_textbox, text, 0, -1);
 }
 
 static void finish_unposted_terminal_work(UINT msg) {
@@ -174,17 +177,21 @@ static BOOL worker_export_key(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t
 static BOOL worker_import_key(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
     int imported_index = -1;
-    return app_flow_import_key(ctx ? ctx->input : NULL, ctx ? ctx->name : NULL,
+    return app_flow_import_key(ctx ? ctx->input : NULL, ctx ? ctx->expected_fingerprint : NULL,
+                               ctx ? ctx->name : NULL,
                                &imported_index, out, err, err_cch);
 }
 
-static BOOL worker_decrypt(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
+static BOOL worker_decrypt(APP_WORK_CTX *ctx, WCHAR **out, int *profile_index_out,
+                           WCHAR *err, size_t err_cch) {
     *out = NULL;
+    if (profile_index_out) *profile_index_out = -1;
     if (!ctx || !ctx->input || !ctx->input[0]) {
         set_error(err, err_cch, L"Clipboard text is empty.");
         return FALSE;
     }
-    return app_flow_decrypt_clip_auto_profile(ctx->input, app_work_cancelled, out, err, err_cch);
+    return app_flow_decrypt_clip_auto_profile(ctx->input, app_work_cancelled, out, profile_index_out,
+                                              err, err_cch);
 }
 
 static DWORD WINAPI work_thread_proc(LPVOID param) {
@@ -198,6 +205,7 @@ static DWORD WINAPI work_thread_proc(LPVOID param) {
     BOOL work_succeeded = FALSE;
     UINT terminal_msg = WM_APP_WORK_ERROR;
     const WCHAR *terminal_text = WORK_BACKGROUND_FAILED_TEXT;
+    int result_profile_index = -1;
 
     if (ctx->kind == APP_WORK_KIND_ENCRYPT) {
         work_succeeded = worker_encrypt(ctx, &result, err, ARRAYSIZE(err));
@@ -206,7 +214,7 @@ static DWORD WINAPI work_thread_proc(LPVOID param) {
     } else if (ctx->kind == APP_WORK_KIND_IMPORT_KEY) {
         work_succeeded = worker_import_key(ctx, &result, err, ARRAYSIZE(err));
     } else if (ctx->kind == APP_WORK_KIND_DECRYPT) {
-        work_succeeded = worker_decrypt(ctx, &result, err, ARRAYSIZE(err));
+        work_succeeded = worker_decrypt(ctx, &result, &result_profile_index, err, ARRAYSIZE(err));
     } else {
         set_error(err, ARRAYSIZE(err), L"Unknown background work kind.");
     }
@@ -221,7 +229,8 @@ static DWORD WINAPI work_thread_proc(LPVOID param) {
         terminal_msg = WM_APP_WORK_ERROR;
         terminal_text = err[0] ? err : WORK_BACKGROUND_FAILED_TEXT;
     }
-    if (!post_work_text_kind(terminal_msg, ctx->target_textbox, terminal_text, ctx->kind)) {
+    if (!post_work_text_kind(terminal_msg, ctx->target_textbox, terminal_text,
+                             ctx->kind, result_profile_index)) {
         finish_unposted_terminal_work(terminal_msg);
     }
     secure_free_wide(result);

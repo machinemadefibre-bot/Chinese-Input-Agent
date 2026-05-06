@@ -12,18 +12,28 @@ int curve25519_donna(uint8_t *out, const uint8_t *secret, const uint8_t *basepoi
 
 /* Crypto state and message wire-format constants. Do not change without a migration. */
 #define STATE_MAGIC 0x31454943u
-#define STATE_VERSION 4u
+#define STATE_VERSION 5u
+#define STATE_VERSION_PRE_SESSION 4u
 #define MASTER_KEY_BYTES 32
 #define X25519_KEY_BYTES 32
 #define CONTACT_CHECKSUM_BYTES 8
-#define CONTACT_COMPACT_PACKAGE_BYTES (X25519_KEY_BYTES + CONTACT_CHECKSUM_BYTES)
-#define CONTACT_FINGERPRINT_DIGITS 16
+#define CONTACT_PACKAGE_FORMAT_BASE 0x20u
+#define CONTACT_PACKAGE_RECIPIENT_FLAG 0x01u
+#define CONTACT_PACKAGE_FORMAT_MASK 0xfeu
+#define CONTACT_PACKAGE_BASE_BYTES (1 + X25519_KEY_BYTES + X25519_KEY_BYTES + CONTACT_CHECKSUM_BYTES)
+#define CONTACT_PACKAGE_WITH_RECIPIENT_BYTES (CONTACT_PACKAGE_BASE_BYTES + X25519_KEY_BYTES)
+#define CONTACT_FINGERPRINT_DIGITS 8
 #define STATE_NONCE_BYTES 12
 #define STATE_TAG_BYTES 16
 #define STATE_HEADER_BYTES 16
 
 #define MESSAGE_NONCE_BYTES 12
-#define MESSAGE_TAG_BYTES 16
+#define MESSAGE_TAG_BYTES 12
+#define SESSION_PACKET_FORMAT 0x21u
+#define SESSION_ID_BYTES 8
+#define SESSION_COUNTER_BYTES 4
+#define SESSION_HEADER_BYTES (1 + SESSION_ID_BYTES + SESSION_COUNTER_BYTES)
+#define SESSION_MAX_SKIPPED_KEYS 64u
 
 typedef struct BOX_BUF {
     uint8_t *data;
@@ -42,12 +52,41 @@ typedef struct READ_CURSOR {
     size_t pos;
 } READ_CURSOR;
 
+typedef struct CONTACT_PACKAGE_VIEW {
+    const uint8_t *static_public;
+    const uint8_t *handshake_public;
+    const uint8_t *recipient_public;
+    BOOL has_recipient;
+    DWORD body_len;
+} CONTACT_PACKAGE_VIEW;
+
+typedef struct SKIPPED_MESSAGE_KEY {
+    BOOL used;
+    uint64_t session_id;
+    uint32_t counter;
+    uint8_t key[32];
+} SKIPPED_MESSAGE_KEY;
+
 struct CRYPTO_BOX {
     BYTE master_key[MASTER_KEY_BYTES];
     WCHAR state_path[MAX_PATH];
     BOX_BUF public_key;
     BOX_BUF private_key;
     BOX_BUF remote_public_key;
+    BOOL local_handshake_ready;
+    uint8_t local_handshake_private[X25519_KEY_BYTES];
+    uint8_t local_handshake_public[X25519_KEY_BYTES];
+    BOOL remote_handshake_ready;
+    uint8_t remote_handshake_public[X25519_KEY_BYTES];
+    BOOL send_chain_ready;
+    BOOL recv_chain_ready;
+    uint64_t send_session_id;
+    uint64_t recv_session_id;
+    uint32_t send_counter;
+    uint32_t recv_counter;
+    uint8_t send_chain_key[32];
+    uint8_t recv_chain_key[32];
+    SKIPPED_MESSAGE_KEY skipped_keys[SESSION_MAX_SKIPPED_KEYS];
 };
 
 static void set_box_error(WCHAR *error_buffer, size_t cch, const WCHAR *fmt, ...) {
@@ -153,6 +192,14 @@ static BOOL builder_u32(BYTE_BUILDER *builder, uint32_t v) {
     return builder_append(builder, encoded, sizeof(encoded));
 }
 
+static BOOL builder_u64(BYTE_BUILDER *builder, uint64_t v) {
+    uint8_t encoded[8];
+    for (int byte_idx = 0; byte_idx < 8; ++byte_idx) {
+        encoded[byte_idx] = (uint8_t)((v >> (byte_idx * 8)) & 0xffu);
+    }
+    return builder_append(builder, encoded, sizeof(encoded));
+}
+
 static BOOL builder_blob(BYTE_BUILDER *builder, const uint8_t *bytes, size_t len) {
     if (len > 0xffffffffu) return FALSE;
     return builder_u32(builder, (uint32_t)len) && builder_append(builder, bytes, len);
@@ -171,6 +218,25 @@ static BOOL read_u32(READ_CURSOR *c, uint32_t *out) {
     return TRUE;
 }
 
+static BOOL read_u64(READ_CURSOR *c, uint64_t *out) {
+    if (!c || !out || c->pos > c->len || c->len - c->pos < 8) return FALSE;
+    const uint8_t *p = c->data + c->pos;
+    uint64_t v = 0;
+    for (int byte_idx = 0; byte_idx < 8; ++byte_idx) {
+        v |= ((uint64_t)p[byte_idx]) << (byte_idx * 8);
+    }
+    *out = v;
+    c->pos += 8;
+    return TRUE;
+}
+
+static BOOL read_fixed_ref(READ_CURSOR *c, const uint8_t **bytes, size_t len) {
+    if (!c || !bytes || c->pos > c->len || len > c->len - c->pos) return FALSE;
+    *bytes = c->data + c->pos;
+    c->pos += len;
+    return TRUE;
+}
+
 static BOOL read_blob_ref(READ_CURSOR *c, const uint8_t **bytes, size_t *len) {
     uint32_t n = 0;
     if (!bytes || !len || !read_u32(c, &n) || c->pos > c->len || (size_t)n > c->len - c->pos) return FALSE;
@@ -178,6 +244,34 @@ static BOOL read_blob_ref(READ_CURSOR *c, const uint8_t **bytes, size_t *len) {
     *len = n;
     c->pos += n;
     return TRUE;
+}
+
+static uint64_t read_u64_le(const uint8_t bytes[8]) {
+    uint64_t v = 0;
+    for (int byte_idx = 0; byte_idx < 8; ++byte_idx) {
+        v |= ((uint64_t)bytes[byte_idx]) << (byte_idx * 8);
+    }
+    return v;
+}
+
+static uint32_t read_u32_le(const uint8_t bytes[4]) {
+    return (uint32_t)bytes[0] |
+           ((uint32_t)bytes[1] << 8) |
+           ((uint32_t)bytes[2] << 16) |
+           ((uint32_t)bytes[3] << 24);
+}
+
+static void write_u64_le(uint8_t bytes[8], uint64_t v) {
+    for (int byte_idx = 0; byte_idx < 8; ++byte_idx) {
+        bytes[byte_idx] = (uint8_t)((v >> (byte_idx * 8)) & 0xffu);
+    }
+}
+
+static void write_u32_le(uint8_t bytes[4], uint32_t v) {
+    bytes[0] = (uint8_t)(v & 0xffu);
+    bytes[1] = (uint8_t)((v >> 8) & 0xffu);
+    bytes[2] = (uint8_t)((v >> 16) & 0xffu);
+    bytes[3] = (uint8_t)((v >> 24) & 0xffu);
 }
 
 static BOOL read_file_all(const WCHAR *path, uint8_t **out, DWORD *out_len) {
@@ -272,34 +366,6 @@ cleanup:
     return hash_succeeded;
 }
 
-static BOOL derive_message_key(const uint8_t *shared, DWORD shared_len,
-                               const uint8_t *ephemeral_public, DWORD ephemeral_public_len,
-                               const uint8_t *recipient_public, DWORD recipient_public_len,
-                               uint8_t key_out[32]) {
-    static const uint8_t salt_key[] = "ChineseInputAgent X25519 ECIES salt v1";
-    static const uint8_t info[] = "ChineseInputAgent X25519 ECIES key v1";
-    uint8_t salt[32];
-    uint8_t prk[32];
-    uint8_t one = 1;
-    const uint8_t *salt_parts[2] = { ephemeral_public, recipient_public };
-    DWORD salt_lens[2] = { ephemeral_public_len, recipient_public_len };
-    const uint8_t *ikm_parts[1] = { shared };
-    DWORD ikm_lens[1] = { shared_len };
-    const uint8_t *info_parts[2] = { info, &one };
-    DWORD info_lens[2] = { (DWORD)(sizeof(info) - 1), 1 };
-    BOOL key_derived = FALSE;
-
-    if (!hmac_sha256_segments(salt_key, (DWORD)(sizeof(salt_key) - 1), salt_parts, salt_lens, 2, salt)) goto cleanup;
-    if (!hmac_sha256_segments(salt, sizeof(salt), ikm_parts, ikm_lens, 1, prk)) goto cleanup;
-    if (!hmac_sha256_segments(prk, sizeof(prk), info_parts, info_lens, 2, key_out)) goto cleanup;
-    key_derived = TRUE;
-cleanup:
-    SecureZeroMemory(salt, sizeof(salt));
-    SecureZeroMemory(prk, sizeof(prk));
-    if (!key_derived) SecureZeroMemory(key_out, 32);
-    return key_derived;
-}
-
 static BOOL aes_gcm_encrypt_raw(const uint8_t key_bytes[32],
                                 const uint8_t *aad, DWORD aad_len,
                                 const uint8_t *nonce, DWORD nonce_len,
@@ -387,40 +453,298 @@ static BOOL x25519_shared_secret(const uint8_t priv[X25519_KEY_BYTES],
     return !bytes_all_zero(shared, X25519_KEY_BYTES);
 }
 
-static BOOL contact_checksum(const uint8_t pub[X25519_KEY_BYTES], uint8_t out[CONTACT_CHECKSUM_BYTES]) {
-    static const uint8_t label[] = "ChineseInputAgent contact checksum";
+static BOOL contact_package_checksum(const uint8_t *body, DWORD body_len, uint8_t out[CONTACT_CHECKSUM_BYTES]) {
+    static const uint8_t label[] = "ChineseInputAgent contact package checksum v2";
     uint8_t digest[32];
-    const uint8_t *parts[2] = { label, pub };
-    DWORD lens[2] = { (DWORD)(sizeof(label) - 1), X25519_KEY_BYTES };
+    const uint8_t *parts[2] = { label, body };
+    DWORD lens[2] = { (DWORD)(sizeof(label) - 1), body_len };
     BOOL checksum_built = sha256_segments(parts, lens, 2, digest);
     if (checksum_built) memcpy(out, digest, CONTACT_CHECKSUM_BYTES);
     SecureZeroMemory(digest, sizeof(digest));
     return checksum_built;
 }
 
+static BOOL parse_contact_package(const uint8_t *pkg, DWORD pkg_len, CONTACT_PACKAGE_VIEW *view) {
+    if (!pkg || !view || pkg_len < 1) return FALSE;
+    ZeroMemory(view, sizeof(*view));
+    uint8_t format = pkg[0];
+    BOOL has_recipient = (format & CONTACT_PACKAGE_RECIPIENT_FLAG) != 0;
+    if ((format & CONTACT_PACKAGE_FORMAT_MASK) != CONTACT_PACKAGE_FORMAT_BASE) return FALSE;
+    DWORD expected_len = has_recipient ? CONTACT_PACKAGE_WITH_RECIPIENT_BYTES : CONTACT_PACKAGE_BASE_BYTES;
+    if (pkg_len != expected_len) return FALSE;
+
+    DWORD pos = 1;
+    view->static_public = pkg + pos;
+    pos += X25519_KEY_BYTES;
+    view->handshake_public = pkg + pos;
+    pos += X25519_KEY_BYTES;
+    if (has_recipient) {
+        view->recipient_public = pkg + pos;
+        pos += X25519_KEY_BYTES;
+    }
+    view->has_recipient = has_recipient;
+    view->body_len = pos;
+
+    if (!validate_public_key_blob(view->static_public, X25519_KEY_BYTES) ||
+        !validate_public_key_blob(view->handshake_public, X25519_KEY_BYTES) ||
+        (has_recipient && !validate_public_key_blob(view->recipient_public, X25519_KEY_BYTES))) {
+        return FALSE;
+    }
+
+    uint8_t expected[CONTACT_CHECKSUM_BYTES];
+    BOOL checksum_matches = contact_package_checksum(pkg, pos, expected) &&
+                            memcmp(expected, pkg + pos, CONTACT_CHECKSUM_BYTES) == 0;
+    SecureZeroMemory(expected, sizeof(expected));
+    return checksum_matches;
+}
+
 static BOOL contact_fingerprint_from_public(const uint8_t pub[X25519_KEY_BYTES], WCHAR *out, size_t cch) {
     static const uint8_t label[] = "ChineseInputAgent contact fingerprint";
-    static const WCHAR alphabet[] = L"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
     uint8_t digest[32];
     const uint8_t *parts[2] = { label, pub };
     DWORD lens[2] = { (DWORD)(sizeof(label) - 1), X25519_KEY_BYTES };
-    if (!out || cch < CONTACT_FINGERPRINT_DIGITS + 4) return FALSE;
+    if (!out || cch < CONTACT_FINGERPRINT_DIGITS + 1) return FALSE;
     if (!validate_public_key_blob(pub, X25519_KEY_BYTES) || !sha256_segments(parts, lens, 2, digest)) return FALSE;
-    size_t bit = 0, pos = 0;
-    for (size_t i = 0; i < CONTACT_FINGERPRINT_DIGITS; ++i) {
-        uint32_t v = 0;
-        for (int j = 0; j < 5; ++j) {
-            size_t byte_i = bit / 8;
-            size_t bit_i = 7 - (bit % 8);
-            v = (v << 1) | ((digest[byte_i] >> bit_i) & 1u);
-            ++bit;
-        }
-        if (i && (i % 4) == 0) out[pos++] = L'-';
-        out[pos++] = alphabet[v & 31u];
-    }
-    out[pos] = L'\0';
+    unsigned long long code = (unsigned long long)(read_u64_le(digest) % 100000000ULL);
+    BOOL fingerprint_built = SUCCEEDED(StringCchPrintfW(out, cch, L"%08llu", code));
     SecureZeroMemory(digest, sizeof(digest));
+    return fingerprint_built;
+}
+
+static void clear_skipped_message_keys(CRYPTO_BOX *box) {
+    if (!box) return;
+    SecureZeroMemory(box->skipped_keys, sizeof(box->skipped_keys));
+}
+
+static void clear_session_chains(CRYPTO_BOX *box) {
+    if (!box) return;
+    box->send_chain_ready = FALSE;
+    box->recv_chain_ready = FALSE;
+    box->send_session_id = 0;
+    box->recv_session_id = 0;
+    box->send_counter = 0;
+    box->recv_counter = 0;
+    SecureZeroMemory(box->send_chain_key, sizeof(box->send_chain_key));
+    SecureZeroMemory(box->recv_chain_key, sizeof(box->recv_chain_key));
+    clear_skipped_message_keys(box);
+}
+
+static void clear_handshake_state(CRYPTO_BOX *box) {
+    if (!box) return;
+    box->local_handshake_ready = FALSE;
+    box->remote_handshake_ready = FALSE;
+    SecureZeroMemory(box->local_handshake_private, sizeof(box->local_handshake_private));
+    SecureZeroMemory(box->local_handshake_public, sizeof(box->local_handshake_public));
+    SecureZeroMemory(box->remote_handshake_public, sizeof(box->remote_handshake_public));
+}
+
+static BOOL generate_handshake_key(CRYPTO_BOX *box) {
+    if (!box) return FALSE;
+    if (box->local_handshake_ready &&
+        validate_private_key_blob(box->local_handshake_private, sizeof(box->local_handshake_private)) &&
+        validate_public_key_blob(box->local_handshake_public, sizeof(box->local_handshake_public))) {
+        return TRUE;
+    }
+    SecureZeroMemory(box->local_handshake_private, sizeof(box->local_handshake_private));
+    SecureZeroMemory(box->local_handshake_public, sizeof(box->local_handshake_public));
+    if (BCryptGenRandom(NULL, box->local_handshake_private, sizeof(box->local_handshake_private),
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+        return FALSE;
+    }
+    x25519_clamp_private(box->local_handshake_private);
+    if (!x25519_public_from_private(box->local_handshake_private, box->local_handshake_public)) {
+        SecureZeroMemory(box->local_handshake_private, sizeof(box->local_handshake_private));
+        SecureZeroMemory(box->local_handshake_public, sizeof(box->local_handshake_public));
+        return FALSE;
+    }
+    box->local_handshake_ready = TRUE;
     return TRUE;
+}
+
+static BOOL derive_labeled_secret(const uint8_t key[32], const char *label, uint8_t out[32]) {
+    const uint8_t *parts[1] = { (const uint8_t *)label };
+    DWORD lens[1] = { (DWORD)strlen(label) };
+    return hmac_sha256_segments(key, 32, parts, lens, 1, out);
+}
+
+static BOOL derive_labeled_session_id(const uint8_t key[32], const char *label, uint64_t *out) {
+    uint8_t digest[32];
+    BOOL id_derived = derive_labeled_secret(key, label, digest);
+    if (id_derived) {
+        *out = read_u64_le(digest);
+        if (*out == 0) *out = 1;
+    }
+    SecureZeroMemory(digest, sizeof(digest));
+    return id_derived;
+}
+
+static BOOL derive_handshake_session(CRYPTO_BOX *box, WCHAR *err, size_t err_cch) {
+    static const uint8_t salt_key[] = "ChineseInputAgent CIM2 handshake salt v1";
+    uint8_t dh_ss[X25519_KEY_BYTES];
+    uint8_t dh_se[X25519_KEY_BYTES];
+    uint8_t dh_es[X25519_KEY_BYTES];
+    uint8_t dh_ee[X25519_KEY_BYTES];
+    uint8_t salt[32];
+    uint8_t root[32];
+    uint8_t chain_0_to_1[32];
+    uint8_t chain_1_to_0[32];
+    uint64_t session_0_to_1 = 0;
+    uint64_t session_1_to_0 = 0;
+    BOOL session_derived = FALSE;
+
+    ZeroMemory(dh_ss, sizeof(dh_ss));
+    ZeroMemory(dh_se, sizeof(dh_se));
+    ZeroMemory(dh_es, sizeof(dh_es));
+    ZeroMemory(dh_ee, sizeof(dh_ee));
+    ZeroMemory(salt, sizeof(salt));
+    ZeroMemory(root, sizeof(root));
+    ZeroMemory(chain_0_to_1, sizeof(chain_0_to_1));
+    ZeroMemory(chain_1_to_0, sizeof(chain_1_to_0));
+
+    if (!box ||
+        !validate_private_key_blob(box->private_key.data, box->private_key.len) ||
+        !validate_public_key_blob(box->public_key.data, box->public_key.len) ||
+        !validate_public_key_blob(box->remote_public_key.data, box->remote_public_key.len) ||
+        !box->local_handshake_ready ||
+        !box->remote_handshake_ready ||
+        !validate_private_key_blob(box->local_handshake_private, sizeof(box->local_handshake_private)) ||
+        !validate_public_key_blob(box->local_handshake_public, sizeof(box->local_handshake_public)) ||
+        !validate_public_key_blob(box->remote_handshake_public, sizeof(box->remote_handshake_public))) {
+        set_box_error(err, err_cch, L"Session handshake material is incomplete.");
+        goto cleanup;
+    }
+
+    int role_cmp = memcmp(box->public_key.data, box->remote_public_key.data, X25519_KEY_BYTES);
+    if (role_cmp == 0) {
+        set_box_error(err, err_cch, L"Session handshake cannot use identical static keys.");
+        goto cleanup;
+    }
+    BOOL local_is_role0 = role_cmp < 0;
+
+    if (!x25519_shared_secret(box->private_key.data, box->remote_public_key.data, dh_ss)) {
+        set_box_error(err, err_cch, L"Session static-static key agreement failed.");
+        goto cleanup;
+    }
+    if (local_is_role0) {
+        if (!x25519_shared_secret(box->private_key.data, box->remote_handshake_public, dh_se) ||
+            !x25519_shared_secret(box->local_handshake_private, box->remote_public_key.data, dh_es)) {
+            set_box_error(err, err_cch, L"Session static-ephemeral key agreement failed.");
+            goto cleanup;
+        }
+    } else {
+        if (!x25519_shared_secret(box->local_handshake_private, box->remote_public_key.data, dh_se) ||
+            !x25519_shared_secret(box->private_key.data, box->remote_handshake_public, dh_es)) {
+            set_box_error(err, err_cch, L"Session static-ephemeral key agreement failed.");
+            goto cleanup;
+        }
+    }
+    if (!x25519_shared_secret(box->local_handshake_private, box->remote_handshake_public, dh_ee)) {
+        set_box_error(err, err_cch, L"Session ephemeral key agreement failed.");
+        goto cleanup;
+    }
+
+    const uint8_t *role0_static = local_is_role0 ? box->public_key.data : box->remote_public_key.data;
+    const uint8_t *role1_static = local_is_role0 ? box->remote_public_key.data : box->public_key.data;
+    const uint8_t *role0_eph = local_is_role0 ? box->local_handshake_public : box->remote_handshake_public;
+    const uint8_t *role1_eph = local_is_role0 ? box->remote_handshake_public : box->local_handshake_public;
+    const uint8_t *salt_parts[4] = { role0_static, role1_static, role0_eph, role1_eph };
+    DWORD salt_lens[4] = { X25519_KEY_BYTES, X25519_KEY_BYTES, X25519_KEY_BYTES, X25519_KEY_BYTES };
+    const uint8_t *root_parts[4] = { dh_ss, dh_se, dh_es, dh_ee };
+    DWORD root_lens[4] = { X25519_KEY_BYTES, X25519_KEY_BYTES, X25519_KEY_BYTES, X25519_KEY_BYTES };
+    if (!hmac_sha256_segments(salt_key, (DWORD)(sizeof(salt_key) - 1), salt_parts, salt_lens, 4, salt) ||
+        !hmac_sha256_segments(salt, sizeof(salt), root_parts, root_lens, 4, root) ||
+        !derive_labeled_secret(root, "ChineseInputAgent CIM2 chain 0->1 v1", chain_0_to_1) ||
+        !derive_labeled_secret(root, "ChineseInputAgent CIM2 chain 1->0 v1", chain_1_to_0) ||
+        !derive_labeled_session_id(root, "ChineseInputAgent CIM2 session id 0->1 v1", &session_0_to_1) ||
+        !derive_labeled_session_id(root, "ChineseInputAgent CIM2 session id 1->0 v1", &session_1_to_0)) {
+        set_box_error(err, err_cch, L"Session key derivation failed.");
+        goto cleanup;
+    }
+
+    clear_session_chains(box);
+    if (local_is_role0) {
+        memcpy(box->send_chain_key, chain_0_to_1, sizeof(box->send_chain_key));
+        memcpy(box->recv_chain_key, chain_1_to_0, sizeof(box->recv_chain_key));
+        box->send_session_id = session_0_to_1;
+        box->recv_session_id = session_1_to_0;
+    } else {
+        memcpy(box->send_chain_key, chain_1_to_0, sizeof(box->send_chain_key));
+        memcpy(box->recv_chain_key, chain_0_to_1, sizeof(box->recv_chain_key));
+        box->send_session_id = session_1_to_0;
+        box->recv_session_id = session_0_to_1;
+    }
+    box->send_counter = 0;
+    box->recv_counter = 0;
+    box->send_chain_ready = TRUE;
+    box->recv_chain_ready = TRUE;
+    clear_handshake_state(box);
+    session_derived = TRUE;
+
+cleanup:
+    SecureZeroMemory(dh_ss, sizeof(dh_ss));
+    SecureZeroMemory(dh_se, sizeof(dh_se));
+    SecureZeroMemory(dh_es, sizeof(dh_es));
+    SecureZeroMemory(dh_ee, sizeof(dh_ee));
+    SecureZeroMemory(salt, sizeof(salt));
+    SecureZeroMemory(root, sizeof(root));
+    SecureZeroMemory(chain_0_to_1, sizeof(chain_0_to_1));
+    SecureZeroMemory(chain_1_to_0, sizeof(chain_1_to_0));
+    return session_derived;
+}
+
+static BOOL establish_session_if_ready(CRYPTO_BOX *box, WCHAR *err, size_t err_cch) {
+    if (!box || !box->local_handshake_ready || !box->remote_handshake_ready) return TRUE;
+    return derive_handshake_session(box, err, err_cch);
+}
+
+static BOOL derive_chain_step(const uint8_t chain_key[32], uint8_t message_key[32], uint8_t next_chain_key[32]) {
+    return derive_labeled_secret(chain_key, "ChineseInputAgent CIM2 message key v1", message_key) &&
+           derive_labeled_secret(chain_key, "ChineseInputAgent CIM2 next chain v1", next_chain_key);
+}
+
+static BOOL derive_session_nonce(const uint8_t message_key[32],
+                                 const uint8_t header[SESSION_HEADER_BYTES],
+                                 uint8_t nonce[MESSAGE_NONCE_BYTES]) {
+    static const uint8_t label[] = "ChineseInputAgent CIM2 nonce v1";
+    uint8_t digest[32];
+    const uint8_t *parts[2] = { label, header };
+    DWORD lens[2] = { (DWORD)(sizeof(label) - 1), SESSION_HEADER_BYTES };
+    BOOL nonce_derived = hmac_sha256_segments(message_key, 32, parts, lens, 2, digest);
+    if (nonce_derived) memcpy(nonce, digest, MESSAGE_NONCE_BYTES);
+    SecureZeroMemory(digest, sizeof(digest));
+    return nonce_derived;
+}
+
+static void write_session_header(uint8_t header[SESSION_HEADER_BYTES], uint64_t session_id, uint32_t counter) {
+    header[0] = SESSION_PACKET_FORMAT;
+    write_u64_le(header + 1, session_id);
+    write_u32_le(header + 1 + SESSION_ID_BYTES, counter);
+}
+
+static int find_skipped_key_index(CRYPTO_BOX *box, uint64_t session_id, uint32_t counter) {
+    if (!box) return -1;
+    for (int key_idx = 0; key_idx < (int)SESSION_MAX_SKIPPED_KEYS; ++key_idx) {
+        SKIPPED_MESSAGE_KEY *skipped = &box->skipped_keys[key_idx];
+        if (skipped->used && skipped->session_id == session_id && skipped->counter == counter) return key_idx;
+    }
+    return -1;
+}
+
+static int find_free_skipped_key_index(CRYPTO_BOX *box) {
+    if (!box) return -1;
+    for (int key_idx = 0; key_idx < (int)SESSION_MAX_SKIPPED_KEYS; ++key_idx) {
+        if (!box->skipped_keys[key_idx].used) return key_idx;
+    }
+    return -1;
+}
+
+static unsigned count_free_skipped_keys(CRYPTO_BOX *box) {
+    unsigned free_count = 0;
+    if (!box) return 0;
+    for (int key_idx = 0; key_idx < (int)SESSION_MAX_SKIPPED_KEYS; ++key_idx) {
+        if (!box->skipped_keys[key_idx].used) ++free_count;
+    }
+    return free_count;
 }
 
 static BOOL protect_state(CRYPTO_BOX *box, const uint8_t *plain, DWORD plain_len, uint8_t **out, DWORD *out_len) {
@@ -470,7 +794,7 @@ static BOOL unprotect_state(CRYPTO_BOX *box, const uint8_t *state_envelope, DWOR
         !state_envelope ||
         state_envelope_len < overhead ||
         memcmp(state_envelope, "CIST", 4) != 0 ||
-        state_envelope[4] != STATE_VERSION ||
+        (state_envelope[4] != STATE_VERSION && state_envelope[4] != STATE_VERSION_PRE_SESSION) ||
         state_envelope[5] != STATE_NONCE_BYTES ||
         state_envelope[6] != STATE_TAG_BYTES) return FALSE;
     DWORD plain_len = (DWORD)state_envelope[8] | ((DWORD)state_envelope[9] << 8) | ((DWORD)state_envelope[10] << 16) | ((DWORD)state_envelope[11] << 24);
@@ -500,7 +824,28 @@ static BOOL save_state(CRYPTO_BOX *box) {
         !builder_u32(&state_builder, STATE_VERSION) ||
         !builder_blob(&state_builder, box->public_key.data, box->public_key.len) ||
         !builder_blob(&state_builder, box->private_key.data, box->private_key.len) ||
-        !builder_blob(&state_builder, box->remote_public_key.data, box->remote_public_key.len)) goto cleanup;
+        !builder_blob(&state_builder, box->remote_public_key.data, box->remote_public_key.len) ||
+        !builder_u32(&state_builder, box->local_handshake_ready ? 1u : 0u) ||
+        !builder_append(&state_builder, box->local_handshake_private, sizeof(box->local_handshake_private)) ||
+        !builder_append(&state_builder, box->local_handshake_public, sizeof(box->local_handshake_public)) ||
+        !builder_u32(&state_builder, box->remote_handshake_ready ? 1u : 0u) ||
+        !builder_append(&state_builder, box->remote_handshake_public, sizeof(box->remote_handshake_public)) ||
+        !builder_u32(&state_builder, box->send_chain_ready ? 1u : 0u) ||
+        !builder_u64(&state_builder, box->send_session_id) ||
+        !builder_u32(&state_builder, box->send_counter) ||
+        !builder_append(&state_builder, box->send_chain_key, sizeof(box->send_chain_key)) ||
+        !builder_u32(&state_builder, box->recv_chain_ready ? 1u : 0u) ||
+        !builder_u64(&state_builder, box->recv_session_id) ||
+        !builder_u32(&state_builder, box->recv_counter) ||
+        !builder_append(&state_builder, box->recv_chain_key, sizeof(box->recv_chain_key)) ||
+        !builder_u32(&state_builder, SESSION_MAX_SKIPPED_KEYS)) goto cleanup;
+    for (int key_idx = 0; key_idx < (int)SESSION_MAX_SKIPPED_KEYS; ++key_idx) {
+        SKIPPED_MESSAGE_KEY *skipped = &box->skipped_keys[key_idx];
+        if (!builder_u32(&state_builder, skipped->used ? 1u : 0u) ||
+            !builder_u64(&state_builder, skipped->session_id) ||
+            !builder_u32(&state_builder, skipped->counter) ||
+            !builder_append(&state_builder, skipped->key, sizeof(skipped->key))) goto cleanup;
+    }
     if (!protect_state(box, state_builder.data, (DWORD)state_builder.len, &protected_blob, &protected_len)) goto cleanup;
     state_saved = write_file_all(box->state_path, protected_blob, protected_len);
 cleanup:
@@ -524,16 +869,75 @@ static BOOL load_state(CRYPTO_BOX *box) {
     if (!read_u32(&c, &magic) ||
         !read_u32(&c, &version) ||
         magic != STATE_MAGIC ||
-        version != STATE_VERSION ||
+        (version != STATE_VERSION && version != STATE_VERSION_PRE_SESSION) ||
         !read_blob_ref(&c, &pub, &pub_len) ||
         !read_blob_ref(&c, &priv, &priv_len) ||
         !read_blob_ref(&c, &remote, &remote_len) ||
         !validate_public_key_blob(pub, pub_len) ||
         !validate_private_key_blob(priv, priv_len)) goto cleanup;
-    if (c.pos != c.len || (remote_len && !validate_public_key_blob(remote, remote_len))) goto cleanup;
+    if (remote_len && !validate_public_key_blob(remote, remote_len)) goto cleanup;
     if (!buf_set(&box->public_key, pub, pub_len) ||
         !buf_set(&box->private_key, priv, priv_len) ||
         !buf_set(&box->remote_public_key, remote, remote_len)) goto cleanup;
+    clear_handshake_state(box);
+    clear_session_chains(box);
+    if (version == STATE_VERSION) {
+        uint32_t local_ready = 0, remote_ready = 0, send_ready = 0, recv_ready = 0, skipped_count = 0;
+        const uint8_t *local_priv = NULL, *local_pub = NULL, *remote_hs = NULL, *send_chain = NULL, *recv_chain = NULL;
+        if (!read_u32(&c, &local_ready) ||
+            !read_fixed_ref(&c, &local_priv, X25519_KEY_BYTES) ||
+            !read_fixed_ref(&c, &local_pub, X25519_KEY_BYTES) ||
+            !read_u32(&c, &remote_ready) ||
+            !read_fixed_ref(&c, &remote_hs, X25519_KEY_BYTES) ||
+            !read_u32(&c, &send_ready) ||
+            !read_u64(&c, &box->send_session_id) ||
+            !read_u32(&c, &box->send_counter) ||
+            !read_fixed_ref(&c, &send_chain, 32) ||
+            !read_u32(&c, &recv_ready) ||
+            !read_u64(&c, &box->recv_session_id) ||
+            !read_u32(&c, &box->recv_counter) ||
+            !read_fixed_ref(&c, &recv_chain, 32) ||
+            !read_u32(&c, &skipped_count) ||
+            skipped_count != SESSION_MAX_SKIPPED_KEYS) goto cleanup;
+        if (local_ready > 1 || remote_ready > 1 || send_ready > 1 || recv_ready > 1) goto cleanup;
+        if (local_ready) {
+            if (!validate_private_key_blob(local_priv, X25519_KEY_BYTES) ||
+                !validate_public_key_blob(local_pub, X25519_KEY_BYTES)) goto cleanup;
+            memcpy(box->local_handshake_private, local_priv, X25519_KEY_BYTES);
+            memcpy(box->local_handshake_public, local_pub, X25519_KEY_BYTES);
+            box->local_handshake_ready = TRUE;
+        }
+        if (remote_ready) {
+            if (!validate_public_key_blob(remote_hs, X25519_KEY_BYTES)) goto cleanup;
+            memcpy(box->remote_handshake_public, remote_hs, X25519_KEY_BYTES);
+            box->remote_handshake_ready = TRUE;
+        }
+        if (send_ready) {
+            if (bytes_all_zero(send_chain, 32) || box->send_session_id == 0) goto cleanup;
+            memcpy(box->send_chain_key, send_chain, 32);
+            box->send_chain_ready = TRUE;
+        }
+        if (recv_ready) {
+            if (bytes_all_zero(recv_chain, 32) || box->recv_session_id == 0) goto cleanup;
+            memcpy(box->recv_chain_key, recv_chain, 32);
+            box->recv_chain_ready = TRUE;
+        }
+        for (uint32_t key_idx = 0; key_idx < skipped_count; ++key_idx) {
+            uint32_t used = 0;
+            const uint8_t *key = NULL;
+            if (!read_u32(&c, &used) ||
+                !read_u64(&c, &box->skipped_keys[key_idx].session_id) ||
+                !read_u32(&c, &box->skipped_keys[key_idx].counter) ||
+                !read_fixed_ref(&c, &key, 32) ||
+                used > 1) goto cleanup;
+            if (used) {
+                if (bytes_all_zero(key, 32) || box->skipped_keys[key_idx].session_id == 0) goto cleanup;
+                box->skipped_keys[key_idx].used = TRUE;
+                memcpy(box->skipped_keys[key_idx].key, key, 32);
+            }
+        }
+    }
+    if (c.pos != c.len) goto cleanup;
     state_loaded = TRUE;
 cleanup:
     box_secure_free(file, file_len);
@@ -652,20 +1056,33 @@ BOOL crypto_box_get_public_fingerprint(CRYPTO_BOX *box, WCHAR *out, size_t cch, 
 
 BOOL crypto_box_contact_package_fingerprint(const BYTE *pkg, DWORD pkg_len, WCHAR *out, size_t cch,
                                             WCHAR *err, size_t err_cch) {
-    if (!pkg || pkg_len != CONTACT_COMPACT_PACKAGE_BYTES ||
-        !validate_public_key_blob(pkg, X25519_KEY_BYTES)) {
-        set_box_error(err, err_cch, L"Invalid compact contact package.");
+    CONTACT_PACKAGE_VIEW view;
+    if (!parse_contact_package(pkg, pkg_len, &view)) {
+        set_box_error(err, err_cch, L"Invalid session contact package.");
         return FALSE;
     }
-    uint8_t expected[CONTACT_CHECKSUM_BYTES];
-    BOOL package_verified = contact_checksum(pkg, expected) &&
-                            memcmp(expected, pkg + X25519_KEY_BYTES, CONTACT_CHECKSUM_BYTES) == 0 &&
-                            contact_fingerprint_from_public(pkg, out, cch);
-    SecureZeroMemory(expected, sizeof(expected));
-    if (!package_verified) {
-        set_box_error(err, err_cch, L"Invalid compact contact package checksum.");
+    if (!contact_fingerprint_from_public(view.static_public, out, cch)) {
+        set_box_error(err, err_cch, L"Contact fingerprint generation failed.");
         return FALSE;
     }
+    return TRUE;
+}
+
+BOOL crypto_box_contact_package_recipient_public(const BYTE *pkg, DWORD pkg_len, BYTE recipient[32],
+                                                 BOOL *has_recipient, WCHAR *err, size_t err_cch) {
+    if (has_recipient) *has_recipient = FALSE;
+    if (recipient) SecureZeroMemory(recipient, X25519_KEY_BYTES);
+    if (!has_recipient || !recipient) {
+        set_box_error(err, err_cch, L"Invalid contact package recipient output.");
+        return FALSE;
+    }
+    CONTACT_PACKAGE_VIEW view;
+    if (!parse_contact_package(pkg, pkg_len, &view)) {
+        set_box_error(err, err_cch, L"Invalid session contact package.");
+        return FALSE;
+    }
+    *has_recipient = view.has_recipient;
+    if (view.has_recipient) memcpy(recipient, view.recipient_public, X25519_KEY_BYTES);
     return TRUE;
 }
 
@@ -682,26 +1099,54 @@ BOOL crypto_box_export_contact_package(CRYPTO_BOX *box, BYTE **out, DWORD *out_l
     *out_len = 0;
     uint8_t checksum[CONTACT_CHECKSUM_BYTES];
     uint8_t *pkg = NULL;
+    DWORD pkg_alloc_len = 0;
     BOOL package_exported = FALSE;
     ZeroMemory(checksum, sizeof(checksum));
     if (!box || !validate_public_key_blob(box->public_key.data, box->public_key.len)) {
         set_box_error(err, err_cch, L"Local public key is not ready.");
         goto cleanup;
     }
-    if (!contact_checksum(box->public_key.data, checksum)) {
-        set_box_error(err, err_cch, L"Contact package checksum failed.");
+    if (!box->state_path[0]) {
+        set_box_error(err, err_cch, L"Session state path is not available.");
         goto cleanup;
     }
-    pkg = (uint8_t *)box_alloc(CONTACT_COMPACT_PACKAGE_BYTES);
+    if (!generate_handshake_key(box)) {
+        set_box_error(err, err_cch, L"Session handshake key generation failed.");
+        goto cleanup;
+    }
+
+    BOOL include_recipient = validate_public_key_blob(box->remote_public_key.data, box->remote_public_key.len);
+    DWORD body_len = include_recipient ?
+        (DWORD)(CONTACT_PACKAGE_WITH_RECIPIENT_BYTES - CONTACT_CHECKSUM_BYTES) :
+        (DWORD)(CONTACT_PACKAGE_BASE_BYTES - CONTACT_CHECKSUM_BYTES);
+    DWORD pkg_len = body_len + CONTACT_CHECKSUM_BYTES;
+    pkg_alloc_len = pkg_len;
+    pkg = (uint8_t *)box_alloc(pkg_alloc_len);
     if (!pkg) {
         set_box_error(err, err_cch, L"Out of memory.");
         goto cleanup;
     }
     uint8_t *p = pkg;
-    memcpy(p, box->public_key.data, X25519_KEY_BYTES); p += X25519_KEY_BYTES;
+    *p++ = (uint8_t)(CONTACT_PACKAGE_FORMAT_BASE | (include_recipient ? CONTACT_PACKAGE_RECIPIENT_FLAG : 0u));
+    memcpy(p, box->public_key.data, X25519_KEY_BYTES);
+    p += X25519_KEY_BYTES;
+    memcpy(p, box->local_handshake_public, X25519_KEY_BYTES);
+    p += X25519_KEY_BYTES;
+    if (include_recipient) {
+        memcpy(p, box->remote_public_key.data, X25519_KEY_BYTES);
+        p += X25519_KEY_BYTES;
+    }
+    if (!contact_package_checksum(pkg, body_len, checksum)) {
+        set_box_error(err, err_cch, L"Contact package checksum failed.");
+        goto cleanup;
+    }
     memcpy(p, checksum, CONTACT_CHECKSUM_BYTES);
+    if (!establish_session_if_ready(box, err, err_cch) || !save_state(box)) {
+        if (!err || !err[0]) set_box_error(err, err_cch, L"Session contact package save failed.");
+        goto cleanup;
+    }
     *out = pkg;
-    *out_len = CONTACT_COMPACT_PACKAGE_BYTES;
+    *out_len = pkg_len;
     pkg = NULL;
     package_exported = TRUE;
 cleanup:
@@ -710,32 +1155,46 @@ cleanup:
         *out = NULL;
         *out_len = 0;
     }
-    box_secure_free(pkg, CONTACT_COMPACT_PACKAGE_BYTES);
+    box_secure_free(pkg, pkg_alloc_len);
     SecureZeroMemory(checksum, sizeof(checksum));
     return package_exported;
 }
 
 BOOL crypto_box_import_contact_package(CRYPTO_BOX *box, const BYTE *pkg, DWORD pkg_len, WCHAR *err, size_t err_cch) {
-    if (!box || !pkg || pkg_len != CONTACT_COMPACT_PACKAGE_BYTES) {
-        set_box_error(err, err_cch, L"Invalid compact contact package length.");
+    if (!box || !pkg) {
+        set_box_error(err, err_cch, L"Invalid session contact package.");
         return FALSE;
     }
-    const uint8_t *pub = pkg;
-    const uint8_t *checksum = pub + X25519_KEY_BYTES;
-    uint8_t expected[CONTACT_CHECKSUM_BYTES];
-    BOOL verified = FALSE;
-    ZeroMemory(expected, sizeof(expected));
-    verified =
-        validate_public_key_blob(pub, X25519_KEY_BYTES) &&
-        contact_checksum(pub, expected) &&
-        memcmp(expected, checksum, CONTACT_CHECKSUM_BYTES) == 0;
-    SecureZeroMemory(expected, sizeof(expected));
-    if (!verified) {
-        set_box_error(err, err_cch, L"Invalid compact contact package checksum.");
+    if (!box->state_path[0]) {
+        set_box_error(err, err_cch, L"Session state path is not available.");
         return FALSE;
     }
-    if (!buf_set(&box->remote_public_key, pub, X25519_KEY_BYTES) || !save_state(box)) {
+    CONTACT_PACKAGE_VIEW view;
+    if (!parse_contact_package(pkg, pkg_len, &view)) {
+        set_box_error(err, err_cch, L"Invalid session contact package.");
+        return FALSE;
+    }
+    if (view.has_recipient &&
+        (!validate_public_key_blob(box->public_key.data, box->public_key.len) ||
+         memcmp(view.recipient_public, box->public_key.data, X25519_KEY_BYTES) != 0)) {
+        set_box_error(err, err_cch, L"This session contact package is addressed to a different local key.");
+        return FALSE;
+    }
+
+    BOOL remote_changed = box->remote_public_key.data &&
+                          memcmp(box->remote_public_key.data, view.static_public, X25519_KEY_BYTES) != 0;
+    if (remote_changed) {
+        clear_handshake_state(box);
+        clear_session_chains(box);
+    }
+    if (!buf_set(&box->remote_public_key, view.static_public, X25519_KEY_BYTES)) {
         set_box_error(err, err_cch, L"Contact package save failed.");
+        return FALSE;
+    }
+    memcpy(box->remote_handshake_public, view.handshake_public, X25519_KEY_BYTES);
+    box->remote_handshake_ready = TRUE;
+    if (!establish_session_if_ready(box, err, err_cch) || !save_state(box)) {
+        if (!err || !err[0]) set_box_error(err, err_cch, L"Contact package save failed.");
         return FALSE;
     }
     return TRUE;
@@ -749,77 +1208,80 @@ BOOL crypto_box_encrypt(CRYPTO_BOX *box, const BYTE *plain, DWORD plain_len, BYT
         set_box_error(err, err_cch, L"Invalid plaintext buffer.");
         return FALSE;
     }
-    const uint8_t *recipient_pub = box->remote_public_key.data ? box->remote_public_key.data : box->public_key.data;
-    size_t recipient_len = box->remote_public_key.data ? box->remote_public_key.len : box->public_key.len;
-    uint8_t eph_priv[X25519_KEY_BYTES];
-    uint8_t eph_pub[X25519_KEY_BYTES];
-    uint8_t shared[X25519_KEY_BYTES];
-    uint8_t key[32];
+    if (!box->state_path[0]) {
+        set_box_error(err, err_cch, L"Session state path is not available.");
+        return FALSE;
+    }
+    if (!box->send_chain_ready || box->send_session_id == 0) {
+        set_box_error(err, err_cch, L"Session is not ready. Exchange key packages first.");
+        return FALSE;
+    }
+    if (box->send_counter == 0xffffffffu) {
+        set_box_error(err, err_cch, L"Session send counter is exhausted. Exchange key packages again.");
+        return FALSE;
+    }
+    if (plain_len > 0xffffffffu - SESSION_HEADER_BYTES - MESSAGE_TAG_BYTES) {
+        set_box_error(err, err_cch, L"Plaintext is too large.");
+        return FALSE;
+    }
+
+    uint8_t header[SESSION_HEADER_BYTES];
+    uint8_t old_chain_key[32];
+    uint8_t message_key[32];
+    uint8_t next_chain_key[32];
     uint8_t nonce[MESSAGE_NONCE_BYTES];
     uint8_t *message = NULL;
-    DWORD message_len = 0;
+    DWORD message_len = SESSION_HEADER_BYTES + MESSAGE_TAG_BYTES + plain_len;
+    uint32_t old_counter = box->send_counter;
     BOOL message_encrypted = FALSE;
 
-    ZeroMemory(eph_priv, sizeof(eph_priv));
-    ZeroMemory(eph_pub, sizeof(eph_pub));
-    ZeroMemory(shared, sizeof(shared));
-    ZeroMemory(key, sizeof(key));
+    ZeroMemory(header, sizeof(header));
+    ZeroMemory(old_chain_key, sizeof(old_chain_key));
+    ZeroMemory(message_key, sizeof(message_key));
+    ZeroMemory(next_chain_key, sizeof(next_chain_key));
     ZeroMemory(nonce, sizeof(nonce));
 
-    if (!validate_public_key_blob(recipient_pub, recipient_len)) {
-        set_box_error(err, err_cch, L"Recipient public key is not ready.");
+    write_session_header(header, box->send_session_id, box->send_counter);
+    memcpy(old_chain_key, box->send_chain_key, sizeof(old_chain_key));
+    if (!derive_chain_step(box->send_chain_key, message_key, next_chain_key) ||
+        !derive_session_nonce(message_key, header, nonce)) {
+        set_box_error(err, err_cch, L"Session message key derivation failed.");
         goto cleanup;
     }
-    if (BCryptGenRandom(NULL, eph_priv, sizeof(eph_priv), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
-        set_box_error(err, err_cch, L"Random generation failed.");
-        goto cleanup;
-    }
-    x25519_clamp_private(eph_priv);
-    if (!x25519_public_from_private(eph_priv, eph_pub) ||
-        !x25519_shared_secret(eph_priv, recipient_pub, shared)) {
-        set_box_error(err, err_cch, L"X25519 key agreement failed.");
-        goto cleanup;
-    }
-    if (!derive_message_key(shared, sizeof(shared),
-                            eph_pub, sizeof(eph_pub),
-                            recipient_pub, (DWORD)recipient_len, key)) {
-        set_box_error(err, err_cch, L"Message key derivation failed.");
-        goto cleanup;
-    }
-    if (BCryptGenRandom(NULL, nonce, sizeof(nonce), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
-        set_box_error(err, err_cch, L"Random generation failed.");
-        goto cleanup;
-    }
-    DWORD aad_len = X25519_KEY_BYTES + MESSAGE_NONCE_BYTES;
-    if (plain_len > 0xffffffffu - aad_len - MESSAGE_TAG_BYTES) {
-        set_box_error(err, err_cch, L"Plaintext is too large.");
-        goto cleanup;
-    }
-    message_len = aad_len + MESSAGE_TAG_BYTES + plain_len;
+
     message = (uint8_t *)box_alloc(message_len ? message_len : 1);
     if (!message) {
         set_box_error(err, err_cch, L"Out of memory.");
         goto cleanup;
     }
-    memcpy(message, eph_pub, X25519_KEY_BYTES);
-    memcpy(message + X25519_KEY_BYTES, nonce, MESSAGE_NONCE_BYTES);
-    if (!aes_gcm_encrypt_raw(key, message, aad_len, nonce, MESSAGE_NONCE_BYTES,
+    memcpy(message, header, SESSION_HEADER_BYTES);
+    if (!aes_gcm_encrypt_raw(message_key, message, SESSION_HEADER_BYTES, nonce, MESSAGE_NONCE_BYTES,
                              plain, plain_len,
-                             message + aad_len, MESSAGE_TAG_BYTES,
-                             message + aad_len + MESSAGE_TAG_BYTES)) {
+                             message + SESSION_HEADER_BYTES, MESSAGE_TAG_BYTES,
+                             message + SESSION_HEADER_BYTES + MESSAGE_TAG_BYTES)) {
         set_box_error(err, err_cch, L"AES-GCM encryption failed.");
         goto cleanup;
     }
+
+    memcpy(box->send_chain_key, next_chain_key, sizeof(box->send_chain_key));
+    box->send_counter++;
+    if (!save_state(box)) {
+        memcpy(box->send_chain_key, old_chain_key, sizeof(box->send_chain_key));
+        box->send_counter = old_counter;
+        set_box_error(err, err_cch, L"Session state save failed.");
+        goto cleanup;
+    }
+
     *out = message;
     *out_len = message_len;
     message = NULL;
     message_encrypted = TRUE;
 cleanup:
     box_secure_free(message, message_len);
-    SecureZeroMemory(eph_priv, sizeof(eph_priv));
-    SecureZeroMemory(eph_pub, sizeof(eph_pub));
-    SecureZeroMemory(shared, sizeof(shared));
-    SecureZeroMemory(key, sizeof(key));
+    SecureZeroMemory(header, sizeof(header));
+    SecureZeroMemory(old_chain_key, sizeof(old_chain_key));
+    SecureZeroMemory(message_key, sizeof(message_key));
+    SecureZeroMemory(next_chain_key, sizeof(next_chain_key));
     SecureZeroMemory(nonce, sizeof(nonce));
     return message_encrypted;
 }
@@ -832,36 +1294,91 @@ BOOL crypto_box_decrypt(CRYPTO_BOX *box, const BYTE *message, DWORD message_len,
         set_box_error(err, err_cch, L"Invalid encrypted message buffer.");
         return FALSE;
     }
-    uint8_t shared[X25519_KEY_BYTES];
-    uint8_t key[32];
+    if (!box->state_path[0]) {
+        set_box_error(err, err_cch, L"Session state path is not available.");
+        return FALSE;
+    }
+    if (message_len < SESSION_HEADER_BYTES + MESSAGE_TAG_BYTES || message[0] != SESSION_PACKET_FORMAT) {
+        set_box_error(err, err_cch, L"Invalid session message format.");
+        return FALSE;
+    }
+
+    uint64_t session_id = read_u64_le(message + 1);
+    uint32_t counter = read_u32_le(message + 1 + SESSION_ID_BYTES);
+    DWORD cipher_len = message_len - SESSION_HEADER_BYTES - MESSAGE_TAG_BYTES;
     uint8_t *plain = NULL;
-    DWORD cipher_len = 0;
+    uint8_t message_key[32];
+    uint8_t next_chain_key[32];
+    uint8_t working_chain_key[32];
+    uint8_t old_recv_chain_key[32];
+    uint8_t nonce[MESSAGE_NONCE_BYTES];
+    SKIPPED_MESSAGE_KEY old_skipped_keys[SESSION_MAX_SKIPPED_KEYS];
+    SKIPPED_MESSAGE_KEY temp_skipped_keys[SESSION_MAX_SKIPPED_KEYS];
+    SKIPPED_MESSAGE_KEY old_skipped_slot;
+    uint32_t old_recv_counter = box->recv_counter;
+    int skipped_slot = -1;
     BOOL message_decrypted = FALSE;
 
-    ZeroMemory(shared, sizeof(shared));
-    ZeroMemory(key, sizeof(key));
+    ZeroMemory(message_key, sizeof(message_key));
+    ZeroMemory(next_chain_key, sizeof(next_chain_key));
+    ZeroMemory(working_chain_key, sizeof(working_chain_key));
+    ZeroMemory(old_recv_chain_key, sizeof(old_recv_chain_key));
+    ZeroMemory(nonce, sizeof(nonce));
+    ZeroMemory(old_skipped_keys, sizeof(old_skipped_keys));
+    ZeroMemory(temp_skipped_keys, sizeof(temp_skipped_keys));
+    ZeroMemory(&old_skipped_slot, sizeof(old_skipped_slot));
 
-    DWORD aad_len = X25519_KEY_BYTES + MESSAGE_NONCE_BYTES;
-    if (message_len < aad_len + MESSAGE_TAG_BYTES) {
-        set_box_error(err, err_cch, L"Invalid encrypted message length.");
+    if (session_id == 0) {
+        set_box_error(err, err_cch, L"Invalid session id.");
         goto cleanup;
     }
-    cipher_len = message_len - aad_len - MESSAGE_TAG_BYTES;
-    if (!validate_private_key_blob(box->private_key.data, box->private_key.len) ||
-        !validate_public_key_blob(box->public_key.data, box->public_key.len)) {
-        set_box_error(err, err_cch, L"Local private key is not ready.");
-        goto cleanup;
+
+    skipped_slot = find_skipped_key_index(box, session_id, counter);
+    if (skipped_slot >= 0) {
+        old_skipped_slot = box->skipped_keys[skipped_slot];
+        memcpy(message_key, box->skipped_keys[skipped_slot].key, sizeof(message_key));
+    } else {
+        if (!box->recv_chain_ready || session_id != box->recv_session_id) {
+            set_box_error(err, err_cch, L"Session message does not match the active receive session.");
+            goto cleanup;
+        }
+        if (counter < box->recv_counter) {
+            set_box_error(err, err_cch, L"Session message counter is too old.");
+            goto cleanup;
+        }
+        if (counter == 0xffffffffu) {
+            set_box_error(err, err_cch, L"Session receive counter is exhausted. Exchange key packages again.");
+            goto cleanup;
+        }
+        uint32_t gap = counter - box->recv_counter;
+        if (gap > SESSION_MAX_SKIPPED_KEYS || gap > count_free_skipped_keys(box)) {
+            set_box_error(err, err_cch, L"Session message is outside the out-of-order window.");
+            goto cleanup;
+        }
+        memcpy(working_chain_key, box->recv_chain_key, sizeof(working_chain_key));
+        for (uint32_t skipped_idx = 0; skipped_idx < gap; ++skipped_idx) {
+            uint8_t skipped_next_chain[32];
+            ZeroMemory(skipped_next_chain, sizeof(skipped_next_chain));
+            temp_skipped_keys[skipped_idx].used = TRUE;
+            temp_skipped_keys[skipped_idx].session_id = session_id;
+            temp_skipped_keys[skipped_idx].counter = box->recv_counter + skipped_idx;
+            if (!derive_chain_step(working_chain_key, temp_skipped_keys[skipped_idx].key, skipped_next_chain)) {
+                SecureZeroMemory(skipped_next_chain, sizeof(skipped_next_chain));
+                set_box_error(err, err_cch, L"Session skipped-key derivation failed.");
+                goto cleanup;
+            }
+            SecureZeroMemory(working_chain_key, sizeof(working_chain_key));
+            memcpy(working_chain_key, skipped_next_chain, sizeof(working_chain_key));
+            SecureZeroMemory(skipped_next_chain, sizeof(skipped_next_chain));
+        }
+        if (!derive_chain_step(working_chain_key, message_key, next_chain_key)) {
+            set_box_error(err, err_cch, L"Session message key derivation failed.");
+            goto cleanup;
+        }
     }
-    const uint8_t *eph_pub = message;
-    if (!validate_public_key_blob(eph_pub, X25519_KEY_BYTES) ||
-        !x25519_shared_secret(box->private_key.data, eph_pub, shared)) {
-        set_box_error(err, err_cch, L"X25519 key agreement failed.");
-        goto cleanup;
-    }
-    if (!derive_message_key(shared, sizeof(shared),
-                            eph_pub, X25519_KEY_BYTES,
-                            box->public_key.data, (DWORD)box->public_key.len, key)) {
-        set_box_error(err, err_cch, L"Message key derivation failed.");
+
+    if (!derive_session_nonce(message_key, message, nonce)) {
+        set_box_error(err, err_cch, L"Session nonce derivation failed.");
         goto cleanup;
     }
     plain = (uint8_t *)box_alloc(cipher_len ? cipher_len : 1);
@@ -869,21 +1386,59 @@ BOOL crypto_box_decrypt(CRYPTO_BOX *box, const BYTE *message, DWORD message_len,
         set_box_error(err, err_cch, L"Out of memory.");
         goto cleanup;
     }
-    if (!aes_gcm_decrypt_raw(key, message, aad_len,
-                             message + X25519_KEY_BYTES, MESSAGE_NONCE_BYTES,
-                             message + aad_len, MESSAGE_TAG_BYTES,
-                             message + aad_len + MESSAGE_TAG_BYTES, cipher_len,
+    if (!aes_gcm_decrypt_raw(message_key, message, SESSION_HEADER_BYTES,
+                             nonce, MESSAGE_NONCE_BYTES,
+                             message + SESSION_HEADER_BYTES, MESSAGE_TAG_BYTES,
+                             message + SESSION_HEADER_BYTES + MESSAGE_TAG_BYTES, cipher_len,
                              plain)) {
         set_box_error(err, err_cch, L"AES-GCM authentication failed.");
         goto cleanup;
     }
+
+    if (skipped_slot >= 0) {
+        ZeroMemory(&box->skipped_keys[skipped_slot], sizeof(box->skipped_keys[skipped_slot]));
+        if (!save_state(box)) {
+            box->skipped_keys[skipped_slot] = old_skipped_slot;
+            set_box_error(err, err_cch, L"Session state save failed.");
+            goto cleanup;
+        }
+    } else {
+        memcpy(old_recv_chain_key, box->recv_chain_key, sizeof(old_recv_chain_key));
+        memcpy(old_skipped_keys, box->skipped_keys, sizeof(old_skipped_keys));
+        for (int skipped_idx = 0; skipped_idx < (int)SESSION_MAX_SKIPPED_KEYS; ++skipped_idx) {
+            if (!temp_skipped_keys[skipped_idx].used) continue;
+            int free_idx = find_free_skipped_key_index(box);
+            if (free_idx < 0) {
+                memcpy(box->skipped_keys, old_skipped_keys, sizeof(box->skipped_keys));
+                set_box_error(err, err_cch, L"Session skipped-key cache is full.");
+                goto cleanup;
+            }
+            box->skipped_keys[free_idx] = temp_skipped_keys[skipped_idx];
+        }
+        memcpy(box->recv_chain_key, next_chain_key, sizeof(box->recv_chain_key));
+        box->recv_counter = counter + 1;
+        if (!save_state(box)) {
+            memcpy(box->recv_chain_key, old_recv_chain_key, sizeof(box->recv_chain_key));
+            box->recv_counter = old_recv_counter;
+            memcpy(box->skipped_keys, old_skipped_keys, sizeof(box->skipped_keys));
+            set_box_error(err, err_cch, L"Session state save failed.");
+            goto cleanup;
+        }
+    }
+
     *out = plain;
     *out_len = cipher_len;
     plain = NULL;
     message_decrypted = TRUE;
 cleanup:
     box_secure_free(plain, cipher_len);
-    SecureZeroMemory(shared, sizeof(shared));
-    SecureZeroMemory(key, sizeof(key));
+    SecureZeroMemory(message_key, sizeof(message_key));
+    SecureZeroMemory(next_chain_key, sizeof(next_chain_key));
+    SecureZeroMemory(working_chain_key, sizeof(working_chain_key));
+    SecureZeroMemory(old_recv_chain_key, sizeof(old_recv_chain_key));
+    SecureZeroMemory(nonce, sizeof(nonce));
+    SecureZeroMemory(old_skipped_keys, sizeof(old_skipped_keys));
+    SecureZeroMemory(temp_skipped_keys, sizeof(temp_skipped_keys));
+    SecureZeroMemory(&old_skipped_slot, sizeof(old_skipped_slot));
     return message_decrypted;
 }

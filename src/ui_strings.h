@@ -9,7 +9,7 @@
 
 #define UI_TEXT_ENCRYPT L"\u52a0\u5bc6"
 #define UI_TEXT_DECRYPT L"\u89e3\u5bc6"
-#define UI_TEXT_ARCHIVE L"\u5f52\u6863"
+#define UI_TEXT_ARCHIVE L"\u804a\u5929\u8bb0\u5f55"
 #define UI_TEXT_BACK L"\u8fd4\u56de"
 #define UI_TEXT_STOP L"\u505c\u6b62"
 #define UI_TEXT_IMPORT L"\u5bfc\u5165"
@@ -33,6 +33,8 @@
 #define UI_TEXT_IMPORT_REFRESH_FAILED L"\u5bc6\u94a5\u5bfc\u5165\u540e\u5237\u65b0\u52a0\u5bc6\u72b6\u6001\u5931\u8d25\u3002"
 #define UI_TEXT_CONTACT_FINGERPRINT_TITLE L"\u8054\u7cfb\u4eba\u6307\u7eb9\u786e\u8ba4"
 #define UI_TEXT_SWITCH_KEY_FAILED L"\u5207\u6362\u5bc6\u94a5\u5931\u8d25\u3002"
+#define UI_TEXT_CHAT_HISTORY_SAVE_FAILED L"\u804a\u5929\u8bb0\u5f55\u4fdd\u5b58\u5931\u8d25\u3002"
+#define UI_TEXT_SENDER_SELF L"\u6211"
 
 #define UI_TEXT_WINDOW_INIT_FAILED L"Window initialization failed."
 #define UI_TEXT_NO_ACTIVE_PROFILE L"No active profile is selected."

@@ -10,6 +10,8 @@ typedef struct UI_WORK_MESSAGE_HOST {
     /* Import-key completion changes app session state; keep those side effects explicit at the boundary. */
     BOOL (*reload_crypto_after_key_import)(void *user, WCHAR *err, size_t err_cch);
     void (*refresh_key_list_after_key_import)(void *user);
+    BOOL (*save_decrypted_plaintext)(void *user, int profile_index, const WCHAR *plain,
+                                     WCHAR *err, size_t err_cch);
     void *user;
 } UI_WORK_MESSAGE_HOST;
 

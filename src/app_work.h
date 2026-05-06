@@ -25,12 +25,14 @@ typedef struct APP_WORK_CTX {
     WCHAR *input;
     WCHAR *topic;
     WCHAR *name;
+    WCHAR *expected_fingerprint;
 } APP_WORK_CTX;
 
 typedef struct APP_WORK_MESSAGE {
     APP_WORK_KIND kind;
     HWND target_textbox;
     WCHAR *text;
+    int profile_index;
 } APP_WORK_MESSAGE;
 
 typedef struct APP_WORK_HOST {

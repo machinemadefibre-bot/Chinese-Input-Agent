@@ -46,8 +46,9 @@ static void do_import_key(HWND hwnd, HWND source_textbox) {
         return;
     }
     WCHAR *body = NULL;
+    WCHAR fingerprint[32] = L"";
     WCHAR err[256] = L"";
-    if (!app_flow_extract_key_package_body(text, &body, err, ARRAYSIZE(err))) {
+    if (!app_flow_extract_key_package_body(text, &body, fingerprint, ARRAYSIZE(fingerprint), err, ARRAYSIZE(err))) {
         xfree(text);
         show_key_transfer_error(hwnd, err[0] ? err : UI_TEXT_KEY_IMPORT_FAILED);
         return;
@@ -78,7 +79,8 @@ static void do_import_key(HWND hwnd, HWND source_textbox) {
     }
     ctx->input = body;
     ctx->name = win_dup_wide(name);
-    if (!ctx->name) {
+    ctx->expected_fingerprint = win_dup_wide(fingerprint);
+    if (!ctx->name || !ctx->expected_fingerprint) {
         app_work_free_ctx(ctx);
         xfree(text);
         show_key_transfer_error(hwnd, UI_TEXT_KEY_IMPORT_FAILED);

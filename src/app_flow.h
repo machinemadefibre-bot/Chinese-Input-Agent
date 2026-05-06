@@ -8,13 +8,17 @@
 
 typedef BOOL (*APP_FLOW_CANCEL_FN)(void);
 
-BOOL app_flow_extract_key_package_body(const WCHAR *text, WCHAR **out, WCHAR *err, size_t err_cch);
+BOOL app_flow_extract_key_package_body(const WCHAR *text, WCHAR **out,
+                                       WCHAR *fingerprint, size_t fingerprint_cch,
+                                       WCHAR *err, size_t err_cch);
 BOOL app_flow_encrypt_message(CRYPTO_BOX *box, const WCHAR *plain, const WCHAR *topic,
                               HWND progress_target, WCHAR **out, WCHAR *err, size_t err_cch);
 BOOL app_flow_export_key(CRYPTO_BOX *box, HWND progress_target, WCHAR **out, WCHAR *err, size_t err_cch);
-BOOL app_flow_import_key(const WCHAR *carrier, const WCHAR *name, int *active_index_out,
+BOOL app_flow_import_key(const WCHAR *carrier, const WCHAR *expected_fingerprint, const WCHAR *name,
+                         int *active_index_out,
                          WCHAR **out_message, WCHAR *err, size_t err_cch);
 BOOL app_flow_decrypt_clip_auto_profile(const WCHAR *clip, APP_FLOW_CANCEL_FN cancel_fn,
-                                        WCHAR **plain_w_out, WCHAR *err, size_t err_cch);
+                                        WCHAR **plain_w_out, int *profile_index_out,
+                                        WCHAR *err, size_t err_cch);
 
 #endif

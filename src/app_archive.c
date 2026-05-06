@@ -13,14 +13,17 @@ static WCHAR *archive_dup_wide(const WCHAR *s) {
     if (copy) CopyMemory(copy, s ? s : L"", (len + 1) * sizeof(WCHAR));
     return copy;
 }
-static BOOL build_archive_record(const KEY_PROFILE *profile, const WCHAR *plain, WCHAR **out) {
+static BOOL build_archive_record(const KEY_PROFILE *profile, const WCHAR *sender,
+                                 const WCHAR *plain, WCHAR **out) {
     *out = NULL;
     SYSTEMTIME st;
     GetLocalTime(&st);
+    const WCHAR *display_sender = sender && sender[0] ? sender :
+        (profile && profile->name[0] ? profile->name : L"\u672a\u547d\u540d");
     WSTRB record_builder = {0};
-    if (!wstrb_appendf(&record_builder, L"[%04u-%02u-%02u %02u:%02u:%02u] %s\r\n",
+    if (!wstrb_appendf(&record_builder, L"[%04u-%02u-%02u %02u:%02u:%02u] \u53d1\u9001\u4eba\uff1a%s\r\n",
                        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
-                       profile && profile->name[0] ? profile->name : L"\u672a\u547d\u540d") ||
+                       display_sender) ||
         !wstrb_append(&record_builder, plain ? plain : L"")) {
         wstrb_secure_free(&record_builder);
         return FALSE;
@@ -139,14 +142,15 @@ cleanup:
     return sort_output_built;
 }
 
-BOOL archive_append_text(const KEY_PROFILE *profile, const WCHAR *plain, WCHAR *err, size_t err_cch) {
+BOOL archive_append_text(const KEY_PROFILE *profile, const WCHAR *sender, const WCHAR *plain,
+                         WCHAR *err, size_t err_cch) {
     WCHAR path[MAX_PATH];
     if (!profiles_get_archive_path(profile, path, ARRAYSIZE(path))) {
         set_error(err, err_cch, L"Archive path is not available.");
         return FALSE;
     }
     WCHAR *record = NULL;
-    if (!build_archive_record(profile, plain, &record)) {
+    if (!build_archive_record(profile, sender, plain, &record)) {
         set_error(err, err_cch, L"Failed to build archive record.");
         return FALSE;
     }

@@ -33,6 +33,14 @@ LRESULT ui_work_handle_message(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam
                 host_set_overlay(host, message->target_textbox, message->text ? message->text : L"", TRUE);
             } else if (msg == WM_APP_WORK_DONE) {
                 host_set_overlay(host, message->target_textbox, NULL, FALSE);
+                if (message->kind == APP_WORK_KIND_DECRYPT && message->text && message->text[0] &&
+                    host && host->save_decrypted_plaintext) {
+                    WCHAR err[256] = L"";
+                    if (!host->save_decrypted_plaintext(host->user, message->profile_index,
+                                                        message->text, err, ARRAYSIZE(err))) {
+                        host_show_error(host, hwnd, err[0] ? err : UI_TEXT_CHAT_HISTORY_SAVE_FAILED);
+                    }
+                }
                 SetWindowTextW(message->target_textbox, message->text ? message->text : L"");
                 if (message->kind == APP_WORK_KIND_IMPORT_KEY) {
                     WCHAR err[256] = L"";

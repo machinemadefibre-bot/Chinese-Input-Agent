@@ -90,6 +90,22 @@ function Test-CryptoBoxUsesOpaqueContext {
     Assert-True (-not $impl.Contains("static WCHAR g_state_path")) "crypto_box.c should not keep a global state path"
 }
 
+function Test-CryptoBoxUsesSessionTransport {
+    $header = Read-RepoFile "src\crypto_box.h"
+    $impl = Read-RepoFile "src\crypto_box.c"
+
+    Assert-True $impl.Contains("#define STATE_VERSION 5u") "crypto session state should use the session-capable state version"
+    Assert-True $impl.Contains("#define MESSAGE_TAG_BYTES 12") "message AES-GCM tag should be 12 bytes"
+    Assert-True $impl.Contains("#define CONTACT_FINGERPRINT_DIGITS 8") "contact fingerprint should be 8 decimal digits"
+    Assert-True $impl.Contains('L"%08llu"') "contact fingerprint should be rendered as zero-padded decimal text"
+    Assert-True $impl.Contains("#define SESSION_HEADER_BYTES (1 + SESSION_ID_BYTES + SESSION_COUNTER_BYTES)") "session messages should use the compact header"
+    Assert-True $impl.Contains("SESSION_MAX_SKIPPED_KEYS") "session transport should keep a bounded skipped-key cache"
+    Assert-True $impl.Contains("derive_handshake_session") "contact package exchange should derive session chains"
+    Assert-True $impl.Contains("derive_chain_step") "session messages should ratchet the symmetric chain"
+    Assert-True (-not $impl.Contains("derive_message_key(")) "legacy per-message ECIES key derivation should not remain"
+    Assert-True $header.Contains("crypto_box_contact_package_recipient_public") "app_flow should be able to route addressed session key packages"
+}
+
 function Test-ProfilesDoNotManageCryptoLifecycle {
     $profiles = Read-RepoFile "src\app_profiles.c"
     $activate = Get-RepoSlice $profiles "BOOL profiles_activate" "int profiles_count"
@@ -161,6 +177,7 @@ $tests = @(
     "Test-DocsDoNotOverstateForwardSecrecy",
     "Test-WorkerResponseIdIsChecked",
     "Test-CryptoBoxUsesOpaqueContext",
+    "Test-CryptoBoxUsesSessionTransport",
     "Test-ProfilesDoNotManageCryptoLifecycle",
     "Test-KeyPersistenceUsesAtomicWrites",
     "Test-AppFlowOwnsCryptoBusinessFlow",

@@ -23,6 +23,8 @@ BOOL crypto_box_get_remote_public_key(CRYPTO_BOX *box, BYTE **out, DWORD *out_le
 BOOL crypto_box_get_public_fingerprint(CRYPTO_BOX *box, WCHAR *out, size_t cch, WCHAR *err, size_t err_cch);
 BOOL crypto_box_contact_package_fingerprint(const BYTE *pkg, DWORD pkg_len, WCHAR *out, size_t cch,
                                             WCHAR *err, size_t err_cch);
+BOOL crypto_box_contact_package_recipient_public(const BYTE *pkg, DWORD pkg_len, BYTE recipient[32],
+                                                 BOOL *has_recipient, WCHAR *err, size_t err_cch);
 BOOL crypto_box_prepare_key_export(CRYPTO_BOX *box, WCHAR *err, size_t err_cch);
 BOOL crypto_box_export_contact_package(CRYPTO_BOX *box, BYTE **out, DWORD *out_len, WCHAR *err, size_t err_cch);
 BOOL crypto_box_import_contact_package(CRYPTO_BOX *box, const BYTE *pkg, DWORD pkg_len,
