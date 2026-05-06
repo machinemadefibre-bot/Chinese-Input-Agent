@@ -14,82 +14,110 @@
   简体中文 | <a href="README.en.md">English</a>
 </p>
 
-<h3 align="center">一个把密文写成文章的小工具。</h3>
+<h3 align="center">一个把加密消息写成中文文章的本地 Windows 小工具。</h3>
 
-ChineseInputAgent 是我做来测试一个想法的：两台电脑能不能不靠搭建服务器，只通过普通聊天软件，交换一段看起来像中文长文的加密消息。
+ChineseInputAgent 是一个实验项目：两台 Windows 电脑不搭服务器，也不接在线 API，只通过已有聊天软件复制文本，能不能交换加密消息。
 
-它不是又一个重复造轮子的聊天软件。它更像一个“翻译层”：把明文加密成二进制，再让本地模型把这些二进制藏进一篇自然中文里；对方复制这段文字，程序再从同一个 tokenizer 里把数据恢复出来并解密。
+它不是聊天软件。它更像一层本地“翻译层”：先把明文加密成二进制消息，再用本地 llama.cpp worker 把二进制 payload 藏进一段中文载体文章。对方复制整段文章回来，程序用同一个 tokenizer 恢复 payload，再解密成明文。
 
-目前它还是实验项目。界面能用，链路能跑，但密码学和载体编码都还没有经过正式测试。
+当前版本已经能完成密钥交换、加密、解密、聊天记录保存和安装器打包，但仍然是实验项目。加密协议和载体编码没有经过正式安全审计。
 
-## 为什么做这个
+## 当前功能
 
-我一直很喜欢互联网隐私，也和一些同样喜欢折腾隐私的朋友试过很多加密通信软件。问题是，真正聊天的时候，我们经常会在那些软件上叫不到人：有人没开代理连不上，有人不把它放在后台，有人没开通知。最后我们还是会退回到微信，因为微信几乎一直挂在后台，大家也都一定会看。
+- 手动导入/导出联系人密钥包，建立联系人关系。
+- 密钥包导入时自动校验明文编号和包内公钥指纹，不再要求用户手动比对。
+- 消息层使用 session transport：密钥交换后普通消息不再每条携带 32-byte X25519 ephemeral public key。
+- 每条消息使用对称链 ratchet 派生独立 message key，支持一定窗口内的乱序和丢包。
+- AES-GCM nonce 保持 12 bytes，消息 tag 当前为 12 bytes。
+- 消息 payload 通过 top-k token 编码写入中文载体文章，末尾允许 free tail token。
+- 本地 llama.cpp worker 优先 CUDA，失败后尝试 Vulkan，再失败回落 CPU。
+- “聊天记录”视图按联系人保存明文记录；点击加密会保存发送明文，点击解密成功会保存收到的明文。
+- profile、state、聊天记录等关键持久化写入使用原子替换。
+- Windows Hello / NCrypt / DPAPI 用于保护本机 profile master key。
+- 安装器不内置大模型，安装时从网上下载模型并校验 SHA-256。
 
-有时候甚至会变成这样：我先在微信里提醒对方“我在某个加密软件里发你消息了”，然后对方再切过去看。这个过程本身就有点别扭。于是我开始想，与其再做一个新的聊天软件，为什么不直接利用大家本来就在用的聊天软件，只把消息内容本身变成一段可以复制、可以发送、可以恢复的加密文本？
+## 它不是
 
-ChineseInputAgent 就是从这个想法开始的。它不想替代微信、QQ、Telegram 或任何现有平台，而是试着在这些平台之上加一层本地加密和文本载体，让两台电脑通过普通聊天窗口也能交换只有彼此能读懂的内容。
-
-## 为什么不是直接发密文
-
-直接把一段随机密文发出去当然最简单，但它也最突兀：一长串看不出意义的字符很容易把注意力集中到“这里有一段需要解开的东西”上。对我来说，这个项目有意思的地方不只是加密，而是让加密后的内容尽量保留普通文本的外观和使用方式。
-
-现在 AI 生成内容已经很常见了，无论是在聊天窗口、论坛、博客。一段普通中文文章都比一段莫名其妙的编码更符合日常语境。ChineseInputAgent 尝试利用这一点，把密文变成一段看起来像正常文章的载体，让两个人或一组人可以通过已有的渠道交换内容，而不必额外约定“去另一个软件里看消息”。
-
-注意：不要用它绕过任何审查、风控或平台规则。
-
-## 它现在能做什么
-
-- 在两台电脑之间交换一次联系人公钥包，之后按联系人加密消息。
-- 使用每条消息临时 X25519 发送密钥和对称认证加密来保护正文；当前版本尚未实现 Double Ratchet 或完整前向安全。
-- 用本地 Qwen3-4b-2507 模型生成中文载体。
-- 用 top-k token 编码承载密文；解码时通过同一模型 tokenizer 还原。
-- 优先使用 CUDA，失败后尝试 Vulkan，再失败就落到 CPU。
-- 加密存储明文聊天记录。
-- 用 Windows Hello 保护本机主密钥。
-
-## 它不是什么
-
-- 不是端到端审计过的安全通信协议。
-- 不是为了压缩到最短密文而牺牲可读性的隐写工具。
-- 不是云服务；没有 OpenAI、Gemini 或其他在线 API 依赖。
-- 也不是要替代你正在用的聊天软件。它只是生成一段你可以复制出去的文本。
-- 不是绕过法律、平台规则或安全审查的保证工具。
+- 不是正式审计过的端到端安全通信协议。
+- 不是完整 Signal Protocol、Double Ratchet，也不是完整 Noise Protocol。
+- 不是云服务；消息生成和解析都在本机完成。
+- 不是为了绕过法律、平台规则、风控或审查的保证工具。
+- 不是另一个聊天客户端；它只生成可复制到现有聊天软件里的文本。
 
 ## 使用方式
 
-下载或构建后运行：
+下载 release 或自行构建后运行：
 
 ```text
 ChineseInputAgent.exe
 ```
 
-第一次启动会创建本机 profile，并要求 Windows Hello 解锁本地密钥。
-如果是两台电脑通信，先在“导入/导出密钥”窗口互相交换联系人包；之后在主界面顶部选择联系人，输入明文，点击加密，复制生成的中文文章发给对方。
+首次启动会创建本机 profile，并通过 Windows Hello 解锁本地密钥。
 
-解密时直接复制对方发来的整段文字，点击解密。程序会按本地联系人尝试匹配和解密。
+两台电脑通信的基本流程：
+
+1. A 打开“导入/导出密钥”，导出密钥文本发给 B。
+2. B 导入 A 的密钥文本，并给这个联系人命名。
+3. B 再导出回复密钥文本发给 A。
+4. A 导入 B 的回复密钥文本，并给这个联系人命名。
+5. 之后双方在主窗口顶部选择联系人，输入主题和明文，点击“加密”，把生成的中文文章发给对方。
+6. 收到消息后复制整段中文文章，点击“解密”。
+
+“聊天记录”按钮会显示当前联系人下保存的明文记录。记录首行包含时间和发送人：
+
+```text
+[2026-05-06 18:30:00] 发送人：我
+明文内容
+```
+
+解密成功时，发送人会使用实际解密成功的联系人名称。
 
 ## 大致流程
 
 ```text
 明文
   -> UTF-16LE bytes
-  -> AEAD 密文
-  -> top-k token 载体文章
+  -> session message encrypt
+  -> top-k token payload
+  -> 中文载体文章
   -> 复制到聊天软件
   -> 对方复制回来
-  -> tokenizer 解码
-  -> AEAD 解密
+  -> tokenizer / top-k decode
+  -> session message decrypt
   -> 明文
 ```
+
+## 消息格式说明
+
+当前普通消息是短 session message：
+
+```text
+1 byte  format
+8 bytes session_id
+4 bytes counter
+12 bytes AES-GCM tag
+N bytes ciphertext
+```
+
+固定开销为 25 bytes，不包含外层中文载体文本开销。
+
+密钥交换通过 contact package 完成。首次包较短；回复包会包含 recipient public key，用于自动路由到已有本地 profile。普通消息不再携带 X25519 public key。
+
+## 安全边界
+
+中文文章只是载体，不是安全层。真正保护消息的是本地加密层。
+
+当前 session transport 使用静态身份密钥和一次性握手密钥建立双向链，并对每条消息做链式派生。它能避免普通消息重复使用同一个 message key，并支持有限乱序，但没有实现 Double Ratchet，也不要把它宣传成完整 Signal/Noise 或已经正式审计的强前向安全协议。
+
+如果 state 文件回滚、丢失或损坏，session counter / chain state 可能无法继续通信，需要重新交换密钥包。第三方聊天平台如果改写、摘要、翻译、清洗或截断载体文章，payload 解码可能失败。
 
 ## 构建
 
 ### 环境
 
 - Windows 10/11
-- MSYS2 UCRT64 MinGW-w64
 - CMake + Ninja
+- MSYS2 UCRT64 MinGW-w64，或 Visual Studio Build Tools
 - Python 3
 - 可选：CUDA Toolkit 或 Vulkan SDK，用于 llama.cpp GPU 后端
 
@@ -100,41 +128,73 @@ git clone --recursive https://github.com/machinemadefibre-bot/Chinese-Input-Agen
 cd Chinese-Input-Agent
 ```
 
-如果你已经普通 clone 了仓库：
+如果已经普通 clone：
 
 ```bash
 git submodule update --init --recursive
 ```
 
-### 模型
+### 构建主程序
 
-仓库里不带模型文件。`package-installer-mingw.bat` 生成的安装器会在安装时从 Hugging Face 下载 Qwen3-4B-Instruct-2507 Q4_K_M GGUF，并校验 SHA-256 后放到：
+MinGW：
 
-```text
-models/base_model.gguf
+```bat
+build-mingw.bat
 ```
 
-如果只使用 portable zip，或者要离线运行，请手动把 llama.cpp 兼容的 Qwen GGUF 放到上面的路径。详见 [models/README.md](models/README.md)。
+MSVC：
+
+```bat
+build.bat
+```
 
 ### 打包
 
 ```bat
-build-mingw.bat
 build-llama-worker.bat
 package-installer-mingw.bat
 ```
 
-输出会在：
+输出：
 
 ```text
 dist\ChineseInputAgentInstaller.exe
 dist\ChineseInputAgent\
 ```
 
+安装器会在安装时下载模型。portable zip/offline 场景需要手动把 llama.cpp 兼容的 Qwen GGUF 放到：
+
+```text
+models\base_model.gguf
+```
+
+## 测试
+
+静态 invariant：
+
+```bat
+test.bat
+```
+
+A/B 独立安装通信测试：
+
+```bat
+test-ab-installs.bat
+```
+
+`test-ab-installs.bat` 默认使用：
+
+```text
+S:\Program Files\ChineseInputAgent-A
+S:\Program Files\ChineseInputAgent-B
+```
+
+它会在两个安装目录各自的 `data\ab_exchange_test` 下创建独立测试 state，覆盖密钥交换、一来一回通信、单方向多条消息、乱序、丢包和重启后继续通信。
+
 ## 目录结构
 
 ```text
-src/                         Win32 UI, 本地 profile, 加密, 安装器 stub
+src/                         Win32 UI、本地 profile、加密、安装器 stub
 tools/payload_watermark/     llama.cpp worker 和 top-k payload codec
 tools/packaging/             portable 包和安装器拼接脚本
 third_party/curve25519-donna X25519 实现
@@ -142,21 +202,13 @@ third_party/llama.cpp        llama.cpp submodule
 models/                      本地 GGUF 模型放置目录
 ```
 
-## 安全边界
+## 当前限制
 
-这个项目里，中文文章只是载体，不应该被当成安全层。真正保护消息的是加密层。
-
-当前消息格式使用发送端临时密钥和接收方长期身份密钥。它能避免复用同一条消息密钥，但如果接收方长期私钥后来泄露，历史消息仍可能被解密；因此不要把它当成已经具备完整前向安全的协议。
-
-当前版本的设计目标是“能在普通聊天软件里复制、发送、恢复”，而不是抵抗所有分析、重写或主动攻击。第三方平台如果自动改写、摘要、翻译或清洗文本，解码可能会失败。
-
-
-## 现在还粗糙的地方
-
-- 长消息会比较慢，尤其是 CPU 推理。
-- 载体文章有时会有小模型味，需要继续调 prompt 和生成策略。
-- 安装器首次运行需要联网下载模型，网络慢时会等待较久。
-- 还缺少完整的端到端自动化测试。
+- 长消息仍然慢，尤其是 CPU 推理。
+- 中文载体文章仍可能有小模型味。
+- 载体文本不能被平台改写，否则可能解码失败。
+- 加密协议没有正式审计。
+- 安装器首次运行需要联网下载模型。
 
 ## License
 
