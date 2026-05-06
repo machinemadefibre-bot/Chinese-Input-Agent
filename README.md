@@ -130,7 +130,7 @@ N bytes ciphertext
 
 中文文章只是载体，不是安全层。真正保护消息的是本地加密层。
 
-当前 session transport 使用静态身份密钥和一次性握手密钥建立双向链，并对每条消息做链式派生。它能避免普通消息重复使用同一个 message key，并支持有限乱序，但没有实现 Double Ratchet，也不要把它宣传成完整 Signal/Noise 或已经正式审计的强前向安全协议。
+当前 session transport 使用静态身份密钥和一次性握手密钥建立双向链，并对每条消息做链式派生。它能避免普通消息重复使用同一个 message key，并支持有限乱序，但没有实现 Double Ratchet，也不是完整的 Signal/Noise 实现或已经正式审计的强前向安全协议。
 
 如果 state 文件回滚、丢失或损坏，session counter / chain state 可能无法继续通信，需要重新交换密钥包。第三方聊天平台如果改写、摘要、翻译、清洗或截断载体文章，payload 解码可能失败。
 
