@@ -77,6 +77,7 @@ target_link_libraries(ChineseInputAgentInstallerStub PRIVATE
 if(MSVC)
   target_compile_options(ChineseInputAgent PRIVATE /utf-8 /W3)
   target_compile_options(ChineseInputAgentInstallerStub PRIVATE /utf-8 /W3)
+  # app.rc and installer.rc explicitly embed app.manifest; disable MSVC's generated manifest to avoid duplicates.
   target_link_options(ChineseInputAgent PRIVATE /MANIFEST:NO)
   target_link_options(ChineseInputAgentInstallerStub PRIVATE /MANIFEST:NO)
 endif()

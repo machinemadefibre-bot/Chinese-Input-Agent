@@ -12,7 +12,6 @@
 #include "ui_key_transfer.h"
 #include "ui_ids.h"
 #include "ui_layout.h"
-#include "ui_name_prompt.h"
 #include "ui_work_messages.h"
 #include "ui_strings.h"
 #include "win_util.h"
@@ -91,12 +90,12 @@ static BOOL activate_profile(int index, HWND owner, WCHAR *err, size_t err_cch) 
 static WCHAR *get_required_topic_text(HWND owner, HWND topic_edit) {
     WCHAR *topic = win_get_window_text_alloc(topic_edit);
     if (!topic) {
-        show_error(owner, L"");
+        show_error(owner, UI_TEXT_TOPIC_REQUIRED);
         return NULL;
     }
     if (topic[0] == L'\0') {
         xfree(topic);
-        show_error(owner, L"");
+        show_error(owner, UI_TEXT_TOPIC_REQUIRED);
         return NULL;
     }
     return topic;
@@ -112,7 +111,7 @@ static void show_archive_for_active_profile(void) {
     WCHAR err[256] = L"";
     WCHAR *archive = NULL;
     if (!archive_load_text(profile, &archive, err, ARRAYSIZE(err))) {
-        show_error(g_main_window, err[0] ? err : L"");
+        show_error(g_main_window, err[0] ? err : UI_TEXT_ARCHIVE_FAILED);
         return;
     }
     set_textbox_overlay(g_textbox, NULL, FALSE);

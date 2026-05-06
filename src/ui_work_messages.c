@@ -48,6 +48,8 @@ LRESULT ui_work_handle_message(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam
             }
         }
         app_work_free_message(message);
+    } else if (msg == WM_APP_WORK_ERROR || msg == WM_APP_WORK_DONE) {
+        host_show_error(host, hwnd, UI_TEXT_BACKGROUND_WORK_FAILED);
     }
     if (msg == WM_APP_WORK_DONE || msg == WM_APP_WORK_ERROR || msg == WM_APP_WORK_CANCELLED) {
         app_work_complete_message_handled();
