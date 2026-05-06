@@ -29,6 +29,9 @@
 #define IDC_STATUS 1007
 #define WM_APP_INSTALL_STATUS (WM_APP + 1)
 #define WM_APP_INSTALL_DONE (WM_APP + 2)
+#define MODEL_DOWNLOAD_URL L"https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf?download=true"
+#define MODEL_DOWNLOAD_SHA256 L"3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597"
+#define MODEL_INSTALL_NAME L"base_model.gguf"
 
 static const unsigned char PAYLOAD_MAGIC[16] = {
     'C','I','A','I','N','S','T','P','K','G','0','0','0','1','\r','\n'
@@ -280,6 +283,67 @@ static BOOL write_expand_script(const WCHAR *script_path, const WCHAR *zip_path,
     return write_succeeded;
 }
 
+static BOOL write_model_download_script(const WCHAR *script_path, const WCHAR *target, WCHAR *err, size_t err_cch) {
+    WCHAR *target_q = ps_single_quote(target);
+    if (!target_q) {
+        StringCchCopyW(err, err_cch, L"内存不足。");
+        return FALSE;
+    }
+    WCHAR content[8192];
+    HRESULT hr = StringCchPrintfW(
+        content,
+        ARRAYSIZE(content),
+        L"$ErrorActionPreference = 'Stop'\r\n"
+        L"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12\r\n"
+        L"$target = %s\r\n"
+        L"$modelsDir = Join-Path $target 'models'\r\n"
+        L"$modelPath = Join-Path $modelsDir '%s'\r\n"
+        L"$tmpPath = $modelPath + '.download'\r\n"
+        L"$url = '%s'\r\n"
+        L"$expected = '%s'\r\n"
+        L"New-Item -ItemType Directory -Force -Path $modelsDir | Out-Null\r\n"
+        L"if (Test-Path -LiteralPath $modelPath) {\r\n"
+        L"  $existing = (Get-FileHash -Algorithm SHA256 -LiteralPath $modelPath).Hash.ToLowerInvariant()\r\n"
+        L"  if ($existing -eq $expected) { exit 0 }\r\n"
+        L"  Remove-Item -LiteralPath $modelPath -Force\r\n"
+        L"}\r\n"
+        L"if (Test-Path -LiteralPath $tmpPath) { Remove-Item -LiteralPath $tmpPath -Force }\r\n"
+        L"if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {\r\n"
+        L"  Start-BitsTransfer -Source $url -Destination $tmpPath\r\n"
+        L"} else {\r\n"
+        L"  Invoke-WebRequest -Uri $url -OutFile $tmpPath -UseBasicParsing\r\n"
+        L"}\r\n"
+        L"$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $tmpPath).Hash.ToLowerInvariant()\r\n"
+        L"if ($actual -ne $expected) {\r\n"
+        L"  Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue\r\n"
+        L"  throw \"Model SHA256 mismatch. Expected $expected but got $actual\"\r\n"
+        L"}\r\n"
+        L"Move-Item -LiteralPath $tmpPath -Destination $modelPath -Force\r\n",
+        target_q,
+        MODEL_INSTALL_NAME,
+        MODEL_DOWNLOAD_URL,
+        MODEL_DOWNLOAD_SHA256
+    );
+    xfree(target_q);
+    if (FAILED(hr)) {
+        StringCchCopyW(err, err_cch, L"模型下载脚本太长。");
+        return FALSE;
+    }
+    HANDLE h = CreateFileW(script_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        StringCchCopyW(err, err_cch, L"无法创建模型下载脚本。");
+        return FALSE;
+    }
+    WORD bom = 0xFEFF;
+    DWORD written = 0;
+    DWORD content_bytes = (DWORD)(wcslen(content) * sizeof(WCHAR));
+    BOOL write_succeeded = WriteFile(h, &bom, sizeof(bom), &written, NULL) && written == sizeof(bom) &&
+                           WriteFile(h, content, content_bytes, &written, NULL) && written == content_bytes;
+    CloseHandle(h);
+    if (!write_succeeded) StringCchCopyW(err, err_cch, L"写入模型下载脚本失败。");
+    return write_succeeded;
+}
+
 static BOOL run_powershell_script(const WCHAR *script_path, WCHAR *err, size_t err_cch) {
     WCHAR cmd[MAX_PATH * 2];
     if (FAILED(StringCchPrintfW(
@@ -287,7 +351,7 @@ static BOOL run_powershell_script(const WCHAR *script_path, WCHAR *err, size_t e
             ARRAYSIZE(cmd),
             L"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%s\"",
             script_path))) {
-        StringCchCopyW(err, err_cch, L"解压命令太长。");
+        StringCchCopyW(err, err_cch, L"PowerShell 命令太长。");
         return FALSE;
     }
     STARTUPINFOW si;
@@ -301,7 +365,7 @@ static BOOL run_powershell_script(const WCHAR *script_path, WCHAR *err, size_t e
     StringCchCopyW(mutable_cmd, ARRAYSIZE(mutable_cmd), cmd);
     BOOL started = CreateProcessW(NULL, mutable_cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
     if (!started) {
-        StringCchPrintfW(err, err_cch, L"无法启动系统解压组件 powershell.exe，错误码：%lu", (unsigned long)GetLastError());
+        StringCchPrintfW(err, err_cch, L"无法启动 powershell.exe，错误码：%lu", (unsigned long)GetLastError());
         return FALSE;
     }
     WaitForSingleObject(pi.hProcess, INFINITE);
@@ -310,7 +374,7 @@ static BOOL run_powershell_script(const WCHAR *script_path, WCHAR *err, size_t e
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     if (exit_code != 0) {
-        StringCchPrintfW(err, err_cch, L"解压失败，PowerShell 返回码：%lu", (unsigned long)exit_code);
+        StringCchPrintfW(err, err_cch, L"PowerShell 脚本失败，返回码：%lu", (unsigned long)exit_code);
         return FALSE;
     }
     return TRUE;
@@ -322,6 +386,8 @@ static DWORD WINAPI install_thread_proc(LPVOID param) {
     WCHAR zip_path[MAX_PATH] = L"";
     WCHAR ps1_path[MAX_PATH] = L"";
     WCHAR exe_path[MAX_PATH] = L"";
+    WCHAR models_path[MAX_PATH] = L"";
+    WCHAR model_path[MAX_PATH] = L"";
 
     post_status(3, L"正在创建安装目录...");
     if (!ensure_directory(ctx->target, err, ARRAYSIZE(err))) goto fail;
@@ -338,9 +404,19 @@ static DWORD WINAPI install_thread_proc(LPVOID param) {
     if (!write_expand_script(ps1_path, zip_path, ctx->target, err, ARRAYSIZE(err))) goto fail;
     if (!run_powershell_script(ps1_path, err, ARRAYSIZE(err))) goto fail;
 
+    post_status(70, L"正在下载 Qwen 模型，首次安装需要较长时间...");
+    if (!write_model_download_script(ps1_path, ctx->target, err, ARRAYSIZE(err))) goto fail;
+    if (!run_powershell_script(ps1_path, err, ARRAYSIZE(err))) goto fail;
+
     if (!join_path(exe_path, ARRAYSIZE(exe_path), ctx->target, L"ChineseInputAgent.exe") ||
         GetFileAttributesW(exe_path) == INVALID_FILE_ATTRIBUTES) {
         StringCchCopyW(err, ARRAYSIZE(err), L"安装完成校验失败：没有找到 ChineseInputAgent.exe。");
+        goto fail;
+    }
+    if (!join_path(models_path, ARRAYSIZE(models_path), ctx->target, L"models") ||
+        !join_path(model_path, ARRAYSIZE(model_path), models_path, MODEL_INSTALL_NAME) ||
+        GetFileAttributesW(model_path) == INVALID_FILE_ATTRIBUTES) {
+        StringCchCopyW(err, ARRAYSIZE(err), L"安装完成校验失败：没有找到 base_model.gguf。");
         goto fail;
     }
 

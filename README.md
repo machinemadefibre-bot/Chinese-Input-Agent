@@ -106,15 +106,15 @@ cd Chinese-Input-Agent
 git submodule update --init --recursive
 ```
 
-### 放入模型
+### 模型
 
-仓库里不带模型文件。请把 llama.cpp 兼容的 Qwen3-4B-Instruct-2507 Q4_K_M GGUF 放到：
+仓库里不带模型文件。`package-installer-mingw.bat` 生成的安装器会在安装时从 Hugging Face 下载 Qwen3-4B-Instruct-2507 Q4_K_M GGUF，并校验 SHA-256 后放到：
 
 ```text
-models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf
+models/base_model.gguf
 ```
 
-详见 [models/README.md](models/README.md)。
+如果只使用 portable zip，或者要离线运行，请手动把 llama.cpp 兼容的 Qwen GGUF 放到上面的路径。详见 [models/README.md](models/README.md)。
 
 ### 打包
 
@@ -155,7 +155,7 @@ models/                      本地 GGUF 模型放置目录
 
 - 长消息会比较慢，尤其是 CPU 推理。
 - 载体文章有时会有小模型味，需要继续调 prompt 和生成策略。
-- 安装包很大，因为模型文件本身很大。
+- 安装器首次运行需要联网下载模型，网络慢时会等待较久。
 - 还缺少完整的端到端自动化测试。
 
 ## License

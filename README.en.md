@@ -105,15 +105,15 @@ If you cloned without submodules:
 git submodule update --init --recursive
 ```
 
-### Add the Model
+### Model
 
-The repository does not include the model file. Put a llama.cpp-compatible Qwen3-4B-Instruct-2507 Q4_K_M GGUF file here:
+The repository does not include the model file. The installer produced by `package-installer-mingw.bat` downloads the Qwen3-4B-Instruct-2507 Q4_K_M GGUF model from Hugging Face during install, verifies its SHA-256, and writes it here:
 
 ```text
-models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf
+models/base_model.gguf
 ```
 
-See [models/README.md](models/README.md) for details.
+For portable zip-only or offline installs, place a llama.cpp-compatible Qwen GGUF at that path manually. See [models/README.md](models/README.md) for details.
 
 ### Package
 
@@ -156,7 +156,7 @@ Contact packages should contain public information only. If exported content eve
 - Long messages can be slow, especially on CPU.
 - Carrier articles can still have a small-model feel.
 - The current carrier is focused on Chinese text; English carrier text is planned for a future version.
-- The installer is large because the local model is large.
+- First install needs internet access to download the model, which can take a while on slow connections.
 - End-to-end automated tests are still incomplete.
 
 ## License
