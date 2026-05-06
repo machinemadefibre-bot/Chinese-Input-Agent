@@ -114,6 +114,7 @@ function Test-KeyPersistenceUsesAtomicWrites {
 
 function Test-AppFlowOwnsCryptoBusinessFlow {
     $main = Read-RepoFile "src\main.c"
+    $work = Read-RepoFile "src\app_work.c"
     $flow = Read-RepoFile "src\app_flow.c"
     $header = Read-RepoFile "src\app_flow.h"
 
@@ -131,9 +132,10 @@ function Test-AppFlowOwnsCryptoBusinessFlow {
     )) {
         Assert-True (-not $main.Contains($call)) "main.c should not directly call business flow API: $call"
     }
-    Assert-True $main.Contains("app_flow_encrypt_message(") "main.c should dispatch encryption through app_flow"
-    Assert-True $main.Contains("app_flow_decrypt_clip_auto_profile(") "main.c should dispatch decryption through app_flow"
+    Assert-True $main.Contains("app_work_start(") "main.c should dispatch background work through app_work"
     Assert-True $main.Contains("CRYPTO_BOX *g_active_box") "main.c should hold the active crypto context"
+    Assert-True $work.Contains("app_flow_encrypt_message(") "app_work.c should dispatch encryption through app_flow"
+    Assert-True $work.Contains("app_flow_decrypt_clip_auto_profile(") "app_work.c should dispatch decryption through app_flow"
     Assert-True $flow.Contains("crypto_box_encrypt(") "app_flow.c should own encryption orchestration"
     Assert-True $flow.Contains("local_topk_decode_payload(") "app_flow.c should own top-k decode orchestration"
     Assert-True $header.Contains("app_flow_import_key(") "app_flow.h should expose import flow"

@@ -17,6 +17,9 @@ set(APP_SOURCES
   src/app_archive.c
   src/app_llm.c
   src/app_flow.c
+  src/app_work.c
+  src/ui_overlay.c
+  src/win_util.c
   src/crypto_box.c
   third_party/curve25519-donna/curve25519-donna.c
   src/app.rc

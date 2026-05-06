@@ -26,6 +26,9 @@
 #include "app_storage.h"
 #include "app_profiles.h"
 #include "app_archive.h"
+#include "app_work.h"
+#include "ui_overlay.h"
+#include "win_util.h"
 
 #define APP_TITLE L"ChineseInputAgent"
 #define APP_DIR_NAME L"ChineseInputAgent"
@@ -44,36 +47,13 @@
 #define IDC_KEY_IMPORT 3003
 #define IDC_KEY_EXPORT 3004
 #define IDC_KEY_OVERLAY 3005
-#define WM_APP_WORK_UPDATE (WM_APP + 10)
-#define WM_APP_WORK_DONE (WM_APP + 11)
-#define WM_APP_WORK_ERROR (WM_APP + 12)
-#define WM_APP_WORK_CANCELLED (WM_APP + 13)
 
 #define MASTER_KEY_BYTES APP_PROFILE_MASTER_KEY_BYTES
 #define MAX_PROFILES APP_PROFILE_MAX_PROFILES
-#define WORK_KIND_ENCRYPT 1
-#define WORK_KIND_EXPORT_KEY 2
-#define WORK_KIND_DECRYPT 3
-#define WORK_KIND_IMPORT_KEY 4
 
 #ifndef EM_SETCUEBANNER
 #define EM_SETCUEBANNER 0x1501
 #endif
-
-typedef struct WORK_CTX {
-    int kind;
-    HWND owner;
-    HWND target_textbox;
-    WCHAR *input;
-    WCHAR *topic;
-    WCHAR *name;
-} WORK_CTX;
-
-typedef struct WORK_MESSAGE {
-    int kind;
-    HWND target_textbox;
-    WCHAR *text;
-} WORK_MESSAGE;
 
 static HINSTANCE g_instance;
 static HWND g_main_window;
@@ -84,14 +64,10 @@ static HWND g_topic_edit;
 static HWND g_key_window;
 static HWND g_key_overlay;
 static HFONT g_ui_font;
-static volatile LONG g_work_active;
-static volatile LONG g_cancel_work;
 static BOOL g_archive_mode;
 static CRYPTO_BOX *g_active_box;
 
 static void set_control_font(HWND hwnd);
-static WCHAR *get_window_text_alloc(HWND hwnd);
-static WCHAR *dup_wide(const WCHAR *s);
 static void show_error(HWND owner, const WCHAR *message);
 static void do_key_transfer(HWND owner);
 static void do_archive(HWND hwnd);
@@ -99,13 +75,11 @@ static void show_archive_for_active_profile(void);
 static void leave_archive_mode(void);
 static void refresh_main_mode_controls(void);
 static void set_textbox_overlay(HWND textbox, const WCHAR *text, BOOL show);
-static BOOL start_background_work(WORK_CTX *ctx);
 static WCHAR *get_required_topic_text(HWND owner, HWND topic_edit);
-static DWORD WINAPI work_thread_proc(LPVOID param);
-static void post_llm_stream_progress(HWND target_textbox, const WCHAR *partial, size_t tokens_done, size_t tokens_total, double tps);
-static BOOL work_cancelled(void);
-static void free_work_ctx(WORK_CTX *ctx);
-static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
+static CRYPTO_BOX *get_active_box_for_work(void *user);
+static void set_work_busy(void *user, BOOL busy);
+static void show_work_error(void *user, HWND owner, const WCHAR *message);
+static void configure_app_work(HWND main_window);
 
 static void refresh_key_combo(void) {
     if (!g_key_select) return;
@@ -150,16 +124,8 @@ static BOOL activate_profile(int index, HWND owner, WCHAR *err, size_t err_cch) 
     return TRUE;
 }
 
-static WCHAR *dup_wide(const WCHAR *s) {
-    size_t len = wcslen(s ? s : L"");
-    if (len > SIZE_MAX / sizeof(WCHAR) - 1) return NULL;
-    WCHAR *copy = (WCHAR *)xalloc((len + 1) * sizeof(WCHAR));
-    if (copy) CopyMemory(copy, s ? s : L"", (len + 1) * sizeof(WCHAR));
-    return copy;
-}
-
 static WCHAR *get_required_topic_text(HWND owner, HWND topic_edit) {
-    WCHAR *topic = get_window_text_alloc(topic_edit);
+    WCHAR *topic = win_get_window_text_alloc(topic_edit);
     if (!topic) {
         show_error(owner, L"");
         return NULL;
@@ -194,7 +160,7 @@ static void show_archive_for_active_profile(void) {
 
 static void refresh_main_mode_controls(void) {
     if (!g_main_window || !IsWindow(g_main_window)) return;
-    BOOL busy = g_work_active != 0;
+    BOOL busy = app_work_is_active();
     HWND encrypt = GetDlgItem(g_main_window, IDC_ENCRYPT);
     HWND decrypt = GetDlgItem(g_main_window, IDC_DECRYPT);
     HWND archive = GetDlgItem(g_main_window, IDC_CLEAR);
@@ -235,7 +201,7 @@ static void do_archive(HWND hwnd) {
         show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
         return;
     }
-    WCHAR *plain = get_window_text_alloc(g_textbox);
+    WCHAR *plain = win_get_window_text_alloc(g_textbox);
     if (!plain) {
         show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
         return;
@@ -277,96 +243,20 @@ static HWND overlay_for_textbox(HWND textbox) {
 
 static void set_textbox_overlay(HWND textbox, const WCHAR *text, BOOL show) {
     HWND overlay = overlay_for_textbox(textbox);
-    if (!overlay || !IsWindow(overlay)) return;
-    BOOL want_visible = show && text && text[0];
-    SetWindowTextW(overlay, text ? text : L"");
-    if (want_visible) {
-        if (!IsWindowVisible(overlay)) ShowWindow(overlay, SW_SHOWNOACTIVATE);
-        SetWindowPos(overlay, HWND_TOP, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        RedrawWindow(overlay, NULL, NULL, RDW_INVALIDATE | RDW_NOERASE);
-    } else if (IsWindowVisible(overlay)) {
-        ShowWindow(overlay, SW_HIDE);
-    }
-}
-
-static BOOL post_work_text_kind(UINT msg, HWND target_textbox, const WCHAR *text, int kind) {
-    WORK_MESSAGE *m = (WORK_MESSAGE *)xalloc(sizeof(WORK_MESSAGE));
-    if (!m) return FALSE;
-    m->kind = kind;
-    m->target_textbox = target_textbox;
-    m->text = dup_wide(text ? text : L"");
-    if (!m->text) {
-        xfree(m);
-        return FALSE;
-    }
-    if (!PostMessageW(g_main_window, msg, 0, (LPARAM)m)) {
-        secure_free_wide(m->text);
-        xfree(m);
-        return FALSE;
-    }
-    return TRUE;
-}
-
-static BOOL post_work_text(UINT msg, HWND target_textbox, const WCHAR *text) {
-    return post_work_text_kind(msg, target_textbox, text, 0);
-}
-
-static void post_llm_stream_progress(HWND target_textbox, const WCHAR *partial, size_t tokens_done, size_t tokens_total, double tps) {
-    const size_t bar_width = 24;
-    if (tokens_total == 0) tokens_total = 1;
-    if (tokens_done > tokens_total) tokens_done = tokens_total;
-    size_t filled = (tokens_done * bar_width) / tokens_total;
-    WSTRB progress_builder = {0};
-    if (!wstrb_append(&progress_builder, L"\u751f\u6210\u8fdb\u5ea6 [")) goto cleanup;
-    for (size_t i = 0; i < bar_width; ++i) {
-        if (!wstrb_append_char(&progress_builder, i < filled ? L'#' : L'-')) goto cleanup;
-    }
-    if (tps > 0.0) {
-        if (!wstrb_appendf(&progress_builder, L"] %zu/%zu  %.1f token/s\r\n\r\n", tokens_done, tokens_total, tps)) goto cleanup;
-    } else {
-        if (!wstrb_appendf(&progress_builder, L"] %zu/%zu  -- token/s\r\n\r\n", tokens_done, tokens_total)) goto cleanup;
-    }
-    if (!wstrb_append(&progress_builder, partial ? partial : L"")) goto cleanup;
-    post_work_text(WM_APP_WORK_UPDATE, target_textbox, progress_builder.data ? progress_builder.data : L"");
-cleanup:
-    wstrb_free(&progress_builder);
-}
-
-static BOOL start_background_work(WORK_CTX *ctx) {
-    if (InterlockedCompareExchange(&g_work_active, 1, 0) != 0) {
-        show_error(ctx->owner, L"\u64cd\u4f5c\u5931\u8d25\u3002");
-        return FALSE;
-    }
-    InterlockedExchange(&g_cancel_work, 0);
-    set_busy_controls(TRUE);
-    HANDLE thread = CreateThread(NULL, 0, work_thread_proc, ctx, 0, NULL);
-    if (!thread) {
-        InterlockedExchange(&g_work_active, 0);
-        InterlockedExchange(&g_cancel_work, 0);
-        set_busy_controls(FALSE);
-        show_error(ctx->owner, L"\u64cd\u4f5c\u5931\u8d25\u3002");
-        return FALSE;
-    }
-    CloseHandle(thread);
-    return TRUE;
+    ui_overlay_set_text(overlay, text, show);
 }
 
 static void do_export_key(HWND hwnd, HWND target_textbox) {
-    WORK_CTX *ctx = (WORK_CTX *)xalloc(sizeof(WORK_CTX));
+    APP_WORK_CTX *ctx = app_work_alloc(APP_WORK_KIND_EXPORT_KEY, hwnd, target_textbox);
     if (!ctx) {
         show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
         return;
     }
-    ctx->kind = WORK_KIND_EXPORT_KEY;
-    ctx->owner = hwnd;
-    ctx->target_textbox = target_textbox;
-    ctx->topic = NULL;
     set_textbox_overlay(target_textbox, L"\u6b63\u5728\u751f\u6210\u8054\u7cfb\u4eba\u516c\u94a5\u5305\u8f7d\u4f53\u6587\u672c\uff0c\u8bf7\u7a0d\u5019...", TRUE);
     SetWindowTextW(target_textbox, L"");
-    if (!start_background_work(ctx)) {
+    if (!app_work_start(ctx)) {
         set_textbox_overlay(target_textbox, NULL, FALSE);
-        xfree(ctx);
+        app_work_free_ctx(ctx);
     }
 }
 
@@ -412,7 +302,7 @@ static LRESULT CALLBACK NamePromptWndProc(HWND hwnd, UINT msg, WPARAM wparam, LP
         }
         break;
     case WM_CLOSE:
-        InterlockedExchange(&g_cancel_work, 1);
+        app_work_cancel();
         shutdown_local_llm_worker();
         DestroyWindow(hwnd);
         return 0;
@@ -448,7 +338,7 @@ static BOOL prompt_key_name(HWND owner, WCHAR *name, size_t cch) {
 }
 
 static void do_import_key(HWND hwnd, HWND source_textbox) {
-    WCHAR *text = get_window_text_alloc(source_textbox);
+    WCHAR *text = win_get_window_text_alloc(source_textbox);
     if (!text) {
         show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
         return;
@@ -473,20 +363,17 @@ static void do_import_key(HWND hwnd, HWND source_textbox) {
         return;
     }
 
-    WORK_CTX *ctx = (WORK_CTX *)xalloc(sizeof(WORK_CTX));
+    APP_WORK_CTX *ctx = app_work_alloc(APP_WORK_KIND_IMPORT_KEY, hwnd, source_textbox);
     if (!ctx) {
         secure_free_wide(body);
         xfree(text);
         show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
         return;
     }
-    ctx->kind = WORK_KIND_IMPORT_KEY;
-    ctx->owner = hwnd;
-    ctx->target_textbox = source_textbox;
     ctx->input = body;
-    ctx->name = dup_wide(name);
+    ctx->name = win_dup_wide(name);
     if (!ctx->name) {
-        free_work_ctx(ctx);
+        app_work_free_ctx(ctx);
         xfree(text);
         show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
         return;
@@ -494,131 +381,45 @@ static void do_import_key(HWND hwnd, HWND source_textbox) {
 
     set_textbox_overlay(source_textbox, L"\u6b63\u5728\u89e3\u6790\u8054\u7cfb\u4eba\u516c\u94a5\u5305\u8f7d\u4f53\u6587\u672c\uff0c\u8bf7\u7a0d\u5019...", TRUE);
     SetWindowTextW(source_textbox, L"");
-    if (!start_background_work(ctx)) {
+    if (!app_work_start(ctx)) {
         set_textbox_overlay(source_textbox, NULL, FALSE);
         SetWindowTextW(source_textbox, text);
-        free_work_ctx(ctx);
+        app_work_free_ctx(ctx);
     }
     xfree(text);
 }
 
-static WCHAR *get_window_text_alloc(HWND hwnd) {
-    int len = GetWindowTextLengthW(hwnd);
-    WCHAR *window_text = (WCHAR *)xalloc(((SIZE_T)len + 1) * sizeof(WCHAR));
-    if (!window_text) return NULL;
-    GetWindowTextW(hwnd, window_text, len + 1);
-    return window_text;
-}
-
-static BOOL get_clipboard_text(HWND owner, WCHAR **out) {
-    *out = NULL;
-    if (!OpenClipboard(owner)) return FALSE;
-    HANDLE h = GetClipboardData(CF_UNICODETEXT);
-    if (!h) {
-        CloseClipboard();
-        return FALSE;
-    }
-    WCHAR *src = (WCHAR *)GlobalLock(h);
-    if (!src) {
-        CloseClipboard();
-        return FALSE;
-    }
-    size_t len = wcslen(src);
-    if (len > SIZE_MAX / sizeof(WCHAR) - 1) {
-        GlobalUnlock(h);
-        CloseClipboard();
-        return FALSE;
-    }
-    WCHAR *copy = (WCHAR *)xalloc((len + 1) * sizeof(WCHAR));
-    if (copy) CopyMemory(copy, src, (len + 1) * sizeof(WCHAR));
-    GlobalUnlock(h);
-    CloseClipboard();
-    *out = copy;
-    return copy != NULL;
-}
-
 static void show_error(HWND owner, const WCHAR *message) {
-    MessageBoxW(owner, message, APP_TITLE, MB_ICONERROR | MB_OK);
+    win_show_error(owner, APP_TITLE, message);
 }
 
-static BOOL work_cancelled(void) {
-    return InterlockedCompareExchange(&g_cancel_work, 0, 0) != 0;
+static CRYPTO_BOX *get_active_box_for_work(void *user) {
+    (void)user;
+    return g_active_box;
 }
 
-static void free_work_ctx(WORK_CTX *ctx) {
-    if (!ctx) return;
-    secure_free_wide(ctx->input);
-    xfree(ctx->topic);
-    xfree(ctx->name);
-    xfree(ctx);
+static void set_work_busy(void *user, BOOL busy) {
+    (void)user;
+    set_busy_controls(busy);
 }
 
-static BOOL worker_encrypt(WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
-    *out = NULL;
-    if (!g_active_box) {
-        set_error(err, err_cch, L"No active crypto context is open.");
-        return FALSE;
-    }
-    return app_flow_encrypt_message(g_active_box, ctx ? ctx->input : NULL, ctx ? ctx->topic : NULL,
-                                    ctx ? ctx->target_textbox : NULL, out, err, err_cch);
+static void show_work_error(void *user, HWND owner, const WCHAR *message) {
+    (void)user;
+    show_error(owner, message);
 }
 
-static BOOL worker_export_key(WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
-    *out = NULL;
-    if (!g_active_box) {
-        set_error(err, err_cch, L"No active crypto context is open.");
-        return FALSE;
-    }
-    return app_flow_export_key(g_active_box, ctx ? ctx->target_textbox : NULL, out, err, err_cch);
-}
-
-static BOOL worker_import_key(WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
-    *out = NULL;
-    int imported_index = -1;
-    return app_flow_import_key(ctx ? ctx->input : NULL, ctx ? ctx->name : NULL,
-                               &imported_index, out, err, err_cch);
-}
-static BOOL worker_decrypt(WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
-    *out = NULL;
-    if (!ctx || !ctx->input || !ctx->input[0]) {
-        set_error(err, err_cch, L"Clipboard text is empty.");
-        return FALSE;
-    }
-    return app_flow_decrypt_clip_auto_profile(ctx->input, work_cancelled, out, err, err_cch);
-}
-
-static DWORD WINAPI work_thread_proc(LPVOID param) {
-    WORK_CTX *ctx = (WORK_CTX *)param;
-    WCHAR *result = NULL;
-    WCHAR err[256] = L"";
-    BOOL work_succeeded = FALSE;
-
-    if (ctx->kind == WORK_KIND_ENCRYPT) {
-        work_succeeded = worker_encrypt(ctx, &result, err, ARRAYSIZE(err));
-    } else if (ctx->kind == WORK_KIND_EXPORT_KEY) {
-        work_succeeded = worker_export_key(ctx, &result, err, ARRAYSIZE(err));
-    } else if (ctx->kind == WORK_KIND_IMPORT_KEY) {
-        work_succeeded = worker_import_key(ctx, &result, err, ARRAYSIZE(err));
-    } else if (ctx->kind == WORK_KIND_DECRYPT) {
-        work_succeeded = worker_decrypt(ctx, &result, err, ARRAYSIZE(err));
-    } else {
-        set_error(err, ARRAYSIZE(err), L"Unknown background work kind.");
-    }
-
-    if (work_succeeded && !work_cancelled()) {
-        post_work_text_kind(WM_APP_WORK_DONE, ctx->target_textbox, result ? result : L"", ctx->kind);
-    } else if (work_cancelled()) {
-        post_work_text_kind(WM_APP_WORK_CANCELLED, ctx->target_textbox, L"", ctx->kind);
-    } else {
-        post_work_text_kind(WM_APP_WORK_ERROR, ctx->target_textbox, err[0] ? err : L"\u540e\u53f0\u4efb\u52a1\u5931\u8d25\u3002", ctx->kind);
-    }
-    secure_free_wide(result);
-    free_work_ctx(ctx);
-    return 0;
+static void configure_app_work(HWND main_window) {
+    APP_WORK_HOST host;
+    ZeroMemory(&host, sizeof(host));
+    host.main_window = main_window;
+    host.get_active_box = get_active_box_for_work;
+    host.set_busy = set_work_busy;
+    host.show_error = show_work_error;
+    app_work_configure(&host);
 }
 
 static void do_encrypt(HWND hwnd) {
-    WCHAR *plain_w = get_window_text_alloc(g_textbox);
+    WCHAR *plain_w = win_get_window_text_alloc(g_textbox);
     if (!plain_w) {
         show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
         return;
@@ -632,32 +433,27 @@ static void do_encrypt(HWND hwnd) {
         secure_free_wide(plain_w);
         return;
     }
-    WORK_CTX *ctx = (WORK_CTX *)xalloc(sizeof(WORK_CTX));
+    APP_WORK_CTX *ctx = app_work_alloc(APP_WORK_KIND_ENCRYPT, hwnd, g_textbox);
     if (!ctx) {
         secure_free_wide(plain_w);
         xfree(topic);
         show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
         return;
     }
-    ctx->kind = WORK_KIND_ENCRYPT;
-    ctx->owner = hwnd;
-    ctx->target_textbox = g_textbox;
     ctx->input = plain_w;
     ctx->topic = topic;
     set_textbox_overlay(g_textbox, L"\u6b63\u5728\u52a0\u5bc6\u5e76\u6df7\u6dc6\uff0c\u8bf7\u7a0d\u5019...", TRUE);
     SetWindowTextW(g_textbox, L"");
-    if (!start_background_work(ctx)) {
+    if (!app_work_start(ctx)) {
         set_textbox_overlay(g_textbox, NULL, FALSE);
         SetWindowTextW(g_textbox, plain_w);
-        secure_free_wide(plain_w);
-        xfree(topic);
-        xfree(ctx);
+        app_work_free_ctx(ctx);
     }
 }
 
 static void do_decrypt(HWND hwnd) {
     WCHAR *clip = NULL;
-    if (!get_clipboard_text(hwnd, &clip)) {
+    if (!win_get_clipboard_text(hwnd, &clip)) {
         show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
         return;
     }
@@ -665,22 +461,17 @@ static void do_decrypt(HWND hwnd) {
         xfree(clip);
         return;
     }
-    WORK_CTX *ctx = (WORK_CTX *)xalloc(sizeof(WORK_CTX));
+    APP_WORK_CTX *ctx = app_work_alloc(APP_WORK_KIND_DECRYPT, hwnd, g_textbox);
     if (!ctx) {
         xfree(clip);
         show_error(hwnd, L"\u64cd\u4f5c\u5931\u8d25\u3002");
         return;
     }
-    ctx->kind = WORK_KIND_DECRYPT;
-    ctx->owner = hwnd;
-    ctx->target_textbox = g_textbox;
     ctx->input = clip;
-    ctx->topic = NULL;
     set_textbox_overlay(g_textbox, L"\u6b63\u5728\u4ece\u526a\u8d34\u677f\u89e3\u5bc6\uff0c\u8bf7\u7a0d\u5019...", TRUE);
-    if (!start_background_work(ctx)) {
+    if (!app_work_start(ctx)) {
         set_textbox_overlay(g_textbox, NULL, FALSE);
-        xfree(clip);
-        xfree(ctx);
+        app_work_free_ctx(ctx);
     }
 }
 
@@ -701,17 +492,7 @@ static void layout_main(HWND hwnd, int width, int height) {
     MoveWindow(g_key_select, margin, margin, width - margin * 2, 220, TRUE);
     MoveWindow(g_topic_edit, margin, topic_y, width - margin * 2, topic_h, TRUE);
     MoveWindow(g_textbox, margin, edit_y, width - margin * 2, edit_h, TRUE);
-    if (g_text_overlay) {
-        RECT edit_rc;
-        GetClientRect(g_textbox, &edit_rc);
-        int overlay_w = edit_rc.right - edit_rc.left - 16;
-        int overlay_h = edit_rc.bottom - edit_rc.top - 16;
-        if (overlay_w < 1) overlay_w = 1;
-        if (overlay_h < 1) overlay_h = 1;
-        MoveWindow(g_text_overlay, 8, 8, overlay_w, overlay_h, TRUE);
-        SetWindowPos(g_text_overlay, HWND_TOP, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    }
+    ui_overlay_layout(g_text_overlay, g_textbox);
     MoveWindow(GetDlgItem(hwnd, IDC_ENCRYPT), margin, button_y, button_w, button_h, TRUE);
     MoveWindow(GetDlgItem(hwnd, IDC_DECRYPT), margin + (button_w + gap), button_y, button_w, button_h, TRUE);
     MoveWindow(GetDlgItem(hwnd, IDC_CLEAR), margin + (button_w + gap) * 2, button_y, button_w, button_h, TRUE);
@@ -719,84 +500,7 @@ static void layout_main(HWND hwnd, int width, int height) {
 }
 
 static void set_control_font(HWND hwnd) {
-    SendMessageW(hwnd, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
-}
-
-static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
-    switch (msg) {
-    case WM_NCCREATE:
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)dup_wide(L""));
-        return TRUE;
-    case WM_SETTEXT: {
-        WCHAR *old_text = (WCHAR *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-        WCHAR *new_text = dup_wide((const WCHAR *)lparam);
-        if (!new_text) return FALSE;
-        secure_free_wide(old_text);
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)new_text);
-        RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_NOERASE);
-        return TRUE;
-    }
-    case WM_GETTEXTLENGTH: {
-        WCHAR *text = (WCHAR *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-        return text ? (LRESULT)wcslen(text) : 0;
-    }
-    case WM_GETTEXT: {
-        WCHAR *text = (WCHAR *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-        WCHAR *out = (WCHAR *)lparam;
-        int cch = (int)wparam;
-        if (!out || cch <= 0) return 0;
-        out[0] = L'\0';
-        if (!text) return 0;
-        StringCchCopyW(out, (size_t)cch, text);
-        return (LRESULT)wcslen(out);
-    }
-    case WM_ERASEBKGND:
-        return 1;
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hwnd, &ps);
-        RECT rc;
-        GetClientRect(hwnd, &rc);
-        int w = rc.right - rc.left;
-        int h = rc.bottom - rc.top;
-        if (w > 0 && h > 0) {
-            HDC mem = CreateCompatibleDC(hdc);
-            HBITMAP bmp = CreateCompatibleBitmap(hdc, w, h);
-            HGDIOBJ old_bmp = SelectObject(mem, bmp);
-            RECT local_rc = { 0, 0, w, h };
-            HRGN clip = CreateRectRgn(0, 0, w, h);
-            if (clip) {
-                SelectClipRgn(mem, clip);
-                DeleteObject(clip);
-            }
-            HBRUSH bg = CreateSolidBrush(GetSysColor(COLOR_WINDOW));
-            FillRect(mem, &local_rc, bg);
-            DeleteObject(bg);
-            HFONT old_font = NULL;
-            if (g_ui_font) old_font = (HFONT)SelectObject(mem, g_ui_font);
-            SetBkMode(mem, TRANSPARENT);
-            SetTextColor(mem, RGB(128, 128, 128));
-            RECT text_rc = local_rc;
-            WCHAR *text = (WCHAR *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-            DrawTextW(mem, text ? text : L"", -1, &text_rc,
-                      DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
-            if (old_font) SelectObject(mem, old_font);
-            BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
-            SelectObject(mem, old_bmp);
-            DeleteObject(bmp);
-            DeleteDC(mem);
-        }
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-    case WM_DESTROY: {
-        WCHAR *text = (WCHAR *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-        secure_free_wide(text);
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-        return 0;
-    }
-    }
-    return DefWindowProcW(hwnd, msg, wparam, lparam);
+    win_set_control_font(hwnd, g_ui_font);
 }
 
 static LRESULT CALLBACK KeyTransferWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -807,9 +511,7 @@ static LRESULT CALLBACK KeyTransferWndProc(HWND hwnd, UINT msg, WPARAM wparam, L
                                     ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
                                     0, 0, 0, 0, hwnd, (HMENU)IDC_KEY_TEXT, g_instance, NULL);
         SendMessageW(edit, EM_SETLIMITTEXT, 4 * 1024 * 1024, 0);
-        g_key_overlay = CreateWindowExW(0, L"ChineseInputAgentOverlay", L"",
-                                        WS_CHILD | WS_CLIPSIBLINGS,
-                                        0, 0, 0, 0, edit, (HMENU)IDC_KEY_OVERLAY, g_instance, NULL);
+        g_key_overlay = ui_overlay_create(edit, g_instance, IDC_KEY_OVERLAY);
         HWND import_btn = CreateWindowExW(0, L"BUTTON", L"\u5bfc\u5165",
                                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                           0, 0, 0, 0, hwnd, (HMENU)IDC_KEY_IMPORT, g_instance, NULL);
@@ -833,17 +535,7 @@ static LRESULT CALLBACK KeyTransferWndProc(HWND hwnd, UINT msg, WPARAM wparam, L
         if (edit_h < 80) edit_h = 80;
         HWND key_edit = GetDlgItem(hwnd, IDC_KEY_TEXT);
         MoveWindow(key_edit, margin, edit_y, w - margin * 2, edit_h, TRUE);
-        if (g_key_overlay) {
-            RECT edit_rc;
-            GetClientRect(key_edit, &edit_rc);
-            int overlay_w = edit_rc.right - edit_rc.left - 16;
-            int overlay_h = edit_rc.bottom - edit_rc.top - 16;
-            if (overlay_w < 1) overlay_w = 1;
-            if (overlay_h < 1) overlay_h = 1;
-            MoveWindow(g_key_overlay, 8, 8, overlay_w, overlay_h, TRUE);
-            SetWindowPos(g_key_overlay, HWND_TOP, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        }
+        ui_overlay_layout(g_key_overlay, key_edit);
         MoveWindow(GetDlgItem(hwnd, IDC_KEY_IMPORT), w - margin - button_w * 2 - gap, button_y, button_w, button_h, TRUE);
         MoveWindow(GetDlgItem(hwnd, IDC_KEY_EXPORT), w - margin - button_w, button_y, button_w, button_h, TRUE);
         return 0;
@@ -865,9 +557,7 @@ static LRESULT CALLBACK KeyTransferWndProc(HWND hwnd, UINT msg, WPARAM wparam, L
         }
         break;
     case WM_CLOSE:
-        if (g_work_active) {
-            InterlockedExchange(&g_cancel_work, 1);
-        }
+        if (app_work_is_active()) app_work_cancel();
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
@@ -903,7 +593,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     case WM_APP_WORK_DONE:
     case WM_APP_WORK_ERROR:
     case WM_APP_WORK_CANCELLED: {
-        WORK_MESSAGE *m = (WORK_MESSAGE *)lparam;
+        APP_WORK_MESSAGE *m = (APP_WORK_MESSAGE *)lparam;
         if (m) {
             if (msg == WM_APP_WORK_ERROR) {
                 if (m->target_textbox && IsWindow(m->target_textbox)) {
@@ -923,7 +613,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                 } else if (msg == WM_APP_WORK_DONE) {
                     set_textbox_overlay(m->target_textbox, NULL, FALSE);
                     SetWindowTextW(m->target_textbox, m->text ? m->text : L"");
-                    if (m->kind == WORK_KIND_IMPORT_KEY) {
+                    if (m->kind == APP_WORK_KIND_IMPORT_KEY) {
                         WCHAR err[256] = L"";
                         if (!reload_active_crypto(err, ARRAYSIZE(err))) {
                             show_error(hwnd, err[0] ? err : L"\u5bc6\u94a5\u5bfc\u5165\u540e\u5237\u65b0\u52a0\u5bc6\u72b6\u6001\u5931\u8d25\u3002");
@@ -935,13 +625,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                     }
                 }
             }
-            xfree(m->text);
-            xfree(m);
+            app_work_free_message(m);
         }
         if (msg == WM_APP_WORK_DONE || msg == WM_APP_WORK_ERROR || msg == WM_APP_WORK_CANCELLED) {
-            InterlockedExchange(&g_work_active, 0);
-            InterlockedExchange(&g_cancel_work, 0);
-            set_busy_controls(FALSE);
+            app_work_complete_message_handled();
         }
         return 0;
     }
@@ -958,9 +645,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                                     ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
                                     0, 0, 0, 0, hwnd, (HMENU)IDC_TEXTBOX, g_instance, NULL);
         SendMessageW(g_textbox, EM_SETLIMITTEXT, 4 * 1024 * 1024, 0);
-        g_text_overlay = CreateWindowExW(0, L"ChineseInputAgentOverlay", L"",
-                                         WS_CHILD | WS_CLIPSIBLINGS,
-                                         0, 0, 0, 0, g_textbox, (HMENU)IDC_TEXT_OVERLAY, g_instance, NULL);
+        g_text_overlay = ui_overlay_create(g_textbox, g_instance, IDC_TEXT_OVERLAY);
 
         HWND encrypt = CreateWindowExW(0, L"BUTTON", L"\u52a0\u5bc6", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                        0, 0, 0, 0, hwnd, (HMENU)IDC_ENCRYPT, g_instance, NULL);
@@ -1003,8 +688,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             }
             break;
         case IDC_ENCRYPT:
-            if (g_work_active) {
-                InterlockedExchange(&g_cancel_work, 1);
+            if (app_work_is_active()) {
+                app_work_cancel();
                 break;
             }
             do_encrypt(hwnd);
@@ -1021,9 +706,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         }
         break;
     case WM_CLOSE:
-        if (g_work_active) {
-            InterlockedExchange(&g_cancel_work, 1);
-        }
+        if (app_work_is_active()) app_work_cancel();
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
@@ -1055,14 +738,7 @@ static BOOL register_windows(void) {
     wc.lpszClassName = L"ChineseInputAgentNamePrompt";
     if (!RegisterClassExW(&wc)) return FALSE;
 
-    ZeroMemory(&wc, sizeof(wc));
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = OverlayWndProc;
-    wc.hInstance = g_instance;
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = NULL;
-    wc.lpszClassName = L"ChineseInputAgentOverlay";
-    if (!RegisterClassExW(&wc)) return FALSE;
+    if (!ui_overlay_register_class(g_instance)) return FALSE;
 
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize = sizeof(wc);
@@ -1079,7 +755,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     (void)prev;
     (void)cmd;
     g_instance = instance;
-    app_llm_init(work_cancelled, post_llm_stream_progress);
+    configure_app_work(NULL);
+    app_llm_init(app_work_cancelled, app_work_post_llm_stream_progress);
 
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof(icc);
@@ -1129,6 +806,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
         app_llm_cleanup();
         return 1;
     }
+    configure_app_work(g_main_window);
 
     ShowWindow(g_main_window, show);
     UpdateWindow(g_main_window);
