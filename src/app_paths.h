@@ -8,6 +8,8 @@
 #define APP_PROFILE_STATE_FILE_FORMAT L"state_%s.dat"
 #define APP_PROFILE_ARCHIVE_FILE_FORMAT L"archive_%s.dat"
 #define APP_PROFILE_LEGACY_ARCHIVE_FILE_FORMAT L"archive_%s.txt"
+#define APP_GROUPS_FILE_NAME L"groups.dat"
+#define APP_GROUP_ARCHIVE_FILE_FORMAT L"group_archive_%016llx.dat"
 
 #define APP_WORKER_TOOLS_DIR L"tools\\payload_watermark"
 #define APP_WORKER_PACKAGE_DIR_NAME L"llama_worker_package"

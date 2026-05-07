@@ -1059,9 +1059,10 @@ public:
     int n_threads = std::max(2u, std::thread::hardware_concurrency());
     int free_tail_tokens = 64;
     int min_tail_tokens = 0;
-    float temperature = 0.62f;
-    float top_p = 0.78f;
+    float temperature = 0.68f;
+    float top_p = 0.88f;
     int top_k = 128;
+    int min_k = 64;
     std::string backend_preference = "auto";
     std::string backend_used = "cpu";
 
@@ -1362,10 +1363,45 @@ public:
         return token;
     }
 
+    std::vector<ScoredToken> apply_top_p_min_k(const std::vector<ScoredToken> & scored,
+                                               size_t min_limit,
+                                               size_t max_limit) const {
+        if (scored.empty()) return {};
+        max_limit = std::min(max_limit, scored.size());
+        min_limit = std::min(min_limit, max_limit);
+        if (top_p >= 1.0f) return std::vector<ScoredToken>(scored.begin(), scored.begin() + max_limit);
+
+        const float max_score = scored.front().score;
+        double total_weight = 0.0;
+        std::vector<double> weights;
+        weights.reserve(max_limit);
+        for (size_t idx = 0; idx < max_limit; ++idx) {
+            double weight = std::exp(static_cast<double>(scored[idx].score - max_score));
+            if (!std::isfinite(weight) || weight < 0.0) weight = 0.0;
+            weights.push_back(weight);
+            total_weight += weight;
+        }
+        if (total_weight <= 0.0) {
+            size_t keep = std::max<size_t>(1, min_limit);
+            return std::vector<ScoredToken>(scored.begin(), scored.begin() + keep);
+        }
+
+        double cumulative = 0.0;
+        size_t keep = 0;
+        while (keep < max_limit) {
+            cumulative += weights[keep];
+            ++keep;
+            if (keep >= min_limit && cumulative / total_weight >= static_cast<double>(top_p)) break;
+        }
+        keep = std::max<size_t>(1, std::min(keep, max_limit));
+        return std::vector<ScoredToken>(scored.begin(), scored.begin() + keep);
+    }
+
     std::vector<ScoredToken> make_topk_code_candidates(const TokenTable & table, const float * logits,
                                                        const std::vector<int> & generated_tokens,
                                                        const std::string & generated_text,
-                                                       size_t limit) const {
+                                                       size_t max_limit,
+                                                       size_t min_limit) const {
         std::unordered_map<int, int> recent_counts;
         int start = std::max<int>(0, static_cast<int>(generated_tokens.size()) - 192);
         for (int i = start; i < static_cast<int>(generated_tokens.size()); ++i) {
@@ -1399,25 +1435,25 @@ public:
             scored.push_back({id, score, piece});
         }
         std::sort(scored.begin(), scored.end(), [](const ScoredToken & a, const ScoredToken & b) { return a.score > b.score; });
-        std::vector<ScoredToken> out;
-        out.reserve(limit);
+        std::vector<ScoredToken> stable_scored;
+        stable_scored.reserve(max_limit);
         size_t tested = 0;
-        size_t test_limit = std::min(scored.size(), std::max<size_t>(limit * 16, 256));
+        size_t test_limit = std::min(scored.size(), std::max<size_t>(max_limit * 16, 256));
         for (const auto & s : scored) {
-            if (tested++ >= test_limit && out.size() >= std::min<size_t>(limit, 8)) break;
+            if (tested++ >= test_limit && stable_scored.size() >= std::min<size_t>(max_limit, 8)) break;
             bool stable = false;
             try { stable = stable_append_tail(vocab, tail_text, tail_tokens, s.token, s.text); } catch (const std::exception &) { stable = false; }
             if (!stable) continue;
-            out.push_back(s);
-            if (out.size() >= limit) break;
+            stable_scored.push_back(s);
+            if (stable_scored.size() >= max_limit) break;
         }
-        if (out.empty()) {
+        if (stable_scored.empty()) {
             for (const auto & s : scored) {
-                if (out.size() >= limit) break;
-                out.push_back(s);
+                if (stable_scored.size() >= max_limit) break;
+                stable_scored.push_back(s);
             }
         }
-        return out;
+        return apply_top_p_min_k(stable_scored, min_limit, max_limit);
     }
 
     int select_topk_payload_token(const std::string & seed, size_t payload_pos, int digit,
@@ -1425,13 +1461,19 @@ public:
                                   const std::vector<int> & generated_tokens,
                                   const std::string & generated_text) const {
         if (digit < 0 || digit >= radix) throw std::runtime_error("top-k 载荷位超出当前进制范围");
-        const size_t limits[] = {
-            static_cast<size_t>(std::max(top_k, radix * 8)),
-            static_cast<size_t>(std::max(top_k * 2, radix * 16)),
-            static_cast<size_t>(std::max(top_k * 4, radix * 32)),
+        const size_t min_limits[] = {
+            static_cast<size_t>(std::max(min_k, radix * 16)),
+            static_cast<size_t>(std::max(min_k * 2, radix * 32)),
+            static_cast<size_t>(std::max(min_k * 4, radix * 64)),
         };
-        for (size_t limit : limits) {
-            auto candidates = make_topk_code_candidates(table, logits, generated_tokens, generated_text, limit);
+        const size_t max_limits[] = {
+            static_cast<size_t>(std::max(top_k, static_cast<int>(min_limits[0]))),
+            static_cast<size_t>(std::max(top_k * 2, static_cast<int>(min_limits[1]))),
+            static_cast<size_t>(std::max(top_k * 4, static_cast<int>(min_limits[2]))),
+        };
+        for (size_t attempt = 0; attempt < sizeof(max_limits) / sizeof(max_limits[0]); ++attempt) {
+            auto candidates = make_topk_code_candidates(table, logits, generated_tokens, generated_text,
+                                                        max_limits[attempt], min_limits[attempt]);
             for (const auto & c : candidates) {
                 if (topk_digit_for_token(seed, payload_pos, c.token, radix) == digit) return c.token;
             }
@@ -1704,14 +1746,15 @@ int main(int argc, char ** argv) {
             else if (a == "--temperature") worker.temperature = std::stof(need("--temperature"));
             else if (a == "--top-p") worker.top_p = std::stof(need("--top-p"));
             else if (a == "--top-k") worker.top_k = std::stoi(need("--top-k"));
+            else if (a == "--min-k") worker.min_k = std::stoi(need("--min-k"));
             else if (a == "--backend") worker.backend_preference = need("--backend");
             else throw std::runtime_error("未知命令行参数：" + a);
         }
         if (!is_power_of_two_radix(worker.radix)) throw std::runtime_error("top-k 载荷进制必须是 2、4、8 或 16");
-        if (worker.n_ctx < 512 || worker.n_threads <= 0 || worker.top_k <= 0) throw std::runtime_error("worker 运行参数不合法");
+        if (worker.n_ctx < 512 || worker.n_threads <= 0 || worker.top_k <= 0 || worker.min_k <= 0) throw std::runtime_error("worker 运行参数不合法");
         if (worker.temperature <= 0.0f || worker.top_p <= 0.0f || worker.top_p > 1.0f) throw std::runtime_error("worker 采样参数不合法");
         worker.load();
-        emit_json("{\"type\":\"ready\",\"ok\":true,\"backend\":\"llama.cpp\",\"backend_detail\":\"" + json_escape(worker.backend_used) + "\",\"model\":\"" + json_escape(worker.model_path) + "\",\"adapter\":\"" + json_escape(worker.adapter_path) + "\",\"adapter_loaded\":" + std::string(worker.adapter ? "true" : "false") + ",\"radix\":" + std::to_string(worker.radix) + "}");
+        emit_json("{\"type\":\"ready\",\"ok\":true,\"backend\":\"llama.cpp\",\"backend_detail\":\"" + json_escape(worker.backend_used) + "\",\"model\":\"" + json_escape(worker.model_path) + "\",\"adapter\":\"" + json_escape(worker.adapter_path) + "\",\"adapter_loaded\":" + std::string(worker.adapter ? "true" : "false") + ",\"radix\":" + std::to_string(worker.radix) + ",\"top_p\":" + std::to_string(worker.top_p) + ",\"min_k\":" + std::to_string(worker.min_k) + "}");
     } catch (const std::exception & e) {
         emit_json("{\"type\":\"ready\",\"ok\":false,\"error\":\"" + json_escape(e.what()) + "\"}");
         return 1;

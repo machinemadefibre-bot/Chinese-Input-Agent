@@ -88,6 +88,7 @@ if not defined NVCC (
   exit /b 0
 )
 for %%P in ("%NVCC%") do set "CUDA_BIN=%%~dpP"
+call :detect_cuda_runtime_bin
 
 call :resolve_tool CL cl.exe
 if not defined CL if defined VCVARS if exist "%VCVARS%" set "CIA_HAVE_CUDA_BUILD=1"
@@ -102,15 +103,25 @@ exit /b 0
 :detect_vcvars
 if defined VSINSTALLDIR if exist "%VSINSTALLDIR%\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%VSINSTALLDIR%\VC\Auxiliary\Build\vcvars64.bat"
 if not defined VCVARS if defined VCINSTALLDIR if exist "%VCINSTALLDIR%\Auxiliary\Build\vcvars64.bat" set "VCVARS=%VCINSTALLDIR%\Auxiliary\Build\vcvars64.bat"
-if not defined VCVARS if defined VSWHERE if exist "%VSWHERE%" for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%I"
-if not defined VCVARS (
-  call :resolve_tool VSWHERE vswhere.exe
-  if not defined VSWHERE call :resolve_vswhere_from_registry
-  if defined VSWHERE for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%I"
-)
+if not defined VCVARS call :detect_vsroot_with_vswhere
 if not defined VCVARS if defined VSROOT if exist "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%VSROOT%\VC\Auxiliary\Build\vcvars64.bat"
 if not defined VCVARS call :detect_vsroot_from_registry
 if not defined VCVARS if defined VSROOT if exist "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%VSROOT%\VC\Auxiliary\Build\vcvars64.bat"
+exit /b 0
+
+:detect_vsroot_with_vswhere
+if not defined VSWHERE call :resolve_tool VSWHERE vswhere.exe
+if not defined VSWHERE call :resolve_vswhere_from_registry
+if defined VSWHERE for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%I"
+exit /b 0
+
+:detect_cuda_runtime_bin
+set "CUDA_RUNTIME_BIN="
+for %%D in ("%CUDA_BIN%." "%CUDA_BIN%.." "%CUDA_PATH%") do (
+  if not defined CUDA_RUNTIME_BIN for /f "delims=" %%F in ('dir /b /s "%%~fD\cudart64_*.dll" 2^>nul') do (
+    if not defined CUDA_RUNTIME_BIN for %%P in ("%%~fF") do set "CUDA_RUNTIME_BIN=%%~dpP"
+  )
+)
 exit /b 0
 
 :detect_vsroot_from_registry
@@ -166,5 +177,8 @@ if defined MINGW_BIN (
 )
 if defined CUDA_BIN (
   for %%F in ("%CUDA_BIN%cudart64_*.dll" "%CUDA_BIN%cublas64_*.dll" "%CUDA_BIN%cublasLt64_*.dll") do if exist "%%~fF" copy /y "%%~fF" "%FINAL%\" >nul
+)
+if defined CUDA_RUNTIME_BIN (
+  for %%F in ("%CUDA_RUNTIME_BIN%cudart64_*.dll" "%CUDA_RUNTIME_BIN%cublas64_*.dll" "%CUDA_RUNTIME_BIN%cublasLt64_*.dll") do if exist "%%~fF" copy /y "%%~fF" "%FINAL%\" >nul
 )
 exit /b 0

@@ -15,7 +15,12 @@ typedef enum APP_WORK_KIND {
     APP_WORK_KIND_ENCRYPT = 1,
     APP_WORK_KIND_EXPORT_KEY = 2,
     APP_WORK_KIND_DECRYPT = 3,
-    APP_WORK_KIND_IMPORT_KEY = 4
+    APP_WORK_KIND_IMPORT_KEY = 4,
+    APP_WORK_KIND_GROUP_ENCRYPT = 5,
+    APP_WORK_KIND_EXPORT_GROUP = 6,
+    APP_WORK_KIND_CREATE_GROUP = 7,
+    APP_WORK_KIND_REKEY_GROUP = 8,
+    APP_WORK_KIND_SET_GROUP_ALIAS = 9
 } APP_WORK_KIND;
 
 typedef struct APP_WORK_CTX {
@@ -26,13 +31,24 @@ typedef struct APP_WORK_CTX {
     WCHAR *topic;
     WCHAR *name;
     WCHAR *expected_fingerprint;
+    int group_index;
+    WCHAR *sent_plaintext;
+    WCHAR *sent_sender;
+    int sent_profile_index;
+    int sent_group_index;
 } APP_WORK_CTX;
 
 typedef struct APP_WORK_MESSAGE {
     APP_WORK_KIND kind;
     HWND target_textbox;
     WCHAR *text;
+    WCHAR *sender;
     int profile_index;
+    int group_index;
+    WCHAR *sent_plaintext;
+    WCHAR *sent_sender;
+    int sent_profile_index;
+    int sent_group_index;
 } APP_WORK_MESSAGE;
 
 typedef struct APP_WORK_HOST {

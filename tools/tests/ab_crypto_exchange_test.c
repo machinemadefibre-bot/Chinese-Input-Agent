@@ -1,4 +1,6 @@
 #include "crypto_box.h"
+#include "app_groups.h"
+#include "app_paths.h"
 #include "app_shared.h"
 
 #include <windows.h>
@@ -12,6 +14,10 @@
 #define SESSION_HEADER_BYTES 13u
 #define SESSION_TAG_BYTES 12u
 #define SESSION_OVERHEAD_BYTES (SESSION_HEADER_BYTES + SESSION_TAG_BYTES)
+#define GROUP_PACKET_FORMAT 0x31u
+#define GROUP_HEADER_BYTES 19u
+#define GROUP_TAG_BYTES 12u
+#define GROUP_OVERHEAD_BYTES (GROUP_HEADER_BYTES + GROUP_TAG_BYTES)
 
 #define CONTACT_PACKAGE_INITIAL_BYTES 73u
 #define CONTACT_PACKAGE_REPLY_BYTES 105u
@@ -35,6 +41,12 @@ typedef struct TEST_MESSAGE {
     DWORD len;
     const char *plain;
 } TEST_MESSAGE;
+
+typedef struct GROUP_TEST_MESSAGE {
+    BYTE *bytes;
+    DWORD len;
+    const WCHAR *plain;
+} GROUP_TEST_MESSAGE;
 
 static int failf(const WCHAR *fmt, ...) {
     va_list args;
@@ -69,6 +81,22 @@ static uint32_t read_counter(const BYTE *message, DWORD len) {
            ((uint32_t)message[12] << 24);
 }
 
+static void write_session_counter(BYTE *message, DWORD len, uint32_t counter) {
+    if (!message || len < SESSION_HEADER_BYTES) return;
+    message[9] = (BYTE)(counter & 0xffu);
+    message[10] = (BYTE)((counter >> 8) & 0xffu);
+    message[11] = (BYTE)((counter >> 16) & 0xffu);
+    message[12] = (BYTE)((counter >> 24) & 0xffu);
+}
+
+static void write_group_counter(BYTE *message, DWORD len, uint32_t counter) {
+    if (!message || len < GROUP_HEADER_BYTES) return;
+    message[15] = (BYTE)(counter & 0xffu);
+    message[16] = (BYTE)((counter >> 8) & 0xffu);
+    message[17] = (BYTE)((counter >> 16) & 0xffu);
+    message[18] = (BYTE)((counter >> 24) & 0xffu);
+}
+
 static int open_box(const WCHAR *label, const BYTE master_key[32], const WCHAR *state_path, CRYPTO_BOX **out) {
     WCHAR err[512] = L"";
     if (!crypto_box_open(master_key, state_path, out, err, ARRAYSIZE(err))) {
@@ -87,6 +115,32 @@ static void free_message(TEST_MESSAGE *message) {
     if (!message) return;
     secure_free(message->bytes, message->len);
     ZeroMemory(message, sizeof(*message));
+}
+
+static void free_group_message(GROUP_TEST_MESSAGE *message) {
+    if (!message) return;
+    secure_free(message->bytes, message->len);
+    ZeroMemory(message, sizeof(*message));
+}
+
+static int duplicate_message(const TEST_MESSAGE *source, TEST_MESSAGE *out) {
+    ZeroMemory(out, sizeof(*out));
+    out->bytes = (BYTE *)xalloc(source->len);
+    if (!out->bytes) return failf(L"failed to duplicate session message");
+    CopyMemory(out->bytes, source->bytes, source->len);
+    out->len = source->len;
+    out->plain = source->plain;
+    return 0;
+}
+
+static int duplicate_group_message(const GROUP_TEST_MESSAGE *source, GROUP_TEST_MESSAGE *out) {
+    ZeroMemory(out, sizeof(*out));
+    out->bytes = (BYTE *)xalloc(source->len);
+    if (!out->bytes) return failf(L"failed to duplicate group message");
+    CopyMemory(out->bytes, source->bytes, source->len);
+    out->len = source->len;
+    out->plain = source->plain;
+    return 0;
 }
 
 static int encrypt_text(CRYPTO_BOX *sender, const char *plain, TEST_MESSAGE *out) {
@@ -129,6 +183,17 @@ static int decrypt_text(CRYPTO_BOX *receiver, const TEST_MESSAGE *message) {
         return failf(L"decrypted text mismatch for '%S'", message->plain);
     }
     secure_free(plain, plain_len);
+    return 0;
+}
+
+static int expect_decrypt_failure(CRYPTO_BOX *receiver, const BYTE *message, DWORD len, const WCHAR *label) {
+    WCHAR err[512] = L"";
+    BYTE *plain = NULL;
+    DWORD plain_len = 0;
+    if (crypto_box_decrypt(receiver, message, len, &plain, &plain_len, err, ARRAYSIZE(err))) {
+        secure_free(plain, plain_len);
+        return failf(L"%s unexpectedly decrypted", label);
+    }
     return 0;
 }
 
@@ -287,6 +352,64 @@ cleanup:
     return result;
 }
 
+static int test_session_edge_cases(CRYPTO_BOX *a_box, CRYPTO_BOX *b_box) {
+    TEST_MESSAGE valid = {0};
+    TEST_MESSAGE tampered = {0};
+    TEST_MESSAGE replay = {0};
+    TEST_MESSAGE overflow[66];
+    int result = 1;
+
+    ZeroMemory(overflow, sizeof(overflow));
+    if (encrypt_text(a_box, "edge valid", &valid)) goto cleanup;
+
+    if (expect_decrypt_failure(b_box, valid.bytes, SESSION_HEADER_BYTES - 1, L"malformed session packet")) goto cleanup;
+
+    if (duplicate_message(&valid, &tampered)) goto cleanup;
+    tampered.bytes[0] = 0x99u;
+    if (expect_decrypt_failure(b_box, tampered.bytes, tampered.len, L"wrong-format session packet")) goto cleanup;
+    free_message(&tampered);
+
+    if (duplicate_message(&valid, &tampered)) goto cleanup;
+    tampered.bytes[1] ^= 0x40u;
+    if (expect_decrypt_failure(b_box, tampered.bytes, tampered.len, L"tampered session header")) goto cleanup;
+    free_message(&tampered);
+
+    if (duplicate_message(&valid, &tampered)) goto cleanup;
+    tampered.bytes[SESSION_HEADER_BYTES] ^= 0x40u;
+    if (expect_decrypt_failure(b_box, tampered.bytes, tampered.len, L"tampered session tag")) goto cleanup;
+    free_message(&tampered);
+
+    if (duplicate_message(&valid, &tampered)) goto cleanup;
+    write_session_counter(tampered.bytes, tampered.len, UINT32_MAX);
+    if (expect_decrypt_failure(b_box, tampered.bytes, tampered.len, L"max-counter session packet")) goto cleanup;
+    free_message(&tampered);
+
+    if (decrypt_text(b_box, &valid)) goto cleanup;
+
+    if (encrypt_text(a_box, "session replay", &replay)) goto cleanup;
+    if (decrypt_text(b_box, &replay)) goto cleanup;
+    if (expect_decrypt_failure(b_box, replay.bytes, replay.len, L"replayed session packet")) goto cleanup;
+
+    for (int message_idx = 0; message_idx < (int)ARRAYSIZE(overflow); ++message_idx) {
+        if (encrypt_text(a_box, "overflow window packet", &overflow[message_idx])) goto cleanup;
+    }
+    if (expect_decrypt_failure(b_box, overflow[65].bytes, overflow[65].len,
+                               L"session skipped-key window overflow")) goto cleanup;
+    if (decrypt_text(b_box, &overflow[0])) goto cleanup;
+
+    fwprintf(stdout, L"PASS session edges: malformed, tamper, replay, overflow, max counter\n");
+    result = 0;
+
+cleanup:
+    free_message(&valid);
+    free_message(&tampered);
+    free_message(&replay);
+    for (int message_idx = 0; message_idx < (int)ARRAYSIZE(overflow); ++message_idx) {
+        free_message(&overflow[message_idx]);
+    }
+    return result;
+}
+
 static int test_reopen_continuation(CRYPTO_BOX **a_box, CRYPTO_BOX **b_box,
                                     const WCHAR *a_state_path,
                                     const WCHAR *b_state_path) {
@@ -306,11 +429,206 @@ cleanup:
     return result;
 }
 
+static int make_child_dir_from_state(const WCHAR *state_path, const WCHAR *child_name, WCHAR *out, size_t cch) {
+    WCHAR parent[MAX_PATH];
+    if (FAILED(StringCchCopyW(parent, ARRAYSIZE(parent), state_path))) {
+        return failf(L"state path is too long");
+    }
+    strip_last_path_component_early(parent);
+    if (FAILED(StringCchPrintfW(out, cch, L"%s\\%s", parent, child_name))) {
+        return failf(L"group test directory path is too long");
+    }
+    if (!CreateDirectoryW(out, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        return failf(L"failed to create group test directory: %ls", out);
+    }
+    return 0;
+}
+
+static int switch_group_store(const WCHAR *label, const WCHAR *dir) {
+    WCHAR err[512] = L"";
+    app_groups_shutdown();
+    if (!SetEnvironmentVariableW(APP_ENV_DATA_DIR, dir)) {
+        return failf(L"%s failed to set group data dir: %ls", label, dir);
+    }
+    if (!app_groups_load(err, ARRAYSIZE(err))) {
+        return failf(L"%s failed to load group store: %ls", label, err);
+    }
+    return 0;
+}
+
+static int setup_group_pair(const WCHAR *a_group_dir, const WCHAR *b_group_dir) {
+    WCHAR err[512] = L"";
+    BYTE *invite = NULL;
+    DWORD invite_len = 0;
+    WCHAR *import_message = NULL;
+    int group_index = -1;
+    int result = 1;
+
+    if (switch_group_store(L"A group", a_group_dir)) goto cleanup;
+    if (!app_groups_create(L"Test Group", L"Alice", &group_index, err, ARRAYSIZE(err))) {
+        failf(L"A group create failed: %ls", err);
+        goto cleanup;
+    }
+    if (!app_groups_export_package(group_index, &invite, &invite_len, err, ARRAYSIZE(err))) {
+        failf(L"A group export failed: %ls", err);
+        goto cleanup;
+    }
+
+    if (switch_group_store(L"B group", b_group_dir)) goto cleanup;
+    if (!app_groups_import_package(invite, invite_len, L"Test Group", L"Bob",
+                                   &group_index, &import_message, err, ARRAYSIZE(err))) {
+        failf(L"B group import failed: %ls", err);
+        goto cleanup;
+    }
+
+    fwprintf(stdout, L"PASS group setup: A create/export + B import\n");
+    result = 0;
+
+cleanup:
+    secure_free(invite, invite_len);
+    secure_free_wide(import_message);
+    return result;
+}
+
+static int group_encrypt_text(int group_index, const WCHAR *plain, GROUP_TEST_MESSAGE *out) {
+    WCHAR err[512] = L"";
+    BYTE *encrypted = NULL;
+    DWORD encrypted_len = 0;
+    if (!app_groups_encrypt_message(group_index, plain, &encrypted, &encrypted_len, err, ARRAYSIZE(err))) {
+        return failf(L"group encrypt failed for '%ls': %ls", plain, err);
+    }
+    if (!encrypted || encrypted_len < GROUP_OVERHEAD_BYTES || encrypted[0] != GROUP_PACKET_FORMAT) {
+        secure_free(encrypted, encrypted_len);
+        return failf(L"group encrypted packet shape mismatch for '%ls'", plain);
+    }
+    out->bytes = encrypted;
+    out->len = encrypted_len;
+    out->plain = plain;
+    return 0;
+}
+
+static int group_decrypt_text(const GROUP_TEST_MESSAGE *message) {
+    WCHAR err[512] = L"";
+    WCHAR *plain = NULL;
+    WCHAR *sender = NULL;
+    int group_index = -1;
+    if (!app_groups_decrypt_message(message->bytes, message->len, &plain, &sender,
+                                    &group_index, err, ARRAYSIZE(err))) {
+        return failf(L"group decrypt failed for '%ls': %ls", message->plain, err);
+    }
+    if (wcscmp(plain ? plain : L"", message->plain) != 0) {
+        secure_free_wide(plain);
+        secure_free_wide(sender);
+        return failf(L"group decrypted text mismatch for '%ls'", message->plain);
+    }
+    secure_free_wide(plain);
+    secure_free_wide(sender);
+    return 0;
+}
+
+static int expect_group_decrypt_failure(const BYTE *message, DWORD len, const WCHAR *label) {
+    WCHAR err[512] = L"";
+    WCHAR *plain = NULL;
+    WCHAR *sender = NULL;
+    int group_index = -1;
+    if (app_groups_decrypt_message(message, len, &plain, &sender, &group_index, err, ARRAYSIZE(err))) {
+        secure_free_wide(plain);
+        secure_free_wide(sender);
+        return failf(L"%s unexpectedly decrypted", label);
+    }
+    return 0;
+}
+
+static int test_group_transport_edges(const WCHAR *a_group_dir, const WCHAR *b_group_dir) {
+    GROUP_TEST_MESSAGE valid = {0};
+    GROUP_TEST_MESSAGE messages[3];
+    GROUP_TEST_MESSAGE replay = {0};
+    GROUP_TEST_MESSAGE tampered = {0};
+    GROUP_TEST_MESSAGE overflow[66];
+    int result = 1;
+
+    ZeroMemory(messages, sizeof(messages));
+    ZeroMemory(overflow, sizeof(overflow));
+
+    if (setup_group_pair(a_group_dir, b_group_dir)) goto cleanup;
+
+    if (switch_group_store(L"A group", a_group_dir)) goto cleanup;
+    if (group_encrypt_text(0, L"group hello", &valid)) goto cleanup;
+    if (switch_group_store(L"B group", b_group_dir)) goto cleanup;
+    if (group_decrypt_text(&valid)) goto cleanup;
+
+    if (switch_group_store(L"A group", a_group_dir)) goto cleanup;
+    if (group_encrypt_text(0, L"group order 0", &messages[0])) goto cleanup;
+    if (group_encrypt_text(0, L"group order 1", &messages[1])) goto cleanup;
+    if (group_encrypt_text(0, L"group order 2", &messages[2])) goto cleanup;
+    if (switch_group_store(L"B group", b_group_dir)) goto cleanup;
+    if (group_decrypt_text(&messages[2])) goto cleanup;
+    if (group_decrypt_text(&messages[0])) goto cleanup;
+    if (group_decrypt_text(&messages[1])) goto cleanup;
+    if (expect_group_decrypt_failure(messages[0].bytes, messages[0].len, L"replayed group packet")) goto cleanup;
+
+    if (switch_group_store(L"A group", a_group_dir)) goto cleanup;
+    if (group_encrypt_text(0, L"group tamper header", &replay)) goto cleanup;
+    if (duplicate_group_message(&replay, &tampered)) goto cleanup;
+    tampered.bytes[1] ^= 0x40u;
+    if (switch_group_store(L"B group", b_group_dir)) goto cleanup;
+    if (expect_group_decrypt_failure(tampered.bytes, tampered.len, L"tampered group header")) goto cleanup;
+    if (group_decrypt_text(&replay)) goto cleanup;
+    free_group_message(&tampered);
+    free_group_message(&replay);
+
+    if (switch_group_store(L"A group", a_group_dir)) goto cleanup;
+    if (group_encrypt_text(0, L"group tamper tag", &replay)) goto cleanup;
+    if (duplicate_group_message(&replay, &tampered)) goto cleanup;
+    tampered.bytes[GROUP_HEADER_BYTES] ^= 0x40u;
+    if (switch_group_store(L"B group", b_group_dir)) goto cleanup;
+    if (expect_group_decrypt_failure(tampered.bytes, tampered.len, L"tampered group tag")) goto cleanup;
+    if (group_decrypt_text(&replay)) goto cleanup;
+    free_group_message(&tampered);
+    free_group_message(&replay);
+
+    if (switch_group_store(L"A group", a_group_dir)) goto cleanup;
+    if (group_encrypt_text(0, L"group max counter", &replay)) goto cleanup;
+    if (duplicate_group_message(&replay, &tampered)) goto cleanup;
+    write_group_counter(tampered.bytes, tampered.len, UINT32_MAX);
+    if (switch_group_store(L"B group", b_group_dir)) goto cleanup;
+    if (expect_group_decrypt_failure(tampered.bytes, tampered.len, L"max-counter group packet")) goto cleanup;
+    if (group_decrypt_text(&replay)) goto cleanup;
+    free_group_message(&tampered);
+    free_group_message(&replay);
+
+    if (switch_group_store(L"A group", a_group_dir)) goto cleanup;
+    for (int message_idx = 0; message_idx < (int)ARRAYSIZE(overflow); ++message_idx) {
+        if (group_encrypt_text(0, L"group overflow window packet", &overflow[message_idx])) goto cleanup;
+    }
+    if (switch_group_store(L"B group", b_group_dir)) goto cleanup;
+    if (expect_group_decrypt_failure(overflow[65].bytes, overflow[65].len,
+                                     L"group skipped-key window overflow")) goto cleanup;
+    if (group_decrypt_text(&overflow[0])) goto cleanup;
+
+    fwprintf(stdout, L"PASS group edges: decrypt, out-of-order, replay, tamper, overflow, max counter\n");
+    result = 0;
+
+cleanup:
+    free_group_message(&valid);
+    for (int message_idx = 0; message_idx < 3; ++message_idx) free_group_message(&messages[message_idx]);
+    free_group_message(&replay);
+    free_group_message(&tampered);
+    for (int message_idx = 0; message_idx < (int)ARRAYSIZE(overflow); ++message_idx) {
+        free_group_message(&overflow[message_idx]);
+    }
+    app_groups_shutdown();
+    SetEnvironmentVariableW(APP_ENV_DATA_DIR, NULL);
+    return result;
+}
+
 int wmain(int argc, WCHAR **argv) {
     const WCHAR *a_exe = arg_value(argc, argv, L"--a-exe");
     const WCHAR *b_exe = arg_value(argc, argv, L"--b-exe");
     const WCHAR *a_state_path = arg_value(argc, argv, L"--a-state");
     const WCHAR *b_state_path = arg_value(argc, argv, L"--b-state");
+    WCHAR a_group_dir[MAX_PATH] = L"";
+    WCHAR b_group_dir[MAX_PATH] = L"";
     CRYPTO_BOX *a_box = NULL;
     CRYPTO_BOX *b_box = NULL;
     int result = 1;
@@ -329,6 +647,10 @@ int wmain(int argc, WCHAR **argv) {
     fwprintf(stdout, L"B exe: %ls\n", b_exe);
     fwprintf(stdout, L"A state: %ls\n", a_state_path);
     fwprintf(stdout, L"B state: %ls\n", b_state_path);
+    if (make_child_dir_from_state(a_state_path, L"group_a", a_group_dir, ARRAYSIZE(a_group_dir)) ||
+        make_child_dir_from_state(b_state_path, L"group_b", b_group_dir, ARRAYSIZE(b_group_dir))) {
+        goto cleanup;
+    }
 
     if (open_box(L"A", MASTER_KEY_A, a_state_path, &a_box)) goto cleanup;
     if (open_box(L"B", MASTER_KEY_B, b_state_path, &b_box)) goto cleanup;
@@ -339,6 +661,8 @@ int wmain(int argc, WCHAR **argv) {
     if (test_out_of_order(a_box, &b_box, b_state_path)) goto cleanup;
     if (test_packet_loss(a_box, b_box)) goto cleanup;
     if (test_reopen_continuation(&a_box, &b_box, a_state_path, b_state_path)) goto cleanup;
+    if (test_session_edge_cases(a_box, b_box)) goto cleanup;
+    if (test_group_transport_edges(a_group_dir, b_group_dir)) goto cleanup;
 
     fwprintf(stdout, L"PASS all AB install crypto exchange tests\n");
     result = 0;

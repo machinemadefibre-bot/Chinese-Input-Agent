@@ -10,6 +10,15 @@
 #define PROFILES_MAGIC 0x31505348u
 #define PROFILES_VERSION 1u
 
+struct KEY_PROFILE {
+    WCHAR id[33];
+    WCHAR name[128];
+    BYTE *wrapped_key;
+    DWORD wrapped_key_len;
+    BYTE master_key[APP_PROFILE_MASTER_KEY_BYTES];
+    BOOL master_loaded;
+};
+
 static KEY_PROFILE g_profiles[APP_PROFILE_MAX_PROFILES];
 static int g_profile_count;
 static int g_active_profile = -1;
@@ -18,28 +27,28 @@ static BOOL get_profiles_path(WCHAR *path, size_t cch) {
     return get_app_file(path, cch, APP_PROFILES_FILE_NAME);
 }
 
-BOOL profiles_get_state_path(const KEY_PROFILE *profile, WCHAR *path, size_t cch) {
+static BOOL profile_get_state_path(const KEY_PROFILE *profile, WCHAR *path, size_t cch) {
     WCHAR name[80];
     if (!profile || !profile->id[0]) return FALSE;
     if (FAILED(StringCchPrintfW(name, ARRAYSIZE(name), APP_PROFILE_STATE_FILE_FORMAT, profile->id))) return FALSE;
     return get_app_file(path, cch, name);
 }
 
-BOOL profiles_get_archive_path(const KEY_PROFILE *profile, WCHAR *path, size_t cch) {
+static BOOL profile_get_archive_path(const KEY_PROFILE *profile, WCHAR *path, size_t cch) {
     WCHAR name[96];
     if (!profile || !profile->id[0]) return FALSE;
     if (FAILED(StringCchPrintfW(name, ARRAYSIZE(name), APP_PROFILE_ARCHIVE_FILE_FORMAT, profile->id))) return FALSE;
     return get_app_file(path, cch, name);
 }
 
-BOOL profiles_get_legacy_archive_path(const KEY_PROFILE *profile, WCHAR *path, size_t cch) {
+static BOOL profile_get_legacy_archive_path(const KEY_PROFILE *profile, WCHAR *path, size_t cch) {
     WCHAR name[96];
     if (!profile || !profile->id[0]) return FALSE;
     if (FAILED(StringCchPrintfW(name, ARRAYSIZE(name), APP_PROFILE_LEGACY_ARCHIVE_FILE_FORMAT, profile->id))) return FALSE;
     return get_app_file(path, cch, name);
 }
 
-void profiles_clear_profile(KEY_PROFILE *profile) {
+static void profiles_clear_profile(KEY_PROFILE *profile) {
     secure_free(profile->wrapped_key, profile->wrapped_key_len);
     SecureZeroMemory(profile->master_key, sizeof(profile->master_key));
     ZeroMemory(profile, sizeof(*profile));
@@ -214,7 +223,8 @@ cleanup:
     return profile_db_written;
 }
 
-BOOL profiles_create_from_master(const WCHAR *name, const BYTE master_key[APP_PROFILE_MASTER_KEY_BYTES], KEY_PROFILE *out, WCHAR *err, size_t err_cch) {
+static BOOL profiles_create_from_master(const WCHAR *name, const BYTE master_key[APP_PROFILE_MASTER_KEY_BYTES],
+                                        KEY_PROFILE *out, WCHAR *err, size_t err_cch) {
     if (!out || !master_key) {
         set_error(err, err_cch, L"Invalid profile creation request.");
         return FALSE;
@@ -343,7 +353,17 @@ BOOL profiles_activate(int index, WCHAR *err, size_t err_cch) {
     }
     if (!unwrap_profile_master_key(&g_profiles[index], err, err_cch)) return FALSE;
     g_active_profile = index;
-    return profiles_save();
+    BOOL profile_saved = profiles_save();
+    if (profile_saved) profiles_lock_inactive_masters();
+    return profile_saved;
+}
+
+void profiles_lock_inactive_masters(void) {
+    for (int profile_idx = 0; profile_idx < g_profile_count; ++profile_idx) {
+        if (profile_idx == g_active_profile) continue;
+        SecureZeroMemory(g_profiles[profile_idx].master_key, sizeof(g_profiles[profile_idx].master_key));
+        g_profiles[profile_idx].master_loaded = FALSE;
+    }
 }
 
 
@@ -355,13 +375,40 @@ int profiles_active_index(void) {
     return g_active_profile;
 }
 
-KEY_PROFILE *profiles_get(int index) {
+static KEY_PROFILE *profile_at(int index) {
     if (index < 0 || index >= g_profile_count) return NULL;
     return &g_profiles[index];
 }
 
-KEY_PROFILE *profiles_active(void) {
-    return profiles_get(g_active_profile);
+BOOL profiles_get_name_copy(int index, WCHAR *out, size_t cch) {
+    KEY_PROFILE *profile = profile_at(index);
+    if (!profile || !out || cch == 0) return FALSE;
+    return SUCCEEDED(StringCchCopyW(out, cch, profile->name));
+}
+
+BOOL profiles_set_name(int index, const WCHAR *name, WCHAR *err, size_t err_cch) {
+    KEY_PROFILE *profile = profile_at(index);
+    if (!profile) {
+        set_error(err, err_cch, L"Requested profile index is out of range.");
+        return FALSE;
+    }
+    if (FAILED(StringCchCopyW(profile->name, ARRAYSIZE(profile->name), name ? name : L""))) {
+        set_error(err, err_cch, L"Profile name is too long.");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+BOOL profiles_get_state_path_by_index(int index, WCHAR *path, size_t cch) {
+    return profile_get_state_path(profile_at(index), path, cch);
+}
+
+BOOL profiles_get_archive_path_by_index(int index, WCHAR *path, size_t cch) {
+    return profile_get_archive_path(profile_at(index), path, cch);
+}
+
+BOOL profiles_get_legacy_archive_path_by_index(int index, WCHAR *path, size_t cch) {
+    return profile_get_legacy_archive_path(profile_at(index), path, cch);
 }
 
 BOOL profiles_open_crypto(int index, CRYPTO_BOX **out, WCHAR *err, size_t err_cch) {
@@ -377,14 +424,39 @@ BOOL profiles_open_crypto(int index, CRYPTO_BOX **out, WCHAR *err, size_t err_cc
     KEY_PROFILE *profile = &g_profiles[index];
     if (!profile->master_loaded && !unwrap_profile_master_key(profile, err, err_cch)) return FALSE;
     WCHAR state_path[MAX_PATH];
-    if (!profiles_get_state_path(profile, state_path, ARRAYSIZE(state_path))) {
+    if (!profile_get_state_path(profile, state_path, ARRAYSIZE(state_path))) {
         set_error(err, err_cch, L"Profile state path is not available.");
+        if (index != g_active_profile) {
+            SecureZeroMemory(profile->master_key, sizeof(profile->master_key));
+            profile->master_loaded = FALSE;
+        }
         return FALSE;
     }
-    return crypto_box_open(profile->master_key, state_path, out, err, err_cch);
+    BOOL opened = crypto_box_open(profile->master_key, state_path, out, err, err_cch);
+    if (!opened && index != g_active_profile) {
+        SecureZeroMemory(profile->master_key, sizeof(profile->master_key));
+        profile->master_loaded = FALSE;
+    }
+    return opened;
 }
 
-BOOL profiles_append_imported(KEY_PROFILE *profile, int *index_out, WCHAR *err, size_t err_cch) {
+BOOL profiles_with_master_key(int index, PROFILE_MASTER_KEY_FN callback, void *user,
+                              WCHAR *err, size_t err_cch) {
+    KEY_PROFILE *profile = profile_at(index);
+    if (!profile || !callback) {
+        set_error(err, err_cch, L"Invalid profile master-key request.");
+        return FALSE;
+    }
+    if (!profile->master_loaded && !unwrap_profile_master_key(profile, err, err_cch)) return FALSE;
+    BOOL callback_succeeded = callback(profile->master_key, user, err, err_cch);
+    if (index != g_active_profile) {
+        SecureZeroMemory(profile->master_key, sizeof(profile->master_key));
+        profile->master_loaded = FALSE;
+    }
+    return callback_succeeded;
+}
+
+static BOOL profiles_append_imported(KEY_PROFILE *profile, int *index_out, WCHAR *err, size_t err_cch) {
     if (!profile || g_profile_count >= APP_PROFILE_MAX_PROFILES) {
         set_error(err, err_cch, L"\u5bc6\u94a5\u6570\u91cf\u5df2\u8fbe\u5230\u4e0a\u9650\u3002");
         return FALSE;
@@ -394,6 +466,17 @@ BOOL profiles_append_imported(KEY_PROFILE *profile, int *index_out, WCHAR *err, 
     ZeroMemory(profile, sizeof(*profile));
     g_active_profile = index;
     if (index_out) *index_out = index;
+    return TRUE;
+}
+
+BOOL profiles_append_from_master(const WCHAR *name, const BYTE master_key[APP_PROFILE_MASTER_KEY_BYTES],
+                                 int *index_out, WCHAR *err, size_t err_cch) {
+    KEY_PROFILE imported;
+    if (!profiles_create_from_master(name, master_key, &imported, err, err_cch)) return FALSE;
+    if (!profiles_append_imported(&imported, index_out, err, err_cch)) {
+        profiles_clear_profile(&imported);
+        return FALSE;
+    }
     return TRUE;
 }
 

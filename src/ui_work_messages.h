@@ -13,6 +13,12 @@ typedef struct UI_WORK_MESSAGE_HOST {
     void (*refresh_key_list_after_key_import)(void *user);
     BOOL (*save_decrypted_plaintext)(void *user, int profile_index, const WCHAR *plain,
                                      WCHAR *err, size_t err_cch);
+    BOOL (*save_decrypted_group_plaintext)(void *user, int group_index, const WCHAR *sender,
+                                           const WCHAR *plain, WCHAR *err, size_t err_cch);
+    BOOL (*save_sent_plaintext)(void *user, int profile_index, const WCHAR *sender,
+                                const WCHAR *plain, WCHAR *err, size_t err_cch);
+    BOOL (*save_sent_group_plaintext)(void *user, int group_index, const WCHAR *sender,
+                                      const WCHAR *plain, WCHAR *err, size_t err_cch);
     void *user;
 } UI_WORK_MESSAGE_HOST;
 

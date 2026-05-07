@@ -8,6 +8,7 @@ typedef struct UI_KEY_TRANSFER_HOST {
     HFONT ui_font;
     void (*show_error)(void *user, HWND owner, const WCHAR *message);
     void (*on_name_prompt_close_requested)(void *user);
+    int (*get_selected_group_index)(void *user);
     /* Copied by ui_key_transfer_show; user must remain valid while the key-transfer window is open. */
     void *user;
 } UI_KEY_TRANSFER_HOST;

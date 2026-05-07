@@ -22,7 +22,7 @@ int curve25519_donna(uint8_t *out, const uint8_t *secret, const uint8_t *basepoi
 #define CONTACT_PACKAGE_FORMAT_MASK 0xfeu
 #define CONTACT_PACKAGE_BASE_BYTES (1 + X25519_KEY_BYTES + X25519_KEY_BYTES + CONTACT_CHECKSUM_BYTES)
 #define CONTACT_PACKAGE_WITH_RECIPIENT_BYTES (CONTACT_PACKAGE_BASE_BYTES + X25519_KEY_BYTES)
-#define CONTACT_FINGERPRINT_DIGITS 8
+#define CONTACT_FINGERPRINT_CHARS 8
 #define STATE_NONCE_BYTES 12
 #define STATE_TAG_BYTES 16
 #define STATE_HEADER_BYTES 16
@@ -500,15 +500,24 @@ static BOOL parse_contact_package(const uint8_t *pkg, DWORD pkg_len, CONTACT_PAC
 
 static BOOL contact_fingerprint_from_public(const uint8_t pub[X25519_KEY_BYTES], WCHAR *out, size_t cch) {
     static const uint8_t label[] = "ChineseInputAgent contact fingerprint";
+    static const WCHAR alphabet[] = L"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     uint8_t digest[32];
     const uint8_t *parts[2] = { label, pub };
     DWORD lens[2] = { (DWORD)(sizeof(label) - 1), X25519_KEY_BYTES };
-    if (!out || cch < CONTACT_FINGERPRINT_DIGITS + 1) return FALSE;
+    if (!out || cch < CONTACT_FINGERPRINT_CHARS + 1) return FALSE;
     if (!validate_public_key_blob(pub, X25519_KEY_BYTES) || !sha256_segments(parts, lens, 2, digest)) return FALSE;
-    unsigned long long code = (unsigned long long)(read_u64_le(digest) % 100000000ULL);
-    BOOL fingerprint_built = SUCCEEDED(StringCchPrintfW(out, cch, L"%08llu", code));
+    uint64_t bits = ((uint64_t)digest[0] << 32) |
+                    ((uint64_t)digest[1] << 24) |
+                    ((uint64_t)digest[2] << 16) |
+                    ((uint64_t)digest[3] << 8) |
+                    (uint64_t)digest[4];
+    for (size_t char_idx = 0; char_idx < CONTACT_FINGERPRINT_CHARS; ++char_idx) {
+        unsigned shift = (unsigned)(35u - char_idx * 5u);
+        out[char_idx] = alphabet[(bits >> shift) & 0x1fu];
+    }
+    out[CONTACT_FINGERPRINT_CHARS] = L'\0';
     SecureZeroMemory(digest, sizeof(digest));
-    return fingerprint_built;
+    return TRUE;
 }
 
 static void clear_skipped_message_keys(CRYPTO_BOX *box) {

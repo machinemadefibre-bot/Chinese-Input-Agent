@@ -29,6 +29,9 @@ APP_WORK_CTX *app_work_alloc(APP_WORK_KIND kind, HWND owner, HWND target_textbox
     ctx->kind = kind;
     ctx->owner = owner;
     ctx->target_textbox = target_textbox;
+    ctx->group_index = -1;
+    ctx->sent_profile_index = -1;
+    ctx->sent_group_index = -1;
     return ctx;
 }
 
@@ -38,12 +41,17 @@ void app_work_free_ctx(APP_WORK_CTX *ctx) {
     xfree(ctx->topic);
     xfree(ctx->name);
     secure_free_wide(ctx->expected_fingerprint);
+    secure_free_wide(ctx->sent_plaintext);
+    secure_free_wide(ctx->sent_sender);
     xfree(ctx);
 }
 
 void app_work_free_message(APP_WORK_MESSAGE *message) {
     if (!message) return;
     secure_free_wide(message->text);
+    secure_free_wide(message->sender);
+    secure_free_wide(message->sent_plaintext);
+    secure_free_wide(message->sent_sender);
     xfree(message);
 }
 
@@ -98,27 +106,36 @@ BOOL app_work_start(APP_WORK_CTX *ctx) {
 }
 
 static BOOL post_work_text_kind(UINT msg, HWND target_textbox, const WCHAR *text,
-                                APP_WORK_KIND kind, int profile_index) {
+                                APP_WORK_KIND kind, int profile_index,
+                                int group_index, const WCHAR *sender,
+                                const WCHAR *sent_plaintext, const WCHAR *sent_sender,
+                                int sent_profile_index, int sent_group_index) {
     APP_WORK_MESSAGE *message = (APP_WORK_MESSAGE *)xalloc(sizeof(*message));
     if (!message) return FALSE;
     message->kind = kind;
     message->target_textbox = target_textbox;
     message->profile_index = profile_index;
+    message->group_index = group_index;
+    message->sent_profile_index = sent_profile_index;
+    message->sent_group_index = sent_group_index;
     message->text = win_dup_wide(text ? text : L"");
-    if (!message->text) {
-        xfree(message);
-        return FALSE;
-    }
+    message->sender = win_dup_wide(sender ? sender : L"");
+    if (sent_plaintext) message->sent_plaintext = win_dup_wide(sent_plaintext);
+    if (sent_sender) message->sent_sender = win_dup_wide(sent_sender);
+    if (!message->text || !message->sender ||
+        (sent_plaintext && !message->sent_plaintext) ||
+        (sent_sender && !message->sent_sender)) goto fail;
     if (!g_host.main_window || !PostMessageW(g_host.main_window, msg, 0, (LPARAM)message)) {
-        secure_free_wide(message->text);
-        xfree(message);
-        return FALSE;
+        goto fail;
     }
     return TRUE;
+fail:
+    app_work_free_message(message);
+    return FALSE;
 }
 
 static BOOL post_work_text(UINT msg, HWND target_textbox, const WCHAR *text) {
-    return post_work_text_kind(msg, target_textbox, text, 0, -1);
+    return post_work_text_kind(msg, target_textbox, text, 0, -1, -1, NULL, NULL, NULL, -1, -1);
 }
 
 static void finish_unposted_terminal_work(UINT msg) {
@@ -164,6 +181,13 @@ static BOOL worker_encrypt(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t er
                                     ctx ? ctx->target_textbox : NULL, out, err, err_cch);
 }
 
+static BOOL worker_group_encrypt(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
+    *out = NULL;
+    return app_flow_encrypt_group_message(ctx ? ctx->group_index : -1, ctx ? ctx->input : NULL,
+                                          ctx ? ctx->topic : NULL,
+                                          ctx ? ctx->target_textbox : NULL, out, err, err_cch);
+}
+
 static BOOL worker_export_key(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
     CRYPTO_BOX *box = active_box();
@@ -174,24 +198,60 @@ static BOOL worker_export_key(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t
     return app_flow_export_key(box, ctx ? ctx->target_textbox : NULL, out, err, err_cch);
 }
 
-static BOOL worker_import_key(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
+static BOOL worker_export_group(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
-    int imported_index = -1;
-    return app_flow_import_key(ctx ? ctx->input : NULL, ctx ? ctx->expected_fingerprint : NULL,
-                               ctx ? ctx->name : NULL,
-                               &imported_index, out, err, err_cch);
+    return app_flow_export_group_key(ctx ? ctx->group_index : -1,
+                                     ctx ? ctx->target_textbox : NULL, out, err, err_cch);
 }
 
-static BOOL worker_decrypt(APP_WORK_CTX *ctx, WCHAR **out, int *profile_index_out,
-                           WCHAR *err, size_t err_cch) {
+static BOOL worker_create_group(APP_WORK_CTX *ctx, WCHAR **out, int *group_index_out,
+                                WCHAR *err, size_t err_cch) {
+    *out = NULL;
+    if (group_index_out) *group_index_out = -1;
+    return app_flow_create_group(ctx ? ctx->input : NULL, ctx ? ctx->name : NULL,
+                                 ctx ? ctx->target_textbox : NULL,
+                                 group_index_out, out, err, err_cch);
+}
+
+static BOOL worker_rekey_group(APP_WORK_CTX *ctx, WCHAR **out, int *group_index_out,
+                               WCHAR *err, size_t err_cch) {
+    *out = NULL;
+    if (group_index_out) *group_index_out = ctx ? ctx->group_index : -1;
+    return app_flow_rekey_group_key(ctx ? ctx->group_index : -1,
+                                    ctx ? ctx->target_textbox : NULL, out, err, err_cch);
+}
+
+static BOOL worker_set_group_alias(APP_WORK_CTX *ctx, WCHAR **out, int *group_index_out,
+                                   WCHAR *err, size_t err_cch) {
+    *out = NULL;
+    if (group_index_out) *group_index_out = ctx ? ctx->group_index : -1;
+    return app_flow_set_group_member_alias(ctx ? ctx->group_index : -1,
+                                           ctx ? ctx->input : NULL,
+                                           ctx ? ctx->name : NULL,
+                                           out, err, err_cch);
+}
+
+static BOOL worker_import_key(APP_WORK_CTX *ctx, WCHAR **out, int *profile_index_out,
+                              int *group_index_out, WCHAR *err, size_t err_cch) {
     *out = NULL;
     if (profile_index_out) *profile_index_out = -1;
+    if (group_index_out) *group_index_out = -1;
+    return app_flow_import_key(ctx ? ctx->input : NULL, ctx ? ctx->expected_fingerprint : NULL,
+                               ctx ? ctx->name : NULL,
+                               ctx ? ctx->topic : NULL,
+                               profile_index_out, group_index_out, out, err, err_cch);
+}
+
+static BOOL worker_decrypt(APP_WORK_CTX *ctx, APP_FLOW_DECRYPT_RESULT *result,
+                           WCHAR *err, size_t err_cch) {
+    ZeroMemory(result, sizeof(*result));
+    result->profile_index = -1;
+    result->group_index = -1;
     if (!ctx || !ctx->input || !ctx->input[0]) {
         set_error(err, err_cch, L"Clipboard text is empty.");
         return FALSE;
     }
-    return app_flow_decrypt_clip_auto_profile(ctx->input, app_work_cancelled, out, profile_index_out,
-                                              err, err_cch);
+    return app_flow_decrypt_clip_auto(ctx->input, app_work_cancelled, result, err, err_cch);
 }
 
 static DWORD WINAPI work_thread_proc(LPVOID param) {
@@ -206,15 +266,36 @@ static DWORD WINAPI work_thread_proc(LPVOID param) {
     UINT terminal_msg = WM_APP_WORK_ERROR;
     const WCHAR *terminal_text = WORK_BACKGROUND_FAILED_TEXT;
     int result_profile_index = -1;
+    int result_group_index = -1;
+    APP_FLOW_DECRYPT_RESULT decrypt_result;
+    ZeroMemory(&decrypt_result, sizeof(decrypt_result));
 
     if (ctx->kind == APP_WORK_KIND_ENCRYPT) {
         work_succeeded = worker_encrypt(ctx, &result, err, ARRAYSIZE(err));
+    } else if (ctx->kind == APP_WORK_KIND_GROUP_ENCRYPT) {
+        work_succeeded = worker_group_encrypt(ctx, &result, err, ARRAYSIZE(err));
     } else if (ctx->kind == APP_WORK_KIND_EXPORT_KEY) {
         work_succeeded = worker_export_key(ctx, &result, err, ARRAYSIZE(err));
+    } else if (ctx->kind == APP_WORK_KIND_EXPORT_GROUP) {
+        work_succeeded = worker_export_group(ctx, &result, err, ARRAYSIZE(err));
+        result_group_index = ctx->group_index;
+    } else if (ctx->kind == APP_WORK_KIND_CREATE_GROUP) {
+        work_succeeded = worker_create_group(ctx, &result, &result_group_index, err, ARRAYSIZE(err));
+    } else if (ctx->kind == APP_WORK_KIND_REKEY_GROUP) {
+        work_succeeded = worker_rekey_group(ctx, &result, &result_group_index, err, ARRAYSIZE(err));
+    } else if (ctx->kind == APP_WORK_KIND_SET_GROUP_ALIAS) {
+        work_succeeded = worker_set_group_alias(ctx, &result, &result_group_index, err, ARRAYSIZE(err));
     } else if (ctx->kind == APP_WORK_KIND_IMPORT_KEY) {
-        work_succeeded = worker_import_key(ctx, &result, err, ARRAYSIZE(err));
+        work_succeeded = worker_import_key(ctx, &result, &result_profile_index,
+                                           &result_group_index, err, ARRAYSIZE(err));
     } else if (ctx->kind == APP_WORK_KIND_DECRYPT) {
-        work_succeeded = worker_decrypt(ctx, &result, &result_profile_index, err, ARRAYSIZE(err));
+        work_succeeded = worker_decrypt(ctx, &decrypt_result, err, ARRAYSIZE(err));
+        if (work_succeeded) {
+            result = decrypt_result.plain;
+            decrypt_result.plain = NULL;
+            result_profile_index = decrypt_result.profile_index;
+            result_group_index = decrypt_result.group_index;
+        }
     } else {
         set_error(err, ARRAYSIZE(err), L"Unknown background work kind.");
     }
@@ -229,10 +310,18 @@ static DWORD WINAPI work_thread_proc(LPVOID param) {
         terminal_msg = WM_APP_WORK_ERROR;
         terminal_text = err[0] ? err : WORK_BACKGROUND_FAILED_TEXT;
     }
+    BOOL should_save_sent_plaintext = terminal_msg == WM_APP_WORK_DONE &&
+        (ctx->kind == APP_WORK_KIND_ENCRYPT || ctx->kind == APP_WORK_KIND_GROUP_ENCRYPT);
     if (!post_work_text_kind(terminal_msg, ctx->target_textbox, terminal_text,
-                             ctx->kind, result_profile_index)) {
+                             ctx->kind, result_profile_index, result_group_index,
+                             decrypt_result.sender,
+                             should_save_sent_plaintext ? ctx->sent_plaintext : NULL,
+                             should_save_sent_plaintext ? ctx->sent_sender : NULL,
+                             should_save_sent_plaintext ? ctx->sent_profile_index : -1,
+                             should_save_sent_plaintext ? ctx->sent_group_index : -1)) {
         finish_unposted_terminal_work(terminal_msg);
     }
+    app_flow_free_decrypt_result(&decrypt_result);
     secure_free_wide(result);
     app_work_free_ctx(ctx);
     return 0;

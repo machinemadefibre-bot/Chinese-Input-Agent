@@ -41,7 +41,7 @@ This does not mean the project can bypass moderation, platform rules, or legal p
 ## What It Can Do Today
 
 - Exchange a contact public-key package once, then encrypt future messages to that contact.
-- Protect message content with a per-message ephemeral X25519 sender key and authenticated symmetric encryption; Double Ratchet-style forward secrecy is not implemented yet.
+- Protect message content with a session transport and authenticated symmetric encryption; Double Ratchet-style forward secrecy is not implemented yet.
 - Generate Chinese carrier text locally with a Qwen GGUF model through llama.cpp.
 - Encode ciphertext with a top-k token carrier and recover it with the same tokenizer.
 - Prefer CUDA, fall back to Vulkan, and then fall back to CPU.
@@ -65,6 +65,8 @@ ChineseInputAgent.exe
 ```
 
 On first launch, the app creates a local profile and asks Windows Hello to unlock the local key. For two-computer communication, exchange contact packages in the import/export key window first. After that, choose a contact at the top of the main window, type plaintext, encrypt it, and send the generated Chinese article through any text channel you control.
+
+Exchange text includes an 8-character base32 fingerprint for comparison through a trusted channel. It is not strong authentication by itself.
 
 To decrypt a message, copy the whole article you received and click decrypt. The app will try the local contacts and decrypt the matching payload.
 

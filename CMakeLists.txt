@@ -14,9 +14,13 @@ set(APP_SOURCES
   src/app_shared.c
   src/app_storage.c
   src/app_profiles.c
+  src/app_groups.c
   src/app_archive.c
   src/app_llm.c
   src/app_flow.c
+  src/app_carrier_flow.c
+  src/app_contact_flow.c
+  src/app_message_flow.c
   src/app_work.c
   src/ui_key_transfer.c
   src/ui_name_prompt.c

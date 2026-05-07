@@ -13,13 +13,13 @@ static WCHAR *archive_dup_wide(const WCHAR *s) {
     if (copy) CopyMemory(copy, s ? s : L"", (len + 1) * sizeof(WCHAR));
     return copy;
 }
-static BOOL build_archive_record(const KEY_PROFILE *profile, const WCHAR *sender,
+static BOOL build_archive_record(const WCHAR *profile_name, const WCHAR *sender,
                                  const WCHAR *plain, WCHAR **out) {
     *out = NULL;
     SYSTEMTIME st;
     GetLocalTime(&st);
     const WCHAR *display_sender = sender && sender[0] ? sender :
-        (profile && profile->name[0] ? profile->name : L"\u672a\u547d\u540d");
+        (profile_name && profile_name[0] ? profile_name : L"\u672a\u547d\u540d");
     WSTRB record_builder = {0};
     if (!wstrb_appendf(&record_builder, L"[%04u-%02u-%02u %02u:%02u:%02u] \u53d1\u9001\u4eba\uff1a%s\r\n",
                        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
@@ -142,15 +142,71 @@ cleanup:
     return sort_output_built;
 }
 
-BOOL archive_append_text(const KEY_PROFILE *profile, const WCHAR *sender, const WCHAR *plain,
+typedef struct ARCHIVE_APPEND_CTX {
+    const WCHAR *path;
+    char *record_utf8;
+    DWORD record_len;
+} ARCHIVE_APPEND_CTX;
+
+static BOOL archive_append_with_master(const BYTE master_key[APP_PROFILE_MASTER_KEY_BYTES],
+                                       void *user, WCHAR *err, size_t err_cch) {
+    ARCHIVE_APPEND_CTX *ctx = (ARCHIVE_APPEND_CTX *)user;
+    BYTE *file = NULL;
+    DWORD file_len = 0;
+    BYTE *old = NULL;
+    DWORD old_len = 0;
+    BOOL archive_exists = file_exists_w(ctx->path);
+    if (read_file_bytes(ctx->path, &file, &file_len)) {
+        if (!local_aes_gcm_decrypt(master_key, file, file_len, &old, &old_len)) {
+            xfree(file);
+            set_error(err, err_cch, L"Archive file exists but could not be decrypted.");
+            return FALSE;
+        }
+        xfree(file);
+    } else if (archive_exists) {
+        set_error(err, err_cch, L"Archive file exists but could not be read.");
+        return FALSE;
+    }
+
+    if (ctx->record_len > 0xffffffffu - old_len) {
+        secure_free(old, old_len);
+        set_error(err, err_cch, L"Archive data is too large.");
+        return FALSE;
+    }
+    DWORD total = old_len + ctx->record_len;
+    BYTE *merged = (BYTE *)xalloc(total ? total : 1);
+    if (!merged) {
+        secure_free(old, old_len);
+        set_error(err, err_cch, L"Out of memory while updating archive.");
+        return FALSE;
+    }
+    if (old && old_len) CopyMemory(merged, old, old_len);
+    CopyMemory(merged + old_len, ctx->record_utf8, ctx->record_len);
+    BYTE *protected_blob = NULL;
+    DWORD protected_len = 0;
+    BOOL archive_write_succeeded = local_aes_gcm_encrypt(master_key, merged, total, &protected_blob, &protected_len) &&
+                                   write_file_bytes_atomic(ctx->path, protected_blob, protected_len);
+    secure_free(protected_blob, protected_len);
+    secure_free(old, old_len);
+    secure_free(merged, total);
+    if (!archive_write_succeeded) {
+        set_error(err, err_cch, L"Failed to encrypt or write archive.");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+BOOL archive_append_text(int profile_index, const WCHAR *sender, const WCHAR *plain,
                          WCHAR *err, size_t err_cch) {
     WCHAR path[MAX_PATH];
-    if (!profiles_get_archive_path(profile, path, ARRAYSIZE(path))) {
+    WCHAR profile_name[128] = L"";
+    if (!profiles_get_archive_path_by_index(profile_index, path, ARRAYSIZE(path))) {
         set_error(err, err_cch, L"Archive path is not available.");
         return FALSE;
     }
+    profiles_get_name_copy(profile_index, profile_name, ARRAYSIZE(profile_name));
     WCHAR *record = NULL;
-    if (!build_archive_record(profile, sender, plain, &record)) {
+    if (!build_archive_record(profile_name, sender, plain, &record)) {
         set_error(err, err_cch, L"Failed to build archive record.");
         return FALSE;
     }
@@ -162,61 +218,55 @@ BOOL archive_append_text(const KEY_PROFILE *profile, const WCHAR *sender, const 
         return FALSE;
     }
     secure_free_wide(record);
-
-    BYTE *file = NULL;
-    DWORD file_len = 0;
-    BYTE *old = NULL;
-    DWORD old_len = 0;
-    BOOL archive_exists = file_exists_w(path);
-    if (read_file_bytes(path, &file, &file_len)) {
-        if (!local_aes_gcm_decrypt(profile->master_key, file, file_len, &old, &old_len)) {
-            xfree(file);
-            secure_free_str(record_utf8);
-            set_error(err, err_cch, L"Archive file exists but could not be decrypted.");
-            return FALSE;
-        }
-        xfree(file);
-    } else if (archive_exists) {
+    if (record_len < 0) {
         secure_free_str(record_utf8);
-        set_error(err, err_cch, L"Archive file exists but could not be read.");
-        return FALSE;
-    }
-
-    if (record_len < 0 || (DWORD)record_len > 0xffffffffu - old_len) {
-        secure_free_str(record_utf8);
-        secure_free(old, old_len);
         set_error(err, err_cch, L"Archive data is too large.");
         return FALSE;
     }
-    DWORD total = old_len + (DWORD)record_len;
-    BYTE *merged = (BYTE *)xalloc(total ? total : 1);
-    if (!merged) {
-        secure_free_str(record_utf8);
-        secure_free(old, old_len);
-        set_error(err, err_cch, L"Out of memory while updating archive.");
-        return FALSE;
-    }
-    if (old && old_len) CopyMemory(merged, old, old_len);
-    CopyMemory(merged + old_len, record_utf8, (DWORD)record_len);
-    BYTE *protected_blob = NULL;
-    DWORD protected_len = 0;
-    BOOL archive_write_succeeded = local_aes_gcm_encrypt(profile->master_key, merged, total, &protected_blob, &protected_len) &&
-                                   write_file_bytes_atomic(path, protected_blob, protected_len);
-    secure_free(protected_blob, protected_len);
+
+    ARCHIVE_APPEND_CTX append_ctx;
+    append_ctx.path = path;
+    append_ctx.record_utf8 = record_utf8;
+    append_ctx.record_len = (DWORD)record_len;
+    BOOL archive_write_succeeded = profiles_with_master_key(profile_index, archive_append_with_master,
+                                                            &append_ctx, err, err_cch);
     secure_free_str(record_utf8);
-    secure_free(old, old_len);
-    secure_free(merged, total);
-    if (!archive_write_succeeded) {
-        set_error(err, err_cch, L"Failed to encrypt or write archive.");
+    return archive_write_succeeded;
+}
+
+typedef struct ARCHIVE_LOAD_CTX {
+    const BYTE *archive_blob;
+    DWORD archive_blob_len;
+    WCHAR **out;
+} ARCHIVE_LOAD_CTX;
+
+static BOOL archive_load_with_master(const BYTE master_key[APP_PROFILE_MASTER_KEY_BYTES],
+                                     void *user, WCHAR *err, size_t err_cch) {
+    ARCHIVE_LOAD_CTX *ctx = (ARCHIVE_LOAD_CTX *)user;
+    BYTE *plain = NULL;
+    DWORD plain_len = 0;
+    BOOL archive_decoded = local_aes_gcm_decrypt(master_key, ctx->archive_blob, ctx->archive_blob_len,
+                                                 &plain, &plain_len) &&
+                           utf8_to_wide_n((const char *)plain, (int)plain_len, ctx->out);
+    if (archive_decoded) {
+        WCHAR *ordered = NULL;
+        if (archive_text_oldest_first(*ctx->out, &ordered)) {
+            secure_free_wide(*ctx->out);
+            *ctx->out = ordered;
+        }
+    }
+    secure_free(plain, plain_len);
+    if (!archive_decoded) {
+        set_error(err, err_cch, L"Archive file could not be decrypted or decoded.");
         return FALSE;
     }
     return TRUE;
 }
 
-BOOL archive_load_text(const KEY_PROFILE *profile, WCHAR **out, WCHAR *err, size_t err_cch) {
+BOOL archive_load_text(int profile_index, WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
     WCHAR path[MAX_PATH];
-    if (!profiles_get_archive_path(profile, path, ARRAYSIZE(path))) {
+    if (!profiles_get_archive_path_by_index(profile_index, path, ARRAYSIZE(path))) {
         set_error(err, err_cch, L"Archive path is not available.");
         return FALSE;
     }
@@ -230,24 +280,14 @@ BOOL archive_load_text(const KEY_PROFILE *profile, WCHAR **out, WCHAR *err, size
         *out = archive_dup_wide(L"");
         return *out != NULL;
     }
-    BYTE *plain = NULL;
-    DWORD plain_len = 0;
-    BOOL archive_decoded = local_aes_gcm_decrypt(profile->master_key, archive_blob, archive_blob_len, &plain, &plain_len) &&
-                           utf8_to_wide_n((const char *)plain, (int)plain_len, out);
-    if (archive_decoded) {
-        WCHAR *ordered = NULL;
-        if (archive_text_oldest_first(*out, &ordered)) {
-            secure_free_wide(*out);
-            *out = ordered;
-        }
-    }
+    ARCHIVE_LOAD_CTX load_ctx;
+    load_ctx.archive_blob = archive_blob;
+    load_ctx.archive_blob_len = archive_blob_len;
+    load_ctx.out = out;
+    BOOL archive_decoded = profiles_with_master_key(profile_index, archive_load_with_master,
+                                                    &load_ctx, err, err_cch);
     xfree(archive_blob);
-    secure_free(plain, plain_len);
-    if (!archive_decoded) {
-        set_error(err, err_cch, L"Archive file could not be decrypted or decoded.");
-        return FALSE;
-    }
-    return TRUE;
+    return archive_decoded;
 }
 
 

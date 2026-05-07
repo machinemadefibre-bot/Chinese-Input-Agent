@@ -126,6 +126,8 @@ N bytes ciphertext
 
 密钥交换通过 contact package 完成。首次包较短；回复包会包含 recipient public key，用于自动路由到已有本地 profile。普通消息不再携带 X25519 public key。
 
+密钥交换文本里的指纹是 8 位 base32，只用于通过可信渠道核对指纹，不是强认证。
+
 ## 安全边界
 
 中文文章只是载体，不是安全层。真正保护消息的是本地加密层。
