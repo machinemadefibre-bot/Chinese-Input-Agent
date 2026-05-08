@@ -18,6 +18,7 @@ void app_groups_shutdown(void);
 int app_groups_count(void);
 const WCHAR *app_groups_name(int index);
 BOOL app_groups_get_display_name(int index, WCHAR *out, size_t cch);
+BOOL app_groups_get_id(int index, uint64_t *out);
 BOOL app_groups_get_message_seed(int index, WCHAR *out, size_t cch);
 BOOL app_groups_get_local_sender_label(int index, WCHAR *out, size_t cch);
 
@@ -45,6 +46,10 @@ BOOL app_groups_decrypt_message(const BYTE *message, DWORD message_len,
                                 WCHAR **plain_out, WCHAR **sender_out,
                                 int *group_index_out,
                                 WCHAR *err, size_t err_cch);
+BOOL app_groups_decrypt_message_ex(const BYTE *message, DWORD message_len,
+                                   WCHAR **plain_out, WCHAR **sender_out,
+                                   int *group_index_out, uint32_t *sender_id_out,
+                                   WCHAR *err, size_t err_cch);
 
 BOOL app_groups_archive_append_text(int index, const WCHAR *sender, const WCHAR *plain,
                                     WCHAR *err, size_t err_cch);

@@ -157,18 +157,14 @@ BOOL app_contact_flow_set_group_member_alias(int group_index, const WCHAR *sende
     return app_groups_set_member_alias(group_index, sender_id_hex, alias, out, err, err_cch);
 }
 
-BOOL app_contact_flow_import_key(const WCHAR *carrier, const WCHAR *expected_fingerprint,
-                                 const WCHAR *name, const WCHAR *group_name,
-                                 int *active_index_out, int *group_index_out,
-                                 WCHAR **out_message, WCHAR *err, size_t err_cch) {
+static BOOL import_decoded_key_package(BYTE *pkg, DWORD pkg_len,
+                                       const WCHAR *expected_fingerprint,
+                                       const WCHAR *name, const WCHAR *group_name,
+                                       int *active_index_out, int *group_index_out,
+                                       WCHAR **out_message, WCHAR *err, size_t err_cch) {
     if (active_index_out) *active_index_out = -1;
     if (group_index_out) *group_index_out = -1;
     *out_message = NULL;
-    BYTE *pkg = NULL;
-    DWORD pkg_len = 0;
-    if (!app_carrier_decode_exchange_package(carrier, &pkg, &pkg_len, err, err_cch)) {
-        return FALSE;
-    }
     if (app_groups_is_package(pkg, pkg_len)) {
         WCHAR fingerprint[32] = L"";
         if (!app_groups_package_fingerprint(pkg, pkg_len, fingerprint, ARRAYSIZE(fingerprint), err, err_cch)) {
@@ -300,4 +296,55 @@ BOOL app_contact_flow_import_key(const WCHAR *carrier, const WCHAR *expected_fin
     profiles_get_name_copy(imported_index, final_name, ARRAYSIZE(final_name));
     return build_key_import_success_message(final_name[0] ? final_name : name,
                                             fingerprint, out_message, err, err_cch);
+}
+
+BOOL app_contact_flow_import_key(const WCHAR *carrier, const WCHAR *expected_fingerprint,
+                                 const WCHAR *name, const WCHAR *group_name,
+                                 int *active_index_out, int *group_index_out,
+                                 WCHAR **out_message, WCHAR *err, size_t err_cch) {
+    if (active_index_out) *active_index_out = -1;
+    if (group_index_out) *group_index_out = -1;
+    *out_message = NULL;
+
+    APP_LLM_DECODE_CANDIDATE *candidates = NULL;
+    DWORD candidate_count = 0;
+    if (!app_carrier_decode_exchange_package_multi(carrier, &candidates, &candidate_count, err, err_cch)) {
+        return FALSE;
+    }
+
+    WCHAR last_err[768] = L"";
+    for (DWORD candidate_idx = 0; candidate_idx < candidate_count; ++candidate_idx) {
+        BYTE *pkg = candidates[candidate_idx].payload;
+        DWORD pkg_len = candidates[candidate_idx].payload_len;
+        candidates[candidate_idx].payload = NULL;
+        candidates[candidate_idx].payload_len = 0;
+
+        WCHAR *local_message = NULL;
+        int local_active_index = -1;
+        int local_group_index = -1;
+        WCHAR local_err[768] = L"";
+        BOOL imported = import_decoded_key_package(pkg, pkg_len,
+                                                   expected_fingerprint,
+                                                   name, group_name,
+                                                   &local_active_index, &local_group_index,
+                                                   &local_message,
+                                                   local_err, ARRAYSIZE(local_err));
+        if (imported) {
+            if (active_index_out) *active_index_out = local_active_index;
+            if (group_index_out) *group_index_out = local_group_index;
+            *out_message = local_message;
+            app_llm_free_decode_candidates(candidates, candidate_count);
+            return TRUE;
+        }
+        secure_free_wide(local_message);
+        if (local_err[0]) StringCchCopyW(last_err, ARRAYSIZE(last_err), local_err);
+    }
+
+    app_llm_free_decode_candidates(candidates, candidate_count);
+    if (last_err[0]) {
+        set_error(err, err_cch, L"%s", last_err);
+    } else {
+        set_error(err, err_cch, L"No tokenizer decoded a valid key package.");
+    }
+    return FALSE;
 }

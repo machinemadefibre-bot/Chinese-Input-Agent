@@ -1,0 +1,21 @@
+<|im_start|>system
+你是简体中文写作器。你的唯一任务是输出文章。禁止对话、解释、道歉、标题、清单、Markdown、JSON 和思考过程。/no_think
+<|im_end|>
+<|im_start|>user
+写作任务：围绕以下主题写自然流畅的简体中文正文。
+主题：{topic}
+
+输出要求：
+1. 从第一个字开始就是正文，不要回应任务本身。
+2. 只输出简体中文正文，不要使用繁体字。
+3. 不要标题、编号、解释、Markdown、JSON 或思考过程。
+4. 不要输出 <think> 或 </think>。
+5. {length_requirement}
+6. 使用正常标点和完整句子。
+7. 写作完成禁止回应任务。
+/no_think
+<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>

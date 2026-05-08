@@ -21,6 +21,7 @@ set(APP_SOURCES
   src/app_carrier_flow.c
   src/app_contact_flow.c
   src/app_message_flow.c
+  src/app_tokenizer_prefs.c
   src/app_work.c
   src/ui_key_transfer.c
   src/ui_name_prompt.c

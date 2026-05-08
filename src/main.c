@@ -9,6 +9,7 @@
 #include "app_groups.h"
 #include "app_archive.h"
 #include "app_flow.h"
+#include "app_tokenizer_prefs.h"
 #include "app_work.h"
 #include "ui_overlay.h"
 #include "ui_ids.h"
@@ -1003,7 +1004,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
         app_llm_cleanup();
         return 1;
     }
+    if (!app_tokenizer_prefs_load(err, ARRAYSIZE(err))) {
+        app_groups_shutdown();
+        profiles_shutdown();
+        MessageBoxW(NULL, err, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
+        app_llm_cleanup();
+        return 1;
+    }
     if (!activate_profile(profiles_active_index(), NULL, err, ARRAYSIZE(err))) {
+        app_tokenizer_prefs_shutdown();
         app_groups_shutdown();
         profiles_shutdown();
         MessageBoxW(NULL, err, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
@@ -1012,6 +1021,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     }
     if (!register_windows()) {
         close_active_crypto();
+        app_tokenizer_prefs_shutdown();
         app_groups_shutdown();
         profiles_shutdown();
         MessageBoxW(NULL, UI_TEXT_WINDOW_INIT_FAILED, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
@@ -1025,6 +1035,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
                                     NULL, NULL, instance, NULL);
     if (!g_main_window) {
         close_active_crypto();
+        app_tokenizer_prefs_shutdown();
         app_groups_shutdown();
         profiles_shutdown();
         MessageBoxW(NULL, UI_TEXT_WINDOW_INIT_FAILED, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
@@ -1046,6 +1057,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
 
     app_llm_cleanup();
     close_active_crypto();
+    app_tokenizer_prefs_shutdown();
     app_groups_shutdown();
     profiles_shutdown();
     if (g_ui_font) DeleteObject(g_ui_font);

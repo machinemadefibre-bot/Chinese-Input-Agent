@@ -5,6 +5,7 @@
 #include <stddef.h>
 
 #include "app_flow.h"
+#include "app_llm.h"
 #include "crypto_box.h"
 
 BOOL app_carrier_extract_exchange_body(const WCHAR *text, APP_FLOW_EXCHANGE_KIND *kind_out,
@@ -19,6 +20,9 @@ BOOL app_carrier_encode_group_package(const BYTE *pkg, DWORD pkg_len, const WCHA
                                       HWND progress_target, WCHAR **out, WCHAR *err, size_t err_cch);
 BOOL app_carrier_decode_exchange_package(const WCHAR *carrier, BYTE **out, DWORD *out_len,
                                          WCHAR *err, size_t err_cch);
+BOOL app_carrier_decode_exchange_package_multi(const WCHAR *carrier,
+                                               APP_LLM_DECODE_CANDIDATE **out, DWORD *out_count,
+                                               WCHAR *err, size_t err_cch);
 BOOL app_carrier_get_message_seed(CRYPTO_BOX *box, WCHAR *seed, size_t seed_cch,
                                   BOOL prefer_remote, WCHAR *err, size_t err_cch);
 BOOL app_carrier_encode_message_payload(const BYTE *payload, DWORD payload_len,
@@ -28,5 +32,9 @@ BOOL app_carrier_encode_message_payload(const BYTE *payload, DWORD payload_len,
 BOOL app_carrier_decode_message_payload(const WCHAR *carrier, const WCHAR *seed,
                                         BYTE **out, DWORD *out_len,
                                         WCHAR *err, size_t err_cch);
+BOOL app_carrier_decode_message_payload_multi(const WCHAR *carrier, const WCHAR *seed,
+                                              const WCHAR *preferred_tokenizer_id,
+                                              APP_LLM_DECODE_CANDIDATE **out, DWORD *out_count,
+                                              WCHAR *err, size_t err_cch);
 
 #endif

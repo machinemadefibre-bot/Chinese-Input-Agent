@@ -924,6 +924,13 @@ BOOL app_groups_get_display_name(int index, WCHAR *out, size_t cch) {
     return SUCCEEDED(StringCchPrintfW(out, cch, L"\u7fa4\uff1a%s", group->name));
 }
 
+BOOL app_groups_get_id(int index, uint64_t *out) {
+    APP_GROUP *group = group_at(index);
+    if (!group || !out) return FALSE;
+    *out = group->group_id;
+    return TRUE;
+}
+
 BOOL app_groups_get_message_seed(int index, WCHAR *out, size_t cch) {
     APP_GROUP *group = group_at(index);
     if (!group || !out || cch == 0) return FALSE;
@@ -1459,13 +1466,14 @@ cleanup:
     return encrypted;
 }
 
-BOOL app_groups_decrypt_message(const BYTE *message, DWORD message_len,
-                                WCHAR **plain_out, WCHAR **sender_out,
-                                int *group_index_out,
-                                WCHAR *err, size_t err_cch) {
+BOOL app_groups_decrypt_message_ex(const BYTE *message, DWORD message_len,
+                                   WCHAR **plain_out, WCHAR **sender_out,
+                                   int *group_index_out, uint32_t *sender_id_out,
+                                   WCHAR *err, size_t err_cch) {
     *plain_out = NULL;
     *sender_out = NULL;
     if (group_index_out) *group_index_out = -1;
+    if (sender_id_out) *sender_id_out = 0;
     if (!message || message_len < APP_GROUP_MESSAGE_OVERHEAD_BYTES || message[0] != GROUP_MESSAGE_FORMAT) {
         set_error(err, err_cch, L"Invalid group message format.");
         return FALSE;
@@ -1606,6 +1614,7 @@ BOOL app_groups_decrypt_message(const BYTE *message, DWORD message_len,
         goto rollback;
     }
     if (group_index_out) *group_index_out = group_index;
+    if (sender_id_out) *sender_id_out = sender_id;
     decrypted = TRUE;
     goto cleanup;
 
@@ -1631,6 +1640,14 @@ cleanup:
     SecureZeroMemory(temp_skipped, sizeof(temp_skipped));
     SecureZeroMemory(&backup_chain, sizeof(backup_chain));
     return decrypted;
+}
+
+BOOL app_groups_decrypt_message(const BYTE *message, DWORD message_len,
+                                WCHAR **plain_out, WCHAR **sender_out,
+                                int *group_index_out,
+                                WCHAR *err, size_t err_cch) {
+    return app_groups_decrypt_message_ex(message, message_len, plain_out, sender_out,
+                                         group_index_out, NULL, err, err_cch);
 }
 
 static WCHAR *dup_wide(const WCHAR *text) {

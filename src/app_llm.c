@@ -91,6 +91,7 @@ static BOOL append_json_wide_field(STRB *request_builder, const char *name, cons
 static BOOL build_worker_request_json(STRB *request_builder, DWORD id, const char *cmd,
                                       const WCHAR *payload_path, const WCHAR *text_path,
                                       const WCHAR *topic_path, const WCHAR *seed,
+                                      const WCHAR *prompt_template, const WCHAR *preferred_tokenizer,
                                       const WCHAR *out_path, int tail_tokens) {
     ZeroMemory(request_builder, sizeof(*request_builder));
     if (!strb_appendf(request_builder, "{\"id\":%lu,\"cmd\":\"%s\"", (unsigned long)id, cmd)) return FALSE;
@@ -98,6 +99,8 @@ static BOOL build_worker_request_json(STRB *request_builder, DWORD id, const cha
     if (text_path && !append_json_wide_field(request_builder, "text", text_path, TRUE)) return FALSE;
     if (topic_path && !append_json_wide_field(request_builder, "topic_file", topic_path, TRUE)) return FALSE;
     if (seed && !append_json_wide_field(request_builder, "seed", seed, TRUE)) return FALSE;
+    if (prompt_template && prompt_template[0] && !append_json_wide_field(request_builder, "prompt_template", prompt_template, TRUE)) return FALSE;
+    if (preferred_tokenizer && preferred_tokenizer[0] && !append_json_wide_field(request_builder, "preferred_tokenizer", preferred_tokenizer, TRUE)) return FALSE;
     if (out_path && !append_json_wide_field(request_builder, "out", out_path, TRUE)) return FALSE;
     if (tail_tokens >= 0 && !strb_appendf(request_builder, ",\"tail_tokens\":%d", tail_tokens)) return FALSE;
     return strb_append(request_builder, "}\n");
@@ -407,7 +410,8 @@ fail:
 }
 
 static BOOL local_llm_worker_request(const char *cmd, const WCHAR *payload_path, const WCHAR *text_path,
-                                     const WCHAR *topic_path, const WCHAR *seed, const WCHAR *out_path,
+                                     const WCHAR *topic_path, const WCHAR *seed, const WCHAR *prompt_template,
+                                     const WCHAR *preferred_tokenizer, const WCHAR *out_path,
                                      int tail_tokens, HWND progress_target, WCHAR *err, size_t err_cch) {
     if (!g_llm_worker.lock_ready) {
         set_error(err, err_cch, L"Local top-k worker manager is not initialized.");
@@ -432,7 +436,8 @@ static BOOL local_llm_worker_request(const char *cmd, const WCHAR *payload_path,
 
     DWORD id = ++g_llm_worker.next_id;
     STRB request = {0};
-    if (!build_worker_request_json(&request, id, cmd, payload_path, text_path, topic_path, seed, out_path, tail_tokens)) {
+    if (!build_worker_request_json(&request, id, cmd, payload_path, text_path, topic_path, seed,
+                                   prompt_template, preferred_tokenizer, out_path, tail_tokens)) {
         strb_free(&request);
         set_error(err, err_cch, L"Failed to build local top-k worker request.");
         LeaveCriticalSection(&g_llm_worker.lock);
@@ -544,7 +549,7 @@ void shutdown_local_llm_worker(void) {
 }
 
 BOOL local_topk_encode_payload(const BYTE *payload, DWORD payload_len, const WCHAR *seed, const WCHAR *topic,
-                                      const WCHAR *prefix, int tail_tokens, HWND progress_target,
+                                      const WCHAR *prompt_template, const WCHAR *prefix, int tail_tokens, HWND progress_target,
                                       WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
     if ((!payload && payload_len) || !seed || !seed[0]) {
@@ -568,7 +573,8 @@ BOOL local_topk_encode_payload(const BYTE *payload, DWORD payload_len, const WCH
     }
 
     WCHAR worker_err[512] = L"";
-    BOOL ran = local_llm_worker_request("encode", payload_path, NULL, topic_path, seed, out_path, tail_tokens, progress_target,
+    BOOL ran = local_llm_worker_request("encode", payload_path, NULL, topic_path, seed, prompt_template, NULL,
+                                        out_path, tail_tokens, progress_target,
                                         worker_err, ARRAYSIZE(worker_err));
     if (!ran) {
         if (app_llm_cancelled()) {
@@ -634,7 +640,7 @@ BOOL local_topk_decode_payload(const WCHAR *carrier, const WCHAR *seed, BYTE **o
     }
 
     WCHAR worker_err[512] = L"";
-    BOOL ran = local_llm_worker_request("decode", NULL, text_path, NULL, seed, out_path, -1, NULL,
+    BOOL ran = local_llm_worker_request("decode", NULL, text_path, NULL, seed, NULL, NULL, out_path, -1, NULL,
                                         worker_err, ARRAYSIZE(worker_err));
     if (!ran) {
         if (app_llm_cancelled()) {
@@ -654,6 +660,138 @@ BOOL local_topk_decode_payload(const WCHAR *carrier, const WCHAR *seed, BYTE **o
 
     *out = payload;
     *out_len = payload_len;
+    secure_delete_file(text_path);
+    secure_delete_file(out_path);
+    return TRUE;
+
+fail:
+    secure_delete_file(text_path);
+    secure_delete_file(out_path);
+    return FALSE;
+}
+
+static BOOL read_u32_le_bytes(const BYTE *data, DWORD len, DWORD *pos, DWORD *out) {
+    if (!data || !pos || !out || *pos > len || len - *pos < 4) return FALSE;
+    const BYTE *p = data + *pos;
+    *out = (DWORD)p[0] | ((DWORD)p[1] << 8) | ((DWORD)p[2] << 16) | ((DWORD)p[3] << 24);
+    *pos += 4;
+    return TRUE;
+}
+
+void app_llm_free_decode_candidates(APP_LLM_DECODE_CANDIDATE *candidates, DWORD count) {
+    if (!candidates) return;
+    for (DWORD candidate_idx = 0; candidate_idx < count; ++candidate_idx) {
+        secure_free_wide(candidates[candidate_idx].tokenizer_id);
+        secure_free(candidates[candidate_idx].payload, candidates[candidate_idx].payload_len);
+    }
+    secure_free(candidates, count * sizeof(APP_LLM_DECODE_CANDIDATE));
+}
+
+static BOOL parse_decode_candidates(const BYTE *data, DWORD len,
+                                    APP_LLM_DECODE_CANDIDATE **out, DWORD *out_count,
+                                    WCHAR *err, size_t err_cch) {
+    static const BYTE magic[8] = { 'C', 'I', 'A', 'T', 'K', 'M', '1', 0 };
+    APP_LLM_DECODE_CANDIDATE *candidates = NULL;
+    DWORD count = 0;
+    DWORD pos = sizeof(magic);
+    *out = NULL;
+    *out_count = 0;
+    if (!data || len < sizeof(magic) + 4 || memcmp(data, magic, sizeof(magic)) != 0 ||
+        !read_u32_le_bytes(data, len, &pos, &count) || count > 64) {
+        set_error(err, err_cch, L"Local top-k worker returned an invalid tokenizer candidate file.");
+        return FALSE;
+    }
+    candidates = (APP_LLM_DECODE_CANDIDATE *)xalloc(count ? count * sizeof(APP_LLM_DECODE_CANDIDATE) : sizeof(APP_LLM_DECODE_CANDIDATE));
+    if (!candidates) {
+        set_error(err, err_cch, L"Operation failed.");
+        return FALSE;
+    }
+    for (DWORD candidate_idx = 0; candidate_idx < count; ++candidate_idx) {
+        DWORD tokenizer_len = 0;
+        DWORD payload_len = 0;
+        if (!read_u32_le_bytes(data, len, &pos, &tokenizer_len) ||
+            tokenizer_len == 0 || tokenizer_len > 128 || pos > len || len - pos < tokenizer_len) {
+            set_error(err, err_cch, L"Local top-k worker returned an invalid tokenizer candidate.");
+            app_llm_free_decode_candidates(candidates, count);
+            return FALSE;
+        }
+        if (!utf8_to_wide_n((const char *)(data + pos), (int)tokenizer_len, &candidates[candidate_idx].tokenizer_id)) {
+            set_error(err, err_cch, L"Local top-k worker returned an invalid tokenizer id.");
+            app_llm_free_decode_candidates(candidates, count);
+            return FALSE;
+        }
+        pos += tokenizer_len;
+        if (!read_u32_le_bytes(data, len, &pos, &payload_len) ||
+            payload_len > APP_MAX_READ_FILE_BYTES || pos > len || len - pos < payload_len) {
+            set_error(err, err_cch, L"Local top-k worker returned an invalid tokenizer payload.");
+            app_llm_free_decode_candidates(candidates, count);
+            return FALSE;
+        }
+        candidates[candidate_idx].payload = (BYTE *)xalloc(payload_len ? payload_len : 1);
+        if (!candidates[candidate_idx].payload) {
+            set_error(err, err_cch, L"Operation failed.");
+            app_llm_free_decode_candidates(candidates, count);
+            return FALSE;
+        }
+        if (payload_len) CopyMemory(candidates[candidate_idx].payload, data + pos, payload_len);
+        candidates[candidate_idx].payload_len = payload_len;
+        pos += payload_len;
+    }
+    if (pos != len) {
+        set_error(err, err_cch, L"Local top-k worker returned trailing tokenizer candidate bytes.");
+        app_llm_free_decode_candidates(candidates, count);
+        return FALSE;
+    }
+    *out = candidates;
+    *out_count = count;
+    return TRUE;
+}
+
+BOOL local_topk_decode_payload_multi(const WCHAR *carrier, const WCHAR *seed, const WCHAR *preferred_tokenizer_id,
+                                     APP_LLM_DECODE_CANDIDATE **out, DWORD *out_count,
+                                     WCHAR *err, size_t err_cch) {
+    *out = NULL;
+    *out_count = 0;
+    if (!carrier || !carrier[0] || !seed || !seed[0]) {
+        set_error(err, err_cch, L"Invalid local top-k decode request.");
+        return FALSE;
+    }
+
+    WCHAR text_path[MAX_PATH] = L"";
+    WCHAR out_path[MAX_PATH] = L"";
+    if (!make_temp_path(text_path, ARRAYSIZE(text_path)) ||
+        !make_temp_path(out_path, ARRAYSIZE(out_path))) {
+        set_error(err, err_cch, L"Operation failed.");
+        goto fail;
+    }
+    if (!write_text_utf8_file(text_path, carrier)) {
+        set_error(err, err_cch, L"Operation failed.");
+        goto fail;
+    }
+
+    WCHAR worker_err[512] = L"";
+    BOOL ran = local_llm_worker_request("decode_multi", NULL, text_path, NULL, seed, NULL,
+                                        preferred_tokenizer_id, out_path, -1, NULL,
+                                        worker_err, ARRAYSIZE(worker_err));
+    if (!ran) {
+        if (app_llm_cancelled()) {
+            if (!err[0]) StringCchCopyW(err, err_cch, L"\u5df2\u505c\u6b62\u3002");
+            goto fail;
+        }
+        StringCchCopyW(err, err_cch, worker_err[0] ? worker_err : L"Local top-k worker returned no usable result.");
+        goto fail;
+    }
+
+    BYTE *candidate_file = NULL;
+    DWORD candidate_file_len = 0;
+    if (!read_file_bytes(out_path, &candidate_file, &candidate_file_len)) {
+        set_error(err, err_cch, L"Operation failed.");
+        goto fail;
+    }
+    BOOL parsed = parse_decode_candidates(candidate_file, candidate_file_len, out, out_count, err, err_cch);
+    secure_free(candidate_file, candidate_file_len);
+    if (!parsed) goto fail;
+
     secure_delete_file(text_path);
     secure_delete_file(out_path);
     return TRUE;

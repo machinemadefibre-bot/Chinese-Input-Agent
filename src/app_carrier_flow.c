@@ -8,11 +8,13 @@
 /* Carrier protocol text and seeds. Keep stable for existing encoded key/message payloads. */
 static const WCHAR KEY_PACKAGE_PREFIX_START[] = L"\u4f60\u597d\uff0c\u6211\u662f\u7f16\u53f7";
 static const WCHAR KEY_PACKAGE_PREFIX_END[] = L"\uff0c\u8fd9\u662f\u6211\u7684\u81ea\u6211\u4ecb\u7ecd\u3002";
-static const WCHAR GROUP_PACKAGE_PREFIX_START[] = L"\u4f60\u597d\uff0c\u8fd9\u662f\u7fa4\u804a\u7f16\u53f7";
-static const WCHAR GROUP_PACKAGE_PREFIX_END[] = L"\uff0c\u8fd9\u662f\u7fa4\u804a\u9080\u8bf7\u3002";
+static const WCHAR GROUP_PACKAGE_PREFIX_START[] = L"\u4f60\u597d\uff01\u6211\u4eec\u7684\u793e\u56e2\u7f16\u53f7\u662f";
+static const WCHAR GROUP_PACKAGE_PREFIX_END[] = L"\u3002\u8fd9\u662f\u6211\u4eec\u793e\u56e2\u7684\u4ecb\u7ecd\u3002";
 static const WCHAR KEY_PACKAGE_TOPK_SEED[] = L"ChineseInputAgent key-exchange top-k payload v1";
 static const WCHAR CONTACT_KEY_PACKAGE_TOPIC[] = L"\u6c42\u804c\u81ea\u6211\u4ecb\u7ecd";
-static const WCHAR GROUP_KEY_PACKAGE_TOPIC[] = L"\u793e\u56e2\u62db\u65b0";
+static const WCHAR GROUP_KEY_PACKAGE_TOPIC[] = L"\u793e\u56e2\u62db\u65b0\u7b80\u4ecb\u3001\u793e\u56e2\u4ecb\u7ecd";
+static const WCHAR CONTACT_KEY_PROMPT_TEMPLATE[] = L"self_intro";
+static const WCHAR GROUP_KEY_PROMPT_TEMPLATE[] = L"group_key";
 static const size_t KEY_PACKAGE_FINGERPRINT_CHARS = 8;
 
 static WCHAR *carrier_dup_wide(const WCHAR *s) {
@@ -102,6 +104,7 @@ static BOOL encode_exchange_package(const BYTE *pkg, DWORD pkg_len,
                                     const WCHAR *prefix_start,
                                     const WCHAR *prefix_end,
                                     const WCHAR *topic,
+                                    const WCHAR *prompt_template,
                                     HWND progress_target,
                                     WCHAR **out,
                                     WCHAR *err,
@@ -114,7 +117,7 @@ static BOOL encode_exchange_package(const BYTE *pkg, DWORD pkg_len,
         set_error(err, err_cch, L"Failed to build exchange package prefix.");
         return FALSE;
     }
-    BOOL package_encoded = local_topk_encode_payload(pkg, pkg_len, KEY_PACKAGE_TOPK_SEED, topic,
+    BOOL package_encoded = local_topk_encode_payload(pkg, pkg_len, KEY_PACKAGE_TOPK_SEED, topic, prompt_template,
                                                      prefix.data, -1, progress_target, out, err, err_cch);
     wstrb_free(&prefix);
     return package_encoded;
@@ -124,19 +127,27 @@ BOOL app_carrier_encode_contact_package(const BYTE *pkg, DWORD pkg_len, const WC
                                         HWND progress_target, WCHAR **out, WCHAR *err, size_t err_cch) {
     return encode_exchange_package(pkg, pkg_len, fingerprint,
                                    KEY_PACKAGE_PREFIX_START, KEY_PACKAGE_PREFIX_END,
-                                   CONTACT_KEY_PACKAGE_TOPIC, progress_target, out, err, err_cch);
+                                   CONTACT_KEY_PACKAGE_TOPIC, CONTACT_KEY_PROMPT_TEMPLATE,
+                                   progress_target, out, err, err_cch);
 }
 
 BOOL app_carrier_encode_group_package(const BYTE *pkg, DWORD pkg_len, const WCHAR *fingerprint,
                                       HWND progress_target, WCHAR **out, WCHAR *err, size_t err_cch) {
     return encode_exchange_package(pkg, pkg_len, fingerprint,
                                    GROUP_PACKAGE_PREFIX_START, GROUP_PACKAGE_PREFIX_END,
-                                   GROUP_KEY_PACKAGE_TOPIC, progress_target, out, err, err_cch);
+                                   GROUP_KEY_PACKAGE_TOPIC, GROUP_KEY_PROMPT_TEMPLATE,
+                                   progress_target, out, err, err_cch);
 }
 
 BOOL app_carrier_decode_exchange_package(const WCHAR *carrier, BYTE **out, DWORD *out_len,
                                          WCHAR *err, size_t err_cch) {
     return local_topk_decode_payload(carrier, KEY_PACKAGE_TOPK_SEED, out, out_len, err, err_cch);
+}
+
+BOOL app_carrier_decode_exchange_package_multi(const WCHAR *carrier,
+                                               APP_LLM_DECODE_CANDIDATE **out, DWORD *out_count,
+                                               WCHAR *err, size_t err_cch) {
+    return local_topk_decode_payload_multi(carrier, KEY_PACKAGE_TOPK_SEED, NULL, out, out_count, err, err_cch);
 }
 
 static BOOL append_hex_bytes(WCHAR *dst, size_t dst_cch, size_t offset, const BYTE *bytes, DWORD len) {
@@ -188,7 +199,7 @@ BOOL app_carrier_encode_message_payload(const BYTE *payload, DWORD payload_len,
                                         const WCHAR *seed, const WCHAR *topic,
                                         HWND progress_target, WCHAR **out,
                                         WCHAR *err, size_t err_cch) {
-    return local_topk_encode_payload(payload, payload_len, seed, topic, NULL, -1,
+    return local_topk_encode_payload(payload, payload_len, seed, topic, NULL, NULL, -1,
                                      progress_target, out, err, err_cch);
 }
 
@@ -196,4 +207,11 @@ BOOL app_carrier_decode_message_payload(const WCHAR *carrier, const WCHAR *seed,
                                         BYTE **out, DWORD *out_len,
                                         WCHAR *err, size_t err_cch) {
     return local_topk_decode_payload(carrier, seed, out, out_len, err, err_cch);
+}
+
+BOOL app_carrier_decode_message_payload_multi(const WCHAR *carrier, const WCHAR *seed,
+                                              const WCHAR *preferred_tokenizer_id,
+                                              APP_LLM_DECODE_CANDIDATE **out, DWORD *out_count,
+                                              WCHAR *err, size_t err_cch) {
+    return local_topk_decode_payload_multi(carrier, seed, preferred_tokenizer_id, out, out_count, err, err_cch);
 }

@@ -386,6 +386,12 @@ BOOL profiles_get_name_copy(int index, WCHAR *out, size_t cch) {
     return SUCCEEDED(StringCchCopyW(out, cch, profile->name));
 }
 
+BOOL profiles_get_id_copy(int index, WCHAR *out, size_t cch) {
+    KEY_PROFILE *profile = profile_at(index);
+    if (!profile || !out || cch == 0) return FALSE;
+    return SUCCEEDED(StringCchCopyW(out, cch, profile->id));
+}
+
 BOOL profiles_set_name(int index, const WCHAR *name, WCHAR *err, size_t err_cch) {
     KEY_PROFILE *profile = profile_at(index);
     if (!profile) {

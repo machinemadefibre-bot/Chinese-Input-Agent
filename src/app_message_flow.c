@@ -4,6 +4,7 @@
 #include "app_groups.h"
 #include "app_profiles.h"
 #include "app_shared.h"
+#include "app_tokenizer_prefs.h"
 
 #include <strsafe.h>
 
@@ -117,30 +118,44 @@ BOOL app_message_flow_decrypt_clip_auto(const WCHAR *clip, APP_FLOW_CANCEL_FN ca
         }
         WCHAR seed[256] = L"";
         if (!app_groups_get_message_seed(group_index, seed, ARRAYSIZE(seed))) continue;
-        BYTE *group_sealed = NULL;
-        DWORD group_sealed_len = 0;
         WCHAR local_err[768] = L"";
-        if (!app_carrier_decode_message_payload(clip, seed, &group_sealed, &group_sealed_len,
-                                                local_err, ARRAYSIZE(local_err))) {
+        WCHAR preferred_tokenizer[APP_TOKENIZER_ID_CCH] = L"";
+        APP_LLM_DECODE_CANDIDATE *candidates = NULL;
+        DWORD candidate_count = 0;
+        app_tokenizer_prefs_get_group_recent(group_index, preferred_tokenizer, ARRAYSIZE(preferred_tokenizer));
+        if (!app_carrier_decode_message_payload_multi(clip, seed,
+                                                      preferred_tokenizer[0] ? preferred_tokenizer : NULL,
+                                                      &candidates, &candidate_count,
+                                                      local_err, ARRAYSIZE(local_err))) {
             if (local_err[0]) StringCchCopyW(group_last_err, ARRAYSIZE(group_last_err), local_err);
             continue;
         }
-        WCHAR *plain_w = NULL;
-        WCHAR *sender_w = NULL;
-        int decrypted_group_index = -1;
-        BOOL group_decrypted = app_groups_decrypt_message(group_sealed, group_sealed_len,
-                                                          &plain_w, &sender_w, &decrypted_group_index,
-                                                          local_err, ARRAYSIZE(local_err));
-        secure_free(group_sealed, group_sealed_len);
-        if (group_decrypted) {
-            result->plain = plain_w;
-            result->sender = sender_w;
-            result->group_index = decrypted_group_index;
-            result->is_group = TRUE;
-            return TRUE;
+        for (DWORD candidate_idx = 0; candidate_idx < candidate_count; ++candidate_idx) {
+            WCHAR *plain_w = NULL;
+            WCHAR *sender_w = NULL;
+            int decrypted_group_index = -1;
+            uint32_t sender_id = 0;
+            BOOL group_decrypted = app_groups_decrypt_message_ex(candidates[candidate_idx].payload,
+                                                                 candidates[candidate_idx].payload_len,
+                                                                 &plain_w, &sender_w,
+                                                                 &decrypted_group_index, &sender_id,
+                                                                 local_err, ARRAYSIZE(local_err));
+            if (group_decrypted) {
+                if (candidates[candidate_idx].tokenizer_id && candidates[candidate_idx].tokenizer_id[0]) {
+                    app_tokenizer_prefs_set_group_recent(decrypted_group_index, candidates[candidate_idx].tokenizer_id);
+                    app_tokenizer_prefs_set_group_sender(decrypted_group_index, sender_id, candidates[candidate_idx].tokenizer_id);
+                }
+                app_llm_free_decode_candidates(candidates, candidate_count);
+                result->plain = plain_w;
+                result->sender = sender_w;
+                result->group_index = decrypted_group_index;
+                result->is_group = TRUE;
+                return TRUE;
+            }
+            secure_free_wide(plain_w);
+            secure_free_wide(sender_w);
         }
-        secure_free_wide(plain_w);
-        secure_free_wide(sender_w);
+        app_llm_free_decode_candidates(candidates, candidate_count);
         if (local_err[0]) StringCchCopyW(group_last_err, ARRAYSIZE(group_last_err), local_err);
     }
 
@@ -172,14 +187,17 @@ BOOL app_message_flow_decrypt_clip_auto(const WCHAR *clip, APP_FLOW_CANCEL_FN ca
             continue;
         }
 
-        WCHAR *plain_w = NULL;
         WCHAR seed[256] = L"";
-        BYTE *local_sealed = NULL;
-        DWORD local_sealed_len = 0;
+        WCHAR preferred_tokenizer[APP_TOKENIZER_ID_CCH] = L"";
+        APP_LLM_DECODE_CANDIDATE *candidates = NULL;
+        DWORD candidate_count = 0;
         BOOL have_local_payload = FALSE;
         if (app_carrier_get_message_seed(box, seed, ARRAYSIZE(seed), FALSE, local_err, ARRAYSIZE(local_err))) {
-            have_local_payload = app_carrier_decode_message_payload(clip, seed, &local_sealed, &local_sealed_len,
-                                                                    local_decode_err, ARRAYSIZE(local_decode_err));
+            app_tokenizer_prefs_get_profile(index, preferred_tokenizer, ARRAYSIZE(preferred_tokenizer));
+            have_local_payload = app_carrier_decode_message_payload_multi(clip, seed,
+                                                                          preferred_tokenizer[0] ? preferred_tokenizer : NULL,
+                                                                          &candidates, &candidate_count,
+                                                                          local_decode_err, ARRAYSIZE(local_decode_err));
             if (!have_local_payload) {
                 if (local_decode_err[0]) {
                     saw_local_decode_error = TRUE;
@@ -190,17 +208,28 @@ BOOL app_message_flow_decrypt_clip_auto(const WCHAR *clip, APP_FLOW_CANCEL_FN ca
             }
         }
         if (have_local_payload) saw_local_payload = TRUE;
-        BOOL decrypt_succeeded = have_local_payload &&
-            decrypt_sealed_with_box(box, local_sealed, local_sealed_len, &plain_w, local_err, ARRAYSIZE(local_err));
-        crypto_box_close(box);
-        secure_free(local_sealed, local_sealed_len);
-        if (decrypt_succeeded) {
-            result->plain = plain_w;
-            result->profile_index = index;
-            result->is_group = FALSE;
-            profiles_lock_inactive_masters();
-            return TRUE;
+        for (DWORD candidate_idx = 0; candidate_idx < candidate_count; ++candidate_idx) {
+            WCHAR *plain_w = NULL;
+            BOOL decrypt_succeeded = decrypt_sealed_with_box(box,
+                                                             candidates[candidate_idx].payload,
+                                                             candidates[candidate_idx].payload_len,
+                                                             &plain_w, local_err, ARRAYSIZE(local_err));
+            if (decrypt_succeeded) {
+                if (candidates[candidate_idx].tokenizer_id && candidates[candidate_idx].tokenizer_id[0]) {
+                    app_tokenizer_prefs_set_profile(index, candidates[candidate_idx].tokenizer_id);
+                }
+                crypto_box_close(box);
+                app_llm_free_decode_candidates(candidates, candidate_count);
+                result->plain = plain_w;
+                result->profile_index = index;
+                result->is_group = FALSE;
+                profiles_lock_inactive_masters();
+                return TRUE;
+            }
+            secure_free_wide(plain_w);
         }
+        crypto_box_close(box);
+        app_llm_free_decode_candidates(candidates, candidate_count);
         StringCchCopyW(last_err, ARRAYSIZE(last_err), local_err[0] ? local_err : L"");
     }
     profiles_lock_inactive_masters();

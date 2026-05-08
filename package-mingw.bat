@@ -22,6 +22,13 @@ mkdir "%DIST%\tools"
 mkdir "%DIST%\tools\payload_watermark"
 copy /y build\llama_worker_package\*.exe "%DIST%\tools\payload_watermark\" >nul
 copy /y build\llama_worker_package\*.dll "%DIST%\tools\payload_watermark\" >nul
+mkdir "%DIST%\tools\payload_watermark\prompts"
+copy /y tools\payload_watermark\prompts\*.txt "%DIST%\tools\payload_watermark\prompts\" >nul
+if exist build\llama_worker_package\tokenizers (
+  mkdir "%DIST%\tools\payload_watermark\tokenizers"
+  xcopy /y /i /q build\llama_worker_package\tokenizers\* "%DIST%\tools\payload_watermark\tokenizers\" >nul
+)
+copy /y tools\payload_watermark\worker_config.txt "%DIST%\tools\payload_watermark\worker_config.txt" >nul
 
 mkdir "%DIST%\models"
 (

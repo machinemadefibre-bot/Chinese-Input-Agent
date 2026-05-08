@@ -12,11 +12,13 @@
 #include <cstring>
 #include <cctype>
 #include <filesystem>
+#include <future>
 #include <functional>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <sstream>
@@ -31,15 +33,76 @@ namespace fs = std::filesystem;
 
 static constexpr int DEFAULT_RADIX = 4;
 static constexpr uintmax_t MAX_WORKER_FILE_BYTES = 128ull * 1024ull * 1024ull;
-static const std::string SELF_INTRO_TOPIC_UTF8 =
-    "\xE8\x87\xAA" "\xE6\x88\x91" "\xE4\xBB\x8B" "\xE7\xBB\x8D";
-static const std::string TOPK_PROMPT =
-    "<|im_start|>user\n"
-    "写一篇自然流畅的中文随笔。\n"
-    "要求：只输出简体中文正文，不要使用繁体字，不要标题，不要提纲，不要编号，不要解释，不要输出思考过程，不要输出<think>。\n"
-    "内容可以围绕日常见闻、学习生活、人际交流和个人感受自然展开，句子要通顺，有正常标点。\n"
+static const std::string DEFAULT_PROMPT_TEMPLATE =
+    "<|im_start|>system\n"
+    "你是简体中文正文写作器。你的唯一任务是输出正文。禁止对话、解释、道歉、标题、清单、Markdown、JSON 和思考过程。/no_think\n"
     "<|im_end|>\n"
-    "<|im_start|>assistant\n";
+    "<|im_start|>user\n"
+    "写作任务：围绕以下主题写自然流畅的简体中文正文。\n"
+    "主题：{topic}\n\n"
+    "输出要求：\n"
+    "1. 从第一个字开始就是正文，不要回应任务本身。\n"
+    "2. 只输出简体中文正文，不要使用繁体字。\n"
+    "3. 不要标题、提纲、编号、解释、Markdown、JSON 或思考过程。\n"
+    "4. 不要输出 <think> 或 </think>。\n"
+    "5. {length_requirement}\n"
+    "6. 使用正常标点和完整句子。\n"
+    "/no_think\n"
+    "<|im_end|>\n"
+    "<|im_start|>assistant\n"
+    "<think>\n\n</think>\n\n";
+static const std::string GROUP_KEY_PROMPT_TEMPLATE =
+    "<|im_start|>system\n"
+    "你是简体中文正文写作器。你的唯一任务是输出正文。禁止对话、解释、道歉、标题、清单、Markdown、JSON 和思考过程。/no_think\n"
+    "<|im_end|>\n"
+    "<|im_start|>user\n"
+    "写作任务：写一段社团招新简介或社团介绍正文。\n"
+    "主题：{topic}\n\n"
+    "输出要求：\n"
+    "1. 从第一个字开始就是正文，不要回应任务本身。\n"
+    "2. 只输出简体中文正文，不要使用繁体字。\n"
+    "3. 内容像社团招新简介或社团介绍，语气自然可信。\n"
+    "4. 不要标题、提纲、编号、解释、Markdown、JSON 或思考过程。\n"
+    "5. 不要输出 <think> 或 </think>。\n"
+    "6. {length_requirement}\n"
+    "7. 使用正常标点和完整句子。\n"
+    "/no_think\n"
+    "<|im_end|>\n"
+    "<|im_start|>assistant\n"
+    "<think>\n\n</think>\n\n";
+static const std::string SELF_INTRO_PROMPT_TEMPLATE =
+    "<|im_start|>system\n"
+    "你是简体中文正文写作器。你的唯一任务是输出正文。禁止对话、解释、道歉、标题、清单、Markdown、JSON 和思考过程。/no_think\n"
+    "<|im_end|>\n"
+    "<|im_start|>user\n"
+    "写作任务：写一段第一人称求职自我介绍正文。\n\n"
+    "输出要求：\n"
+    "1. 从第一个字开始就是正文，不要回应任务本身。\n"
+    "2. 只输出简体中文正文，不要使用繁体字。\n"
+    "3. 从头到尾保持第一人称自我介绍主题。\n"
+    "4. 可以自然写身份、日常生活、学习、兴趣、性格和与人交流的方式。\n"
+    "5. 不要标题、提纲、编号、解释、Markdown、JSON 或思考过程。\n"
+    "6. 不要输出 <think> 或 </think>。\n"
+    "7. {length_requirement}\n"
+    "8. 使用正常标点和完整句子。\n"
+    "/no_think\n"
+    "<|im_end|>\n"
+    "<|im_start|>assistant\n"
+    "<think>\n\n</think>\n\n";
+
+static const std::string OUTLINE_PROMPT_TEMPLATE =
+    "<|im_start|>system\n"
+    "You write a short Simplified Chinese planning outline. Output only the outline. /no_think\n"
+    "<|im_end|>\n"
+    "<|im_start|>user\n"
+    "Write an internal outline for the final Chinese article.\n"
+    "Template: {prompt_template}\n"
+    "Topic: {topic}\n"
+    "Length target: {length_requirement}\n"
+    "Use 3 to 5 short lines. Do not write the final article. /no_think\n"
+    "<|im_end|>\n"
+    "<|im_start|>assistant\n"
+    "<think>\n\n</think>\n\n";
 static std::string ascii_lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
@@ -65,32 +128,204 @@ static std::string clean_prompt_topic(std::string topic) {
     return topic;
 }
 
-static std::string build_topk_prompt(const std::string & topic) {
-    std::string clean = clean_prompt_topic(topic);
-    if (clean.find(SELF_INTRO_TOPIC_UTF8) != std::string::npos || contains_ci(clean, "self-introduction")) {
-        return std::string("<|im_start|>user\n") +
-            "Write a first-person Chinese self-introduction.\n\n"
-            "Requirements:\n"
-            "1. Output Simplified Chinese prose only. Do not use Traditional Chinese characters.\n"
-            "2. Stay on the self-introduction topic from beginning to end.\n"
-            "3. Write naturally about identity, daily life, learning, interests, personality, and how you communicate with others.\n"
-            "4. Do not output a title, outline, numbering, explanation, Markdown, JSON, or thinking process.\n"
-            "5. Do not output <think> or </think>.\n"
-            "6. Use normal punctuation and complete sentences.\n"
-            "<|im_end|>\n"
-            "<|im_start|>assistant\n";
+struct PromptLengthBounds {
+    size_t lower_chars = 0;
+    size_t upper_chars = 0;
+};
+
+struct PromptLengthConfig {
+    int min_chars_floor = 48;
+    float payload_digit_multiplier = 1.3333334f;
+    int upper_tail_extra_chars = 160;
+    float upper_lower_multiplier = 2.0f;
+    int upper_extra_chars = 80;
+};
+
+static PromptLengthBounds prompt_length_bounds(size_t payload_digits,
+                                               int tail_budget,
+                                               const PromptLengthConfig & config) {
+    PromptLengthBounds bounds;
+    const double payload_scaled = std::ceil(static_cast<double>(payload_digits) *
+                                            static_cast<double>(config.payload_digit_multiplier));
+    bounds.lower_chars = std::max<size_t>(static_cast<size_t>(std::max(0, config.min_chars_floor)),
+                                          static_cast<size_t>(std::max(0.0, payload_scaled)));
+    bounds.upper_chars = bounds.lower_chars + static_cast<size_t>(std::max(0, tail_budget)) +
+                         static_cast<size_t>(std::max(0, config.upper_tail_extra_chars));
+    const double upper_scaled = std::ceil(static_cast<double>(bounds.lower_chars) *
+                                          static_cast<double>(config.upper_lower_multiplier));
+    bounds.upper_chars = std::max(bounds.upper_chars,
+                                  static_cast<size_t>(std::max(0.0, upper_scaled)) +
+                                  static_cast<size_t>(std::max(0, config.upper_extra_chars)));
+    return bounds;
+}
+
+static std::string format_length_requirement(const PromptLengthBounds & bounds) {
+    return "字数：至少 " + std::to_string(bounds.lower_chars) + " 个汉字，最多约 " +
+           std::to_string(bounds.upper_chars) + " 个汉字。";
+}
+
+static void replace_all(std::string & text, const std::string & needle, const std::string & replacement) {
+    if (needle.empty()) return;
+    size_t pos = 0;
+    while ((pos = text.find(needle, pos)) != std::string::npos) {
+        text.replace(pos, needle.size(), replacement);
+        pos += replacement.size();
     }
-    return std::string("<|im_start|>user\n") +
-        "Write a natural, fluent Chinese prose text about this topic:\n" +
-        clean +
-        "\n\nRequirements:\n"
-        "1. Output Simplified Chinese prose only. Do not use Traditional Chinese characters.\n"
-        "2. Do not output a title, outline, numbering, explanation, Markdown, JSON, or thinking process.\n"
-        "3. Do not output <think> or </think>.\n"
-        "4. Use normal punctuation and complete sentences.\n"
-        "5. If the topic is self-introduction, write in first person as a normal self-introduction.\n"
-        "<|im_end|>\n"
-        "<|im_start|>assistant\n";
+}
+
+static std::string trim_ascii(std::string text) {
+    auto is_ws = [](unsigned char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+    while (!text.empty() && is_ws(static_cast<unsigned char>(text.front()))) text.erase(text.begin());
+    while (!text.empty() && is_ws(static_cast<unsigned char>(text.back()))) text.pop_back();
+    return text;
+}
+
+static std::vector<std::string> split_csv_list(const std::string & text) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t comma = text.find(',', pos);
+        std::string item = trim_ascii(comma == std::string::npos ? text.substr(pos) : text.substr(pos, comma - pos));
+        if (!item.empty()) out.push_back(item);
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return out;
+}
+
+static bool append_unique_string(std::vector<std::string> & list, const std::string & value) {
+    if (value.empty()) return false;
+    if (std::find(list.begin(), list.end(), value) != list.end()) return false;
+    list.push_back(value);
+    return true;
+}
+
+static bool read_utf8_template_file(const fs::path & path, std::string & out) {
+    out.clear();
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return false;
+    file.seekg(0, std::ios::end);
+    std::streamoff size = file.tellg();
+    if (size <= 0 || size > 256 * 1024) return false;
+    file.seekg(0, std::ios::beg);
+    out.resize(static_cast<size_t>(size));
+    if (!file.read(&out[0], size)) {
+        out.clear();
+        return false;
+    }
+    if (out.size() >= 3 &&
+        static_cast<unsigned char>(out[0]) == 0xef &&
+        static_cast<unsigned char>(out[1]) == 0xbb &&
+        static_cast<unsigned char>(out[2]) == 0xbf) {
+        out.erase(0, 3);
+    }
+    return !out.empty();
+}
+
+static std::vector<std::string> read_line_list_file(const fs::path & path) {
+    std::string text;
+    std::vector<std::string> lines;
+    if (!read_utf8_template_file(path, text)) return lines;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t end = text.find('\n', pos);
+        std::string line = trim_ascii(end == std::string::npos ? text.substr(pos) : text.substr(pos, end - pos));
+        if (!line.empty() && line[0] != '#') lines.push_back(line);
+        if (end == std::string::npos) break;
+        pos = end + 1;
+    }
+    return lines;
+}
+
+static std::string sanitize_prompt_template_name(std::string name) {
+    if (name.empty()) return "default";
+    std::string sanitized;
+    for (unsigned char c : name) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '-') {
+            sanitized.push_back(static_cast<char>(c));
+        }
+    }
+    return sanitized.empty() ? "default" : sanitized;
+}
+
+static std::string load_prompt_template(const std::string & prompt_dir,
+                                        const std::string & template_name,
+                                        const std::string & fallback_template) {
+    std::string loaded_template;
+    if (!prompt_dir.empty() &&
+        read_utf8_template_file(fs::path(prompt_dir) / (template_name + ".txt"), loaded_template)) {
+        return loaded_template;
+    }
+    return fallback_template;
+}
+
+static const std::string & fallback_prompt_template(const std::string & template_name) {
+    if (template_name == "self_intro") return SELF_INTRO_PROMPT_TEMPLATE;
+    if (template_name == "group_key") return GROUP_KEY_PROMPT_TEMPLATE;
+    return DEFAULT_PROMPT_TEMPLATE;
+}
+
+static std::string load_outline_prompt_template(const std::string & prompt_dir,
+                                                const std::string & template_name) {
+    std::string loaded_template;
+    if (!prompt_dir.empty() &&
+        read_utf8_template_file(fs::path(prompt_dir) / (template_name + "_outline.txt"), loaded_template)) {
+        return loaded_template;
+    }
+    if (!prompt_dir.empty() &&
+        read_utf8_template_file(fs::path(prompt_dir) / "outline.txt", loaded_template)) {
+        return loaded_template;
+    }
+    return OUTLINE_PROMPT_TEMPLATE;
+}
+
+static void inject_outline_context(std::string & prompt, const std::string & outline) {
+    if (outline.empty()) return;
+    const std::string outline_block = "\nWriting outline reference. Do not output the outline:\n" + outline + "\n";
+    const std::string assistant_marker = "\n<|im_end|>\n<|im_start|>assistant";
+    size_t pos = prompt.rfind(assistant_marker);
+    if (pos != std::string::npos) {
+        prompt.insert(pos, outline_block);
+    } else {
+        prompt += outline_block;
+    }
+}
+
+static std::string build_topk_prompt(const std::string & topic,
+                                     size_t payload_digits,
+                                     int tail_budget,
+                                     const PromptLengthConfig & length_config,
+                                     const std::string & prompt_dir,
+                                     const std::string & prompt_template_name,
+                                     const std::string & outline) {
+    std::string clean = clean_prompt_topic(topic);
+    PromptLengthBounds bounds = prompt_length_bounds(payload_digits, tail_budget, length_config);
+    std::string template_name = sanitize_prompt_template_name(prompt_template_name);
+    std::string prompt = load_prompt_template(prompt_dir, template_name, fallback_prompt_template(template_name));
+    const bool has_outline_placeholder = prompt.find("{outline}") != std::string::npos;
+    replace_all(prompt, "{topic}", clean);
+    replace_all(prompt, "{length_requirement}", format_length_requirement(bounds));
+    replace_all(prompt, "{min_chars}", std::to_string(bounds.lower_chars));
+    replace_all(prompt, "{max_chars}", std::to_string(bounds.upper_chars));
+    replace_all(prompt, "{outline}", outline);
+    if (!has_outline_placeholder) inject_outline_context(prompt, outline);
+    return prompt;
+}
+
+static std::string build_outline_prompt(const std::string & topic,
+                                        const std::string & prompt_template_name,
+                                        const PromptLengthBounds & bounds,
+                                        const std::string & prompt_dir) {
+    std::string clean = clean_prompt_topic(topic);
+    std::string template_name = sanitize_prompt_template_name(prompt_template_name);
+    std::string prompt = load_outline_prompt_template(prompt_dir, template_name);
+    replace_all(prompt, "{topic}", clean);
+    replace_all(prompt, "{prompt_template}", template_name);
+    replace_all(prompt, "{length_requirement}", format_length_requirement(bounds));
+    replace_all(prompt, "{min_chars}", std::to_string(bounds.lower_chars));
+    replace_all(prompt, "{max_chars}", std::to_string(bounds.upper_chars));
+    return prompt;
 }
 
 struct Sha256 {
@@ -227,6 +462,34 @@ static void write_text_file(const std::string & path, const std::string & text) 
     if (!text.empty() && !f.write(text.data(), static_cast<std::streamsize>(text.size()))) {
         throw std::runtime_error("写入输出文件失败：" + path);
     }
+}
+
+struct DecodeCandidate {
+    std::string tokenizer_id;
+    std::vector<uint8_t> payload;
+};
+
+static void append_u32_le(std::vector<uint8_t> & out, uint32_t value) {
+    out.push_back(static_cast<uint8_t>(value & 0xffu));
+    out.push_back(static_cast<uint8_t>((value >> 8) & 0xffu));
+    out.push_back(static_cast<uint8_t>((value >> 16) & 0xffu));
+    out.push_back(static_cast<uint8_t>((value >> 24) & 0xffu));
+}
+
+static void write_decode_candidates_file(const std::string & path, const std::vector<DecodeCandidate> & candidates) {
+    std::vector<uint8_t> data;
+    data.insert(data.end(), {'C', 'I', 'A', 'T', 'K', 'M', '1', '\0'});
+    append_u32_le(data, static_cast<uint32_t>(candidates.size()));
+    for (const auto & candidate : candidates) {
+        if (candidate.tokenizer_id.size() > 0xffffffffu || candidate.payload.size() > 0xffffffffu) {
+            throw std::runtime_error("decode candidate output is too large");
+        }
+        append_u32_le(data, static_cast<uint32_t>(candidate.tokenizer_id.size()));
+        data.insert(data.end(), candidate.tokenizer_id.begin(), candidate.tokenizer_id.end());
+        append_u32_le(data, static_cast<uint32_t>(candidate.payload.size()));
+        data.insert(data.end(), candidate.payload.begin(), candidate.payload.end());
+    }
+    write_binary(path, data);
 }
 
 static void append_utf8(std::string & out, uint32_t cp) {
@@ -718,6 +981,11 @@ static bool contains_any_phrase(const std::string & text, const std::vector<std:
     return false;
 }
 
+static bool contains_runtime_reject_phrase(const std::string & text, const std::string & prompt_dir) {
+    if (prompt_dir.empty()) return false;
+    return contains_any_phrase(text, read_line_list_file(fs::path(prompt_dir) / "reject_phrases.txt"));
+}
+
 static bool has_enough_article_before(const std::string & text, size_t pos, size_t min_cjk = 260) {
     if (pos == std::string::npos || pos == 0) return false;
     return cjk_count(text.substr(0, pos)) >= min_cjk;
@@ -929,23 +1197,45 @@ static std::string clean_generated_article(std::string text) {
     return trim_text(text);
 }
 
-static bool looks_like_instruction_reply(const std::string & text) {
+static bool looks_like_instruction_reply(const std::string & text, const std::string & prompt_dir) {
     if (looks_like_meta_or_compliance_text(text)) return true;
     std::string head = text.substr(0, std::min<size_t>(text.size(), 1800));
+    if (contains_runtime_reject_phrase(head, prompt_dir)) return true;
     if (contains_any_phrase(head, {
             "请提供具体", "请提供更多", "请提供完整", "提供具体的写作需求", "写作需求",
             "这是一个关于", "这是一篇关于", "建议文章吗", "完整的长篇文章",
             "我可以继续", "我会继续", "继续为你", "进一步处理", "开始处理",
             "如果你希望", "如果你需要", "是否要", "是否需要", "你希望我",
-            "请确认", "请告诉我", "让我们从", "我们可以先"
+            "请确认", "请告诉我", "让我们从", "我们可以先",
+            "抱歉", "对不起", "纠正之前", "纠正前文", "正确的自我介绍",
+            "这是正确的", "以下是"
         })) {
         return true;
     }
     std::string tail = text.size() > 2200 ? text.substr(text.size() - 2200) : text;
+    if (contains_runtime_reject_phrase(tail, prompt_dir)) return true;
     return contains_any_phrase(tail, {
         "以上是我", "以上就是", "完整正文所有内容", "字数约", "满足写作助手",
         "请您继续处理", "请继续处理", "请确认", "是否完成此请求", "是否有新的要求",
         "如果不需要继续", "直接输入", "不写内容", "最终输出文档", "即可执行"
+    });
+}
+
+static bool disallowed_article_continuation(const std::string & generated_text,
+                                            const std::string & piece,
+                                            const std::vector<std::string> & reject_phrases) {
+    if (contains_bracket(piece) || piece.find("<|") != std::string::npos) return true;
+    std::string probe = generated_text + piece;
+    std::string tail = probe.size() > 4096 ? probe.substr(probe.size() - 4096) : probe;
+    if (looks_like_meta_or_compliance_text(tail)) return true;
+    if (contains_any_phrase(tail, reject_phrases)) return true;
+    return contains_any_phrase(tail, {
+        "如果你", "如果您", "你有任何", "您有任何", "对你有", "对您有",
+        "欢迎直接问", "欢迎随时", "祝你", "祝您", "简要版本",
+        "请放心提问", "提问和解答", "写作需求的满足",
+        "if you", "if i", "i can", "i will", "i would", "this response",
+        "for instance", "as an example", "the output could", "your instructions",
+        "requirements", "happy to be of service", "this is an example"
     });
 }
 struct ScoredToken {
@@ -1059,10 +1349,32 @@ public:
     int n_threads = std::max(2u, std::thread::hardware_concurrency());
     int free_tail_tokens = 64;
     int min_tail_tokens = 0;
-    float temperature = 0.68f;
-    float top_p = 0.88f;
-    int top_k = 128;
+    int max_tail_tokens = 64;
+    float temperature = 0.7f;
+    float top_p = 0.8f;
+    int top_k = 20;
     int min_k = 64;
+    PromptLengthConfig length_config;
+    int encode_attempts = 5;
+    int retry_seed_stride = 9973;
+    int progress_interval_ms = 1000;
+    int batch_min_tokens = 512;
+    int context_keep_tokens = 256;
+    int rolling_context_tokens = 768;
+    int context_shift_margin = 128;
+    int self_check_initial_digits = 32;
+    int self_check_interval_digits = 32;
+    int self_check_tail_chars = 4096;
+    bool outline_enabled = true;
+    int outline_tokens = 96;
+    int outline_min_chars = 24;
+    int outline_context_extra_tokens = 64;
+    std::string prompt_dir;
+    std::string tokenizer_id = "model";
+    std::string tokenizer_dir;
+    std::vector<std::string> decode_tokenizers;
+    std::map<std::string, std::string> tokenizer_paths;
+    int decode_threads = 4;
     std::string backend_preference = "auto";
     std::string backend_used = "cpu";
 
@@ -1072,8 +1384,20 @@ public:
     std::map<std::string, TokenTable> table_cache;
     ggml_backend_dev_t selected_devices[2] = { nullptr, nullptr };
 
+    struct LoadedTokenizer {
+        std::string id;
+        llama_model * model = nullptr;
+        const llama_vocab * vocab = nullptr;
+        bool primary = false;
+    };
+    std::vector<LoadedTokenizer> loaded_tokenizers;
+    std::mutex tokenizer_lock;
+
     ~LlamaPayloadWorker() {
         if (adapter) llama_adapter_lora_free(adapter);
+        for (auto & tokenizer : loaded_tokenizers) {
+            if (!tokenizer.primary && tokenizer.model) llama_model_free(tokenizer.model);
+        }
         if (model) llama_model_free(model);
     }
 
@@ -1226,6 +1550,63 @@ public:
             adapter = llama_adapter_lora_init(model, adapter_path.c_str());
             if (!adapter) throw std::runtime_error("无法加载 LoRA adapter：" + adapter_path);
         }
+        LoadedTokenizer primary;
+        primary.id = tokenizer_id.empty() ? "model" : tokenizer_id;
+        primary.model = model;
+        primary.vocab = vocab;
+        primary.primary = true;
+        loaded_tokenizers.push_back(primary);
+    }
+
+    llama_model * load_vocab_only_model(const std::string & path) const {
+        llama_model_params mp = llama_model_default_params();
+        mp.vocab_only = true;
+        mp.n_gpu_layers = 0;
+        return llama_model_load_from_file(path.c_str(), mp);
+    }
+
+    std::string tokenizer_file_for_id(const std::string & id) const {
+        auto mapped = tokenizer_paths.find(id);
+        if (mapped != tokenizer_paths.end()) return mapped->second;
+        fs::path base = tokenizer_dir.empty() ? fs::path("tokenizers") : fs::path(tokenizer_dir);
+        fs::path candidate = base / (id + ".gguf");
+        return candidate.string();
+    }
+
+    const llama_vocab * vocab_for_tokenizer(const std::string & id) {
+        std::lock_guard<std::mutex> guard(tokenizer_lock);
+        std::string wanted = id.empty() ? (tokenizer_id.empty() ? "model" : tokenizer_id) : id;
+        for (const auto & tokenizer : loaded_tokenizers) {
+            if (tokenizer.id == wanted) return tokenizer.vocab;
+        }
+        std::string path = tokenizer_file_for_id(wanted);
+        std::error_code ec;
+        if (!fs::exists(fs::path(path), ec) || ec) {
+            throw std::runtime_error("tokenizer asset not found: " + wanted);
+        }
+        llama_model * tokenizer_model = load_vocab_only_model(path);
+        if (!tokenizer_model) throw std::runtime_error("failed to load tokenizer asset: " + wanted);
+        const llama_vocab * tokenizer_vocab = llama_model_get_vocab(tokenizer_model);
+        if (!tokenizer_vocab) {
+            llama_model_free(tokenizer_model);
+            throw std::runtime_error("tokenizer asset has no vocab: " + wanted);
+        }
+        LoadedTokenizer loaded;
+        loaded.id = wanted;
+        loaded.model = tokenizer_model;
+        loaded.vocab = tokenizer_vocab;
+        loaded.primary = false;
+        loaded_tokenizers.push_back(loaded);
+        return loaded.vocab;
+    }
+
+    std::vector<std::string> ordered_decode_tokenizers(const std::string & preferred) const {
+        std::vector<std::string> ordered;
+        append_unique_string(ordered, preferred);
+        append_unique_string(ordered, tokenizer_id.empty() ? "model" : tokenizer_id);
+        for (const auto & id : decode_tokenizers) append_unique_string(ordered, id);
+        for (const auto & entry : tokenizer_paths) append_unique_string(ordered, entry.first);
+        return ordered;
     }
 
     TokenTable & table_for_seed(const std::string & seed) {
@@ -1252,6 +1633,75 @@ public:
         add_sampler(llama_sampler_init_temp(temperature), "temperature");
         add_sampler(llama_sampler_init_dist(seed), "distribution");
         return smpl;
+    }
+
+    int sample_free_text_token(llama_sampler * smpl, const float * logits) const {
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+        std::vector<llama_token_data> data;
+        data.reserve(static_cast<size_t>(n_vocab));
+        for (int token = 0; token < n_vocab; ++token) {
+            if (llama_vocab_is_control(vocab, token) && !llama_vocab_is_eog(vocab, token)) continue;
+            data.push_back({token, logits[token], 0.0f});
+        }
+        if (data.empty()) throw std::runtime_error("outline sampler has no candidate tokens");
+        llama_token_data_array cur{data.data(), data.size(), -1, false};
+        llama_sampler_apply(smpl, &cur);
+        if (cur.selected < 0 || static_cast<size_t>(cur.selected) >= data.size()) {
+            throw std::runtime_error("outline sampler did not select a valid token");
+        }
+        int token = data[static_cast<size_t>(cur.selected)].id;
+        llama_sampler_accept(smpl, token);
+        return token;
+    }
+
+    std::string generate_outline_once(const std::string & prompt, uint32_t sample_seed) {
+        if (!outline_enabled || outline_tokens <= 0) return {};
+        auto prompt_tokens = tokenize(vocab, prompt, false, true);
+        if (prompt_tokens.empty()) return {};
+        const int max_new = std::max(1, outline_tokens);
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = static_cast<uint32_t>(std::max(n_ctx, static_cast<int>(prompt_tokens.size()) + max_new +
+                                                  std::max(0, outline_context_extra_tokens)));
+        cp.n_batch = static_cast<uint32_t>(std::max<int>(batch_min_tokens, static_cast<int>(prompt_tokens.size())));
+        cp.n_ubatch = static_cast<uint32_t>(batch_min_tokens);
+        cp.n_threads = n_threads;
+        cp.n_threads_batch = n_threads;
+        cp.no_perf = true;
+        llama_context * ctx = llama_init_from_model(model, cp);
+        if (!ctx) return {};
+        llama_sampler * smpl = make_sampler(sample_seed);
+        std::string outline;
+        std::vector<int> generated_tokens;
+        try {
+            llama_batch batch = llama_batch_get_one(prompt_tokens.data(), static_cast<int32_t>(prompt_tokens.size()));
+            if (llama_decode(ctx, batch) != 0) throw std::runtime_error("outline prompt decode failed");
+            for (int i = 0; i < max_new; ++i) {
+                const float * logits = llama_get_logits_ith(ctx, -1);
+                if (!logits) throw std::runtime_error("outline logits unavailable");
+                int token = sample_free_text_token(smpl, logits);
+                if (llama_vocab_is_eog(vocab, token)) break;
+                std::string piece = token_piece(vocab, token);
+                if (piece.find("<|") != std::string::npos || piece.find("<think") != std::string::npos ||
+                    piece.find("</think") != std::string::npos) break;
+                generated_tokens.push_back(token);
+                outline += piece;
+                if (cjk_count(outline) >= static_cast<size_t>(std::max(0, outline_min_chars)) &&
+                    contains_sentence_break(piece)) {
+                    break;
+                }
+                batch = llama_batch_get_one(&generated_tokens.back(), 1);
+                if (llama_decode(ctx, batch) != 0) break;
+            }
+        } catch (...) {
+            llama_sampler_free(smpl);
+            llama_free(ctx);
+            return {};
+        }
+        llama_sampler_free(smpl);
+        llama_free(ctx);
+        outline = trim_text(strip_thinking_blocks(outline));
+        if (looks_like_meta_or_compliance_text(outline)) return {};
+        return outline;
     }
 
     std::vector<int> candidate_subset(const std::vector<int> & allowed, const std::vector<int> & generated_tokens,
@@ -1438,7 +1888,7 @@ public:
         std::vector<ScoredToken> stable_scored;
         stable_scored.reserve(max_limit);
         size_t tested = 0;
-        size_t test_limit = std::min(scored.size(), std::max<size_t>(max_limit * 16, 256));
+        const size_t test_limit = std::min(scored.size(), std::max<size_t>(max_limit * 16, 256));
         for (const auto & s : scored) {
             if (tested++ >= test_limit && stable_scored.size() >= std::min<size_t>(max_limit, 8)) break;
             bool stable = false;
@@ -1459,7 +1909,8 @@ public:
     int select_topk_payload_token(const std::string & seed, size_t payload_pos, int digit,
                                   const TokenTable & table, const float * logits,
                                   const std::vector<int> & generated_tokens,
-                                  const std::string & generated_text) const {
+                                  const std::string & generated_text,
+                                  const std::vector<std::string> & reject_phrases) const {
         if (digit < 0 || digit >= radix) throw std::runtime_error("top-k 载荷位超出当前进制范围");
         const size_t min_limits[] = {
             static_cast<size_t>(std::max(min_k, radix * 16)),
@@ -1475,7 +1926,9 @@ public:
             auto candidates = make_topk_code_candidates(table, logits, generated_tokens, generated_text,
                                                         max_limits[attempt], min_limits[attempt]);
             for (const auto & c : candidates) {
-                if (topk_digit_for_token(seed, payload_pos, c.token, radix) == digit) return c.token;
+                if (topk_digit_for_token(seed, payload_pos, c.token, radix) != digit) continue;
+                if (disallowed_article_continuation(generated_text, c.text, reject_phrases)) continue;
+                return c.token;
             }
         }
         throw std::runtime_error("top-k 编码器在当前模型候选集中找不到匹配载荷位的 token");
@@ -1490,13 +1943,13 @@ public:
         auto prompt_tokens = tokenize(vocab, prompt, false, true);
         if (prompt_tokens.empty()) throw std::runtime_error("top-k 生成提示词无法被 tokenizer 编码");
         const int requested_tail = tail_tokens_override >= 0 ? tail_tokens_override : free_tail_tokens;
-        const int tail_budget = std::max(0, std::min(requested_tail, 64));
+        const int tail_budget = std::max(0, std::min(requested_tail, max_tail_tokens));
         const int min_tail = std::min(std::max(0, min_tail_tokens), tail_budget);
         const int max_new = static_cast<int>(digits.size()) + tail_budget;
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = static_cast<uint32_t>(std::max(n_ctx, static_cast<int>(prompt_tokens.size()) + max_new + 64));
-        cp.n_batch = static_cast<uint32_t>(std::max<int>(512, static_cast<int>(prompt_tokens.size())));
-        cp.n_ubatch = 512;
+        cp.n_batch = static_cast<uint32_t>(std::max<int>(batch_min_tokens, static_cast<int>(prompt_tokens.size())));
+        cp.n_ubatch = static_cast<uint32_t>(batch_min_tokens);
         cp.n_threads = n_threads;
         cp.n_threads_batch = n_threads;
         cp.no_perf = true;
@@ -1504,9 +1957,13 @@ public:
         if (!ctx) throw std::runtime_error("无法创建 top-k 生成上下文");
         llama_memory_t mem = llama_get_memory(ctx);
         const bool can_shift_context = mem && llama_memory_can_shift(mem);
-        const llama_pos keep_prompt_tokens = static_cast<llama_pos>(std::min<size_t>(prompt_tokens.size(), 256));
-        const llama_pos rolling_context_tokens = 768;
+        const llama_pos keep_prompt_tokens = static_cast<llama_pos>(
+            std::min<size_t>(prompt_tokens.size(), static_cast<size_t>(std::max(0, context_keep_tokens))));
+        const llama_pos rolling_tokens = static_cast<llama_pos>(std::max(0, rolling_context_tokens));
         llama_sampler * smpl = make_sampler(sample_seed);
+        const std::vector<std::string> reject_phrases =
+            prompt_dir.empty() ? std::vector<std::string>() :
+            read_line_list_file(fs::path(prompt_dir) / "reject_phrases.txt");
         std::string generated_text;
         std::vector<int> generated_tokens;
         auto progress_start = std::chrono::steady_clock::now();
@@ -1514,7 +1971,7 @@ public:
         auto maybe_progress = [&](bool force, size_t done) {
             if (!progress_cb) return;
             auto now = std::chrono::steady_clock::now();
-            if (!force && now - last_progress < std::chrono::milliseconds(1000)) return;
+            if (!force && now - last_progress < std::chrono::milliseconds(progress_interval_ms)) return;
             last_progress = now;
             double elapsed = std::chrono::duration<double>(now - progress_start).count();
             double tps = elapsed > 0.05 ? static_cast<double>(generated_tokens.size()) / elapsed : 0.0;
@@ -1525,8 +1982,8 @@ public:
             llama_pos pos_max = llama_memory_seq_pos_max(mem, 0);
             if (pos_max < 0) return;
             const llama_pos used = pos_max + 1;
-            const llama_pos target = keep_prompt_tokens + rolling_context_tokens;
-            if (used <= target + 128) return;
+            const llama_pos target = keep_prompt_tokens + rolling_tokens;
+            if (used <= target + static_cast<llama_pos>(std::max(0, context_shift_margin))) return;
             const llama_pos discard = used - target;
             if (discard <= 0) return;
             if (llama_memory_seq_rm(mem, 0, keep_prompt_tokens, keep_prompt_tokens + discard)) {
@@ -1540,14 +1997,20 @@ public:
             for (size_t i = 0; i < digits.size(); ++i) {
                 const float * logits = llama_get_logits_ith(ctx, -1);
                 if (!logits) throw std::runtime_error("top-k 生成时无法读取模型 logits");
-                int token = select_topk_payload_token(seed, i, digits[i], table, logits, generated_tokens, generated_text);
+                int token = select_topk_payload_token(seed, i, digits[i], table, logits, generated_tokens, generated_text,
+                                                      reject_phrases);
                 llama_sampler_accept(smpl, token);
                 std::string piece = token_piece(vocab, token);
                 generated_tokens.push_back(token);
                 generated_text += piece;
-                if ((i < 32 || (i % 32) == 31 || i + 1 == digits.size()) &&
-                    (looks_like_meta_or_compliance_text(generated_text.size() > 4096 ? generated_text.substr(generated_text.size() - 4096) : generated_text) ||
-                     looks_like_instruction_reply(generated_text.size() > 4096 ? generated_text.substr(generated_text.size() - 4096) : generated_text))) {
+                const bool should_self_check =
+                    (self_check_initial_digits > 0 && i < static_cast<size_t>(self_check_initial_digits)) ||
+                    (self_check_interval_digits > 0 && (i % static_cast<size_t>(self_check_interval_digits)) ==
+                        static_cast<size_t>(self_check_interval_digits - 1)) ||
+                    i + 1 == digits.size();
+                if (should_self_check &&
+                    (looks_like_meta_or_compliance_text(generated_text.size() > static_cast<size_t>(self_check_tail_chars) ? generated_text.substr(generated_text.size() - static_cast<size_t>(self_check_tail_chars)) : generated_text) ||
+                     looks_like_instruction_reply(generated_text.size() > static_cast<size_t>(self_check_tail_chars) ? generated_text.substr(generated_text.size() - static_cast<size_t>(self_check_tail_chars)) : generated_text, prompt_dir))) {
                     throw std::runtime_error("模型生成了元说明或合规检查文本，已拒绝该候选");
                 }
                 if (contains_bracket(piece)) throw std::runtime_error("模型生成了括号类 token，已拒绝该候选");
@@ -1601,25 +2064,37 @@ public:
     }
 
     std::string encode_payload(const std::string & seed, const std::vector<uint8_t> & payload, const std::string & topic,
+                               const std::string & prompt_template_name,
                                int tail_tokens_override = -1,
                                std::string * outline_used = nullptr,
                                const std::function<void(const std::string &, size_t, size_t, double)> & progress_cb = {}) {
         TokenTable & table = table_for_seed(seed);
         if (!is_power_of_two_radix(table.radix)) throw std::runtime_error("top-k 载荷进制必须是 2、4、8 或 16");
         auto digits = encode_payload_to_digits(payload, table.radix);
-        const std::string prompt = build_topk_prompt(topic);
-        std::string last_error;
+        const int requested_tail = tail_tokens_override >= 0 ? tail_tokens_override : free_tail_tokens;
+        const int tail_budget = std::max(0, std::min(requested_tail, max_tail_tokens));
+        PromptLengthBounds bounds = prompt_length_bounds(digits.size(), tail_budget, length_config);
         uint32_t base_seed = 0;
         auto digest = topk_generation_seed_digest(seed, payload);
         for (int i = 0; i < 4; ++i) base_seed = (base_seed << 8) | digest[static_cast<size_t>(i)];
-        for (int attempt = 1; attempt <= 5; ++attempt) {
+        std::string outline_text;
+        if (outline_enabled && outline_tokens > 0) {
+            std::string outline_prompt = build_outline_prompt(topic, prompt_template_name, bounds, prompt_dir);
+            outline_text = generate_outline_once(outline_prompt, base_seed ^ 0x9e3779b9u);
+        }
+        if (outline_used) *outline_used = outline_text;
+        const std::string prompt = build_topk_prompt(topic, digits.size(), tail_budget, length_config,
+                                                     prompt_dir, prompt_template_name, outline_text);
+        std::string last_error;
+        for (int attempt = 1; attempt <= encode_attempts; ++attempt) {
             std::string text;
             try {
-                if (outline_used) *outline_used = "";
-                text = generate_topk_once(seed, digits, prompt, base_seed + static_cast<uint32_t>(attempt * 9973), tail_tokens_override, progress_cb);
+                text = generate_topk_once(seed, digits, prompt,
+                                          base_seed + static_cast<uint32_t>(attempt * retry_seed_stride),
+                                          tail_tokens_override, progress_cb);
                 auto recovered_digits = text_to_topk_digits(seed, text, table.radix);
                 auto recovered = decode_digits_to_payload(recovered_digits, table.radix);
-                if (looks_like_instruction_reply(text)) {
+                if (looks_like_instruction_reply(text, prompt_dir)) {
                     last_error = "自检拒绝：模型输出像是在请求继续指令";
                     continue;
                 }
@@ -1636,9 +2111,74 @@ public:
         throw std::runtime_error("top-k 载体文本生成失败，无法通过本地可解码性自检：" + last_error);
     }
 
-    std::vector<uint8_t> decode_payload(const std::string & seed, const std::string & text) {
-        auto digits = text_to_topk_digits(seed, text, radix);
+    std::vector<int> text_to_topk_digits_for_vocab(const llama_vocab * decode_vocab,
+                                                   const std::string & seed,
+                                                   const std::string & text) const {
+        auto text_tokens = tokenize(decode_vocab, text, false, false);
+        if (text_tokens.empty()) throw std::runtime_error("载体文本无法被 tokenizer 切分出有效 token");
+        std::vector<int> digits;
+        digits.reserve(text_tokens.size());
+        for (int token : text_tokens) {
+            digits.push_back(topk_digit_for_token(seed, digits.size(), token, radix));
+        }
+        return digits;
+    }
+
+    std::vector<uint8_t> decode_payload_for_vocab(const llama_vocab * decode_vocab,
+                                                  const std::string & seed,
+                                                  const std::string & text) const {
+        auto digits = text_to_topk_digits_for_vocab(decode_vocab, seed, text);
         return decode_digits_to_payload(digits, radix);
+    }
+
+    std::vector<uint8_t> decode_payload(const std::string & seed, const std::string & text) {
+        return decode_payload_for_vocab(vocab, seed, text);
+    }
+
+    std::vector<DecodeCandidate> decode_payload_multi(const std::string & seed,
+                                                      const std::string & text,
+                                                      const std::string & preferred_tokenizer) {
+        std::vector<std::string> tokenizers = ordered_decode_tokenizers(preferred_tokenizer);
+        if (tokenizers.empty()) append_unique_string(tokenizers, "model");
+        std::vector<DecodeCandidate> candidates;
+        std::mutex candidates_lock;
+        std::vector<std::future<void>> jobs;
+        size_t next = 0;
+        int limit = std::max(1, decode_threads);
+        auto launch_one = [&](const std::string & id) {
+            return std::async(std::launch::async, [&, id]() {
+                try {
+                    const llama_vocab * decode_vocab = vocab_for_tokenizer(id);
+                    DecodeCandidate candidate;
+                    candidate.tokenizer_id = id;
+                    candidate.payload = decode_payload_for_vocab(decode_vocab, seed, text);
+                    std::lock_guard<std::mutex> guard(candidates_lock);
+                    bool duplicate = false;
+                    for (const auto & existing : candidates) {
+                        if (existing.payload == candidate.payload) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate) candidates.push_back(std::move(candidate));
+                } catch (const std::exception &) {
+                    /* Wrong tokenizer candidates are expected; crypto authentication decides the winner. */
+                }
+            });
+        };
+        while (next < tokenizers.size() || !jobs.empty()) {
+            while (next < tokenizers.size() && jobs.size() < static_cast<size_t>(limit)) {
+                jobs.push_back(launch_one(tokenizers[next++]));
+            }
+            if (!jobs.empty()) {
+                jobs.front().get();
+                jobs.erase(jobs.begin());
+            }
+        }
+        if (candidates.empty()) {
+            throw std::runtime_error("no configured tokenizer decoded a framed top-k payload");
+        }
+        return candidates;
     }
 };
 
@@ -1651,6 +2191,12 @@ static fs::path current_path_noexcept() {
 static bool path_exists_noexcept(const fs::path & path) {
     std::error_code ec;
     bool ok = fs::exists(path, ec);
+    return ok && !ec;
+}
+
+static bool dir_exists_noexcept(const fs::path & path) {
+    std::error_code ec;
+    bool ok = fs::is_directory(path, ec);
     return ok && !ec;
 }
 
@@ -1669,6 +2215,8 @@ static std::string default_model_path(int argc, char ** argv) {
         "base_model.gguf",
         "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
         "qwen3-4b-instruct-2507-q4_k_m.gguf",
+        "Qwen3.5-2B-Q4_K_M.gguf",
+        "qwen3.5-2b-q4_k_m.gguf",
     };
     auto add_dir = [&](const fs::path & dir) {
         for (const char * name : names) candidates.push_back(dir / name);
@@ -1692,7 +2240,7 @@ static std::string default_model_path(int argc, char ** argv) {
             return (ec ? p : abs).string();
         }
     }
-    throw std::runtime_error("未找到默认 GGUF 模型文件 base_model.gguf 或 Qwen3-4B-Instruct-2507-Q4_K_M.gguf。请把模型放在 models 目录，或使用 --model 指定。");
+    throw std::runtime_error("未找到默认 GGUF 模型文件 base_model.gguf。请把模型放在 models 目录，或使用 --model 指定。");
 }
 
 static std::string default_adapter_path(char ** argv) {
@@ -1709,6 +2257,221 @@ static std::string default_adapter_path(char ** argv) {
     }
     (void) argv;
     return "";
+}
+
+static std::string default_prompt_dir(int argc, char ** argv) {
+    const char * env_path = std::getenv("CIA_PROMPT_DIR");
+    if (env_path && env_path[0]) return env_path;
+
+    fs::path cwd = current_path_noexcept();
+    fs::path exe_dir = exe_dir_path(argc, argv);
+    std::vector<fs::path> candidates = {
+        cwd / "prompts",
+        exe_dir / "prompts",
+        cwd / "tools" / "payload_watermark" / "prompts",
+        exe_dir / ".." / ".." / "tools" / "payload_watermark" / "prompts",
+    };
+    for (const auto & candidate : candidates) {
+        if (dir_exists_noexcept(candidate)) {
+            std::error_code ec;
+            fs::path abs = fs::absolute(candidate, ec);
+            return (ec ? candidate : abs).string();
+        }
+    }
+    return (cwd / "prompts").string();
+}
+
+static std::string default_tokenizer_dir(int argc, char ** argv) {
+    const char * env_path = std::getenv("CIA_TOKENIZER_DIR");
+    if (env_path && env_path[0]) return env_path;
+
+    fs::path cwd = current_path_noexcept();
+    fs::path exe_dir = exe_dir_path(argc, argv);
+    std::vector<fs::path> candidates = {
+        cwd / "tokenizers",
+        exe_dir / "tokenizers",
+        cwd / "tools" / "payload_watermark" / "tokenizers",
+        exe_dir / ".." / ".." / "tools" / "payload_watermark" / "tokenizers",
+    };
+    for (const auto & candidate : candidates) {
+        if (dir_exists_noexcept(candidate)) {
+            std::error_code ec;
+            fs::path abs = fs::absolute(candidate, ec);
+            return (ec ? candidate : abs).string();
+        }
+    }
+    return (cwd / "tokenizers").string();
+}
+
+static std::string resolve_directory_path(const std::string & configured_dir, int argc, char ** argv) {
+    if (configured_dir.empty()) return configured_dir;
+    fs::path configured_path(configured_dir);
+    if (dir_exists_noexcept(configured_path)) {
+        std::error_code ec;
+        fs::path abs = fs::absolute(configured_path, ec);
+        return (ec ? configured_path : abs).string();
+    }
+    fs::path cwd = current_path_noexcept();
+    fs::path exe_dir = exe_dir_path(argc, argv);
+    std::vector<fs::path> candidates = {
+        cwd / configured_path,
+        exe_dir / configured_path,
+        cwd / "tools" / "payload_watermark" / configured_path,
+        exe_dir / ".." / ".." / "tools" / "payload_watermark" / configured_path,
+    };
+    for (const auto & candidate : candidates) {
+        if (dir_exists_noexcept(candidate)) {
+            std::error_code ec;
+            fs::path abs = fs::absolute(candidate, ec);
+            return (ec ? candidate : abs).string();
+        }
+    }
+    return configured_dir;
+}
+
+static void apply_tokenizer_manifest(LlamaPayloadWorker & worker) {
+    if (worker.tokenizer_dir.empty()) return;
+    std::string text;
+    fs::path manifest = fs::path(worker.tokenizer_dir) / "manifest.txt";
+    if (!read_utf8_template_file(manifest, text)) return;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t end = text.find('\n', pos);
+        std::string line = trim_ascii(end == std::string::npos ? text.substr(pos) : text.substr(pos, end - pos));
+        if (!line.empty() && line[0] != '#' && line[0] != ';') {
+            size_t eq = line.find('=');
+            if (eq != std::string::npos) {
+                std::string id = trim_ascii(line.substr(0, eq));
+                std::string path = trim_ascii(line.substr(eq + 1));
+                if (!id.empty() && !path.empty() && worker.tokenizer_paths.find(id) == worker.tokenizer_paths.end()) {
+                    fs::path configured(path);
+                    worker.tokenizer_paths[id] = configured.is_absolute() ? configured.string() : (fs::path(worker.tokenizer_dir) / configured).string();
+                }
+            }
+        }
+        if (end == std::string::npos) break;
+        pos = end + 1;
+    }
+}
+
+static std::string default_worker_config_path(int argc, char ** argv) {
+    const char * env_path = std::getenv("CIA_WORKER_CONFIG");
+    if (env_path && env_path[0]) return env_path;
+
+    fs::path cwd = current_path_noexcept();
+    fs::path exe_dir = exe_dir_path(argc, argv);
+    std::vector<fs::path> candidates = {
+        cwd / "worker_config.txt",
+        exe_dir / "worker_config.txt",
+        cwd / "tools" / "payload_watermark" / "worker_config.txt",
+        exe_dir / ".." / ".." / "tools" / "payload_watermark" / "worker_config.txt",
+    };
+    for (const auto & candidate : candidates) {
+        if (path_exists_noexcept(candidate)) {
+            std::error_code ec;
+            fs::path abs = fs::absolute(candidate, ec);
+            return (ec ? candidate : abs).string();
+        }
+    }
+    return "";
+}
+
+static std::string resolve_model_path(const std::string & configured_model, int argc, char ** argv) {
+    if (configured_model.empty()) return default_model_path(argc, argv);
+    fs::path configured_path(configured_model);
+    if (path_exists_noexcept(configured_path)) {
+        std::error_code ec;
+        fs::path abs = fs::absolute(configured_path, ec);
+        return (ec ? configured_path : abs).string();
+    }
+
+    fs::path cwd = current_path_noexcept();
+    fs::path exe_dir = exe_dir_path(argc, argv);
+    std::vector<fs::path> candidates = {
+        cwd / "models" / configured_path,
+        cwd / configured_path,
+        cwd / ".." / "models" / configured_path,
+        cwd / ".." / configured_path,
+        cwd / ".." / ".." / "models" / configured_path,
+        cwd / ".." / ".." / configured_path,
+        exe_dir / "models" / configured_path,
+        exe_dir / configured_path,
+        exe_dir / ".." / "models" / configured_path,
+        exe_dir / ".." / configured_path,
+        exe_dir / ".." / ".." / "models" / configured_path,
+        exe_dir / ".." / ".." / configured_path,
+    };
+    for (const auto & candidate : candidates) {
+        if (path_exists_noexcept(candidate)) {
+            std::error_code ec;
+            fs::path abs = fs::absolute(candidate, ec);
+            return (ec ? candidate : abs).string();
+        }
+    }
+    return configured_model;
+}
+
+static void apply_worker_config_key(LlamaPayloadWorker & worker, const std::string & key, const std::string & value) {
+    if (key == "model") worker.model_path = value;
+    else if (key == "adapter") worker.adapter_path = value;
+    else if (key == "radix") worker.radix = std::stoi(value);
+    else if (key == "gpu_layers") worker.n_gpu_layers = std::stoi(value);
+    else if (key == "ctx") worker.n_ctx = std::stoi(value);
+    else if (key == "threads") worker.n_threads = std::stoi(value);
+    else if (key == "free_tail_tokens") worker.free_tail_tokens = std::stoi(value);
+    else if (key == "min_tail_tokens") worker.min_tail_tokens = std::stoi(value);
+    else if (key == "max_tail_tokens") worker.max_tail_tokens = std::stoi(value);
+    else if (key == "temperature") worker.temperature = std::stof(value);
+    else if (key == "top_p") worker.top_p = std::stof(value);
+    else if (key == "top_k") worker.top_k = std::stoi(value);
+    else if (key == "min_k") worker.min_k = std::stoi(value);
+    else if (key == "length_min_chars") worker.length_config.min_chars_floor = std::stoi(value);
+    else if (key == "length_payload_multiplier") worker.length_config.payload_digit_multiplier = std::stof(value);
+    else if (key == "length_upper_tail_extra_chars") worker.length_config.upper_tail_extra_chars = std::stoi(value);
+    else if (key == "length_upper_lower_multiplier") worker.length_config.upper_lower_multiplier = std::stof(value);
+    else if (key == "length_upper_extra_chars") worker.length_config.upper_extra_chars = std::stoi(value);
+    else if (key == "encode_attempts") worker.encode_attempts = std::stoi(value);
+    else if (key == "retry_seed_stride") worker.retry_seed_stride = std::stoi(value);
+    else if (key == "progress_interval_ms") worker.progress_interval_ms = std::stoi(value);
+    else if (key == "batch_min_tokens") worker.batch_min_tokens = std::stoi(value);
+    else if (key == "context_keep_tokens") worker.context_keep_tokens = std::stoi(value);
+    else if (key == "rolling_context_tokens") worker.rolling_context_tokens = std::stoi(value);
+    else if (key == "context_shift_margin") worker.context_shift_margin = std::stoi(value);
+    else if (key == "self_check_initial_digits") worker.self_check_initial_digits = std::stoi(value);
+    else if (key == "self_check_interval_digits") worker.self_check_interval_digits = std::stoi(value);
+    else if (key == "self_check_tail_chars") worker.self_check_tail_chars = std::stoi(value);
+    else if (key == "outline_enabled") worker.outline_enabled = std::stoi(value) != 0;
+    else if (key == "outline_tokens") worker.outline_tokens = std::stoi(value);
+    else if (key == "outline_min_chars") worker.outline_min_chars = std::stoi(value);
+    else if (key == "outline_context_extra_tokens") worker.outline_context_extra_tokens = std::stoi(value);
+    else if (key == "backend") worker.backend_preference = value;
+    else if (key == "prompt_dir") worker.prompt_dir = value;
+    else if (key == "tokenizer_id") worker.tokenizer_id = value;
+    else if (key == "tokenizer_dir") worker.tokenizer_dir = value;
+    else if (key == "decode_tokenizers") worker.decode_tokenizers = split_csv_list(value);
+    else if (key == "decode_threads") worker.decode_threads = std::stoi(value);
+    else if (key.rfind("tokenizer.", 0) == 0 && key.size() > 10) worker.tokenizer_paths[key.substr(10)] = value;
+}
+
+static void apply_worker_config_file(LlamaPayloadWorker & worker, const std::string & config_path) {
+    if (config_path.empty()) return;
+    std::string text;
+    if (!read_utf8_template_file(fs::path(config_path), text)) return;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t end = text.find('\n', pos);
+        std::string line = trim_ascii(end == std::string::npos ? text.substr(pos) : text.substr(pos, end - pos));
+        if (!line.empty() && line[0] != '#' && line[0] != ';') {
+            size_t eq = line.find('=');
+            if (eq != std::string::npos) {
+                std::string key = trim_ascii(line.substr(0, eq));
+                std::string value = trim_ascii(line.substr(eq + 1));
+                if (!key.empty() && !value.empty()) apply_worker_config_key(worker, key, value);
+            }
+        }
+        if (end == std::string::npos) break;
+        pos = end + 1;
+    }
 }
 
 static void emit_json(const std::string & line) {
@@ -1728,8 +2491,15 @@ int main(int argc, char ** argv) {
     std::setlocale(LC_ALL, "C.UTF-8");
     LlamaPayloadWorker worker;
     try {
-        worker.model_path = default_model_path(argc, argv);
         worker.adapter_path = default_adapter_path(argv);
+        worker.prompt_dir = default_prompt_dir(argc, argv);
+        worker.tokenizer_dir = default_tokenizer_dir(argc, argv);
+        std::string config_path = default_worker_config_path(argc, argv);
+        for (int i = 1; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--config" && i + 1 < argc) config_path = argv[++i];
+        }
+        apply_worker_config_file(worker, config_path);
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
             auto need = [&](const char * name) -> const char * {
@@ -1743,18 +2513,45 @@ int main(int argc, char ** argv) {
             else if (a == "--ctx") worker.n_ctx = std::stoi(need("--ctx"));
             else if (a == "--threads") worker.n_threads = std::stoi(need("--threads"));
             else if (a == "--free-tail-tokens") worker.free_tail_tokens = std::stoi(need("--free-tail-tokens"));
+            else if (a == "--max-tail-tokens") worker.max_tail_tokens = std::stoi(need("--max-tail-tokens"));
             else if (a == "--temperature") worker.temperature = std::stof(need("--temperature"));
             else if (a == "--top-p") worker.top_p = std::stof(need("--top-p"));
             else if (a == "--top-k") worker.top_k = std::stoi(need("--top-k"));
             else if (a == "--min-k") worker.min_k = std::stoi(need("--min-k"));
+            else if (a == "--outline-enabled") worker.outline_enabled = std::stoi(need("--outline-enabled")) != 0;
+            else if (a == "--outline-tokens") worker.outline_tokens = std::stoi(need("--outline-tokens"));
+            else if (a == "--prompt-dir") worker.prompt_dir = need("--prompt-dir");
+            else if (a == "--tokenizer-id") worker.tokenizer_id = need("--tokenizer-id");
+            else if (a == "--tokenizer-dir") worker.tokenizer_dir = need("--tokenizer-dir");
+            else if (a == "--decode-tokenizers") worker.decode_tokenizers = split_csv_list(need("--decode-tokenizers"));
+            else if (a == "--config") (void) need("--config");
             else if (a == "--backend") worker.backend_preference = need("--backend");
             else throw std::runtime_error("未知命令行参数：" + a);
         }
+        worker.model_path = resolve_model_path(worker.model_path, argc, argv);
+        worker.tokenizer_dir = resolve_directory_path(worker.tokenizer_dir, argc, argv);
+        apply_tokenizer_manifest(worker);
         if (!is_power_of_two_radix(worker.radix)) throw std::runtime_error("top-k 载荷进制必须是 2、4、8 或 16");
         if (worker.n_ctx < 512 || worker.n_threads <= 0 || worker.top_k <= 0 || worker.min_k <= 0) throw std::runtime_error("worker 运行参数不合法");
         if (worker.temperature <= 0.0f || worker.top_p <= 0.0f || worker.top_p > 1.0f) throw std::runtime_error("worker 采样参数不合法");
+        if (worker.free_tail_tokens < 0 || worker.min_tail_tokens < 0 || worker.max_tail_tokens < 0 ||
+            worker.min_tail_tokens > worker.max_tail_tokens) throw std::runtime_error("worker 收尾参数不合法");
+        if (worker.length_config.min_chars_floor < 0 ||
+            worker.length_config.payload_digit_multiplier <= 0.0f ||
+            worker.length_config.upper_tail_extra_chars < 0 ||
+            worker.length_config.upper_lower_multiplier <= 0.0f ||
+            worker.length_config.upper_extra_chars < 0) throw std::runtime_error("worker 字数提示参数不合法");
+        if (worker.encode_attempts <= 0 || worker.encode_attempts > 50 || worker.retry_seed_stride <= 0) throw std::runtime_error("worker 重试参数不合法");
+        if (worker.progress_interval_ms < 50 || worker.batch_min_tokens <= 0 ||
+            worker.context_keep_tokens < 0 || worker.rolling_context_tokens < 0 ||
+            worker.context_shift_margin < 0) throw std::runtime_error("worker 上下文参数不合法");
+        if (worker.self_check_initial_digits < 0 || worker.self_check_interval_digits < 0 ||
+            worker.self_check_tail_chars <= 0) throw std::runtime_error("worker 自检参数不合法");
+        if (worker.outline_tokens < 0 || worker.outline_tokens > 1024 ||
+            worker.outline_min_chars < 0 || worker.outline_context_extra_tokens < 0) throw std::runtime_error("worker 提纲参数不合法");
+        if (worker.decode_threads <= 0 || worker.decode_threads > 32) throw std::runtime_error("worker tokenizer decode thread count is invalid");
         worker.load();
-        emit_json("{\"type\":\"ready\",\"ok\":true,\"backend\":\"llama.cpp\",\"backend_detail\":\"" + json_escape(worker.backend_used) + "\",\"model\":\"" + json_escape(worker.model_path) + "\",\"adapter\":\"" + json_escape(worker.adapter_path) + "\",\"adapter_loaded\":" + std::string(worker.adapter ? "true" : "false") + ",\"radix\":" + std::to_string(worker.radix) + ",\"top_p\":" + std::to_string(worker.top_p) + ",\"min_k\":" + std::to_string(worker.min_k) + "}");
+        emit_json("{\"type\":\"ready\",\"ok\":true,\"backend\":\"llama.cpp\",\"backend_detail\":\"" + json_escape(worker.backend_used) + "\",\"model\":\"" + json_escape(worker.model_path) + "\",\"adapter\":\"" + json_escape(worker.adapter_path) + "\",\"adapter_loaded\":" + std::string(worker.adapter ? "true" : "false") + ",\"radix\":" + std::to_string(worker.radix) + ",\"top_p\":" + std::to_string(worker.top_p) + ",\"min_k\":" + std::to_string(worker.min_k) + ",\"prompt_dir\":\"" + json_escape(worker.prompt_dir) + "\",\"tokenizer_id\":\"" + json_escape(worker.tokenizer_id) + "\"}");
     } catch (const std::exception & e) {
         emit_json("{\"type\":\"ready\",\"ok\":false,\"error\":\"" + json_escape(e.what()) + "\"}");
         return 1;
@@ -1781,6 +2578,8 @@ int main(int argc, char ** argv) {
                 std::string topic_path;
                 if (json_get_string(line, "topic_file", topic_path)) topic = read_text(topic_path);
                 else json_get_string(line, "topic", topic);
+                std::string prompt_template_name = "default";
+                json_get_string(line, "prompt_template", prompt_template_name);
                 std::string seed;
                 if (!json_get_string(line, "seed", seed) || seed.empty()) throw std::runtime_error("top-k 编码请求缺少 seed 字段");
                 int tail_tokens = -1;
@@ -1799,10 +2598,10 @@ int main(int argc, char ** argv) {
                               ",\"tps\":" + speed.str() +
                               ",\"text\":\"" + json_escape(partial) + "\"}");
                 };
-                std::string text = worker.encode_payload(seed, payload, topic, tail_tokens, write_outline ? &outline_used : nullptr, progress_cb);
+                std::string text = worker.encode_payload(seed, payload, topic, prompt_template_name, tail_tokens, write_outline ? &outline_used : nullptr, progress_cb);
                 write_text_file(out_path, text);
                 if (write_outline) write_text_file(outline_out_path, outline_used);
-                emit_json(ok_response(id, ",\"backend\":\"llama.cpp\",\"backend_detail\":\"" + json_escape(worker.backend_used) + "\",\"radix\":" + std::to_string(worker.radix) + ",\"bytes\":" + std::to_string(payload.size()) + ",\"chars\":" + std::to_string(cjk_count(text)) + (write_outline ? ",\"outline_chars\":" + std::to_string(cjk_count(outline_used)) : "")));
+                emit_json(ok_response(id, ",\"backend\":\"llama.cpp\",\"backend_detail\":\"" + json_escape(worker.backend_used) + "\",\"radix\":" + std::to_string(worker.radix) + ",\"bytes\":" + std::to_string(payload.size()) + ",\"chars\":" + std::to_string(cjk_count(text)) + ",\"tokenizer_id\":\"" + json_escape(worker.tokenizer_id) + "\"" + (write_outline ? ",\"outline_chars\":" + std::to_string(cjk_count(outline_used)) : "")));
             } else if (cmd == "decode") {
                 std::string text_path, out_path;
                 if (!json_get_string(line, "text", text_path) || !json_get_string(line, "out", out_path)) throw std::runtime_error("top-k 解码请求缺少 text 或 out 字段");
@@ -1811,7 +2610,18 @@ int main(int argc, char ** argv) {
                 std::string text = read_text(text_path);
                 auto payload = worker.decode_payload(seed, text);
                 write_binary(out_path, payload);
-                emit_json(ok_response(id, ",\"backend\":\"llama.cpp\",\"backend_detail\":\"" + json_escape(worker.backend_used) + "\",\"radix\":" + std::to_string(worker.radix) + ",\"bytes\":" + std::to_string(payload.size())));
+                emit_json(ok_response(id, ",\"backend\":\"llama.cpp\",\"backend_detail\":\"" + json_escape(worker.backend_used) + "\",\"radix\":" + std::to_string(worker.radix) + ",\"bytes\":" + std::to_string(payload.size()) + ",\"tokenizer_id\":\"" + json_escape(worker.tokenizer_id) + "\""));
+            } else if (cmd == "decode_multi") {
+                std::string text_path, out_path;
+                if (!json_get_string(line, "text", text_path) || !json_get_string(line, "out", out_path)) throw std::runtime_error("top-k multi-decode request is missing text or out");
+                std::string seed;
+                if (!json_get_string(line, "seed", seed) || seed.empty()) throw std::runtime_error("top-k multi-decode request is missing seed");
+                std::string preferred_tokenizer;
+                json_get_string(line, "preferred_tokenizer", preferred_tokenizer);
+                std::string text = read_text(text_path);
+                auto candidates = worker.decode_payload_multi(seed, text, preferred_tokenizer);
+                write_decode_candidates_file(out_path, candidates);
+                emit_json(ok_response(id, ",\"backend\":\"llama.cpp\",\"backend_detail\":\"" + json_escape(worker.backend_used) + "\",\"radix\":" + std::to_string(worker.radix) + ",\"candidates\":" + std::to_string(candidates.size())));
             } else {
                 throw std::runtime_error("未知 worker 命令：" + cmd);
             }

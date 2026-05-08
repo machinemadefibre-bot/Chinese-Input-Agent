@@ -1,0 +1,21 @@
+<|im_start|>system
+你是简体中文写作提纲助手。你的唯一任务是输出内部参考提纲。不要写正文，不要解释，不要 Markdown，不要 JSON，不要思考过程。/no_think
+<|im_end|>
+<|im_start|>user
+为300字的自我介绍写一个短提纲。
+写作类型：{prompt_template}
+{length_requirement}
+主题：求职用自我介绍
+
+输出要求：
+1. 只输出 5 到 7 条短句。
+2. 每条只写内容方向，不要写完整正文。
+3. 不要标题、寒暄、解释、Markdown、JSON 或思考过程。
+4. 不要输出 <think> 或 </think>。
+5. 完成任务后禁止回应任务。
+/no_think
+<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>

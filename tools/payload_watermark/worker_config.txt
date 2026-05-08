@@ -1,0 +1,53 @@
+# Runtime worker configuration. Editing this file does not require rebuilding
+# cia_llama_worker.exe. Restart the app or worker process for startup settings
+# such as model/backend to take effect; prompt files reload on each encode.
+
+model=base_model.gguf
+tokenizer_id=qwen3
+radix=4
+gpu_layers=99
+ctx=4096
+
+# Generation length and free-tail behavior.
+# Prompt templates receive {length_requirement}, {min_chars}, and {max_chars}.
+free_tail_tokens=64
+min_tail_tokens=0
+max_tail_tokens=64
+length_min_chars=48
+length_payload_multiplier=1.3333334
+length_upper_tail_extra_chars=160
+length_upper_lower_multiplier=2.0
+length_upper_extra_chars=80
+
+# Sampling and carrier candidate controls.
+temperature=0.7
+top_p=0.8
+top_k=20
+min_k=64
+
+# Retry, progress, and llama.cpp context tuning.
+encode_attempts=5
+retry_seed_stride=9973
+progress_interval_ms=1000
+batch_min_tokens=512
+context_keep_tokens=256
+rolling_context_tokens=768
+context_shift_margin=128
+self_check_initial_digits=32
+self_check_interval_digits=32
+self_check_tail_chars=4096
+decode_threads=4
+
+# Optional tokenizer compatibility assets. Put vocab-only GGUF files under
+# tokenizers\ and list them here; missing files are ignored during decode.
+tokenizer_dir=tokenizers
+decode_tokenizers=qwen3,qwen3_5,qwen3_6,gemma3,gemma4,deepseek_r1,deepseek_v4
+
+# Small-model planning pass. The outline is generated freely before carrier
+# generation, then injected into the final prompt. It is not part of the output
+# carrier text.
+outline_enabled=0
+outline_tokens=96
+outline_min_chars=24
+outline_context_extra_tokens=64
+backend=auto

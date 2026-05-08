@@ -401,7 +401,7 @@ static DWORD WINAPI install_thread_proc(LPVOID param) {
     if (!join_path(models_path, ARRAYSIZE(models_path), ctx->target, APP_INSTALL_MODELS_DIR_NAME) ||
         !join_path(model_path, ARRAYSIZE(model_path), models_path, APP_INSTALL_MODEL_NAME) ||
         GetFileAttributesW(model_path) == INVALID_FILE_ATTRIBUTES) {
-        StringCchCopyW(err, ARRAYSIZE(err), L"安装完成校验失败：没有找到 base_model.gguf。");
+        StringCchPrintfW(err, ARRAYSIZE(err), L"安装完成校验失败：没有找到 %s。", APP_INSTALL_MODEL_NAME);
         goto fail;
     }
 

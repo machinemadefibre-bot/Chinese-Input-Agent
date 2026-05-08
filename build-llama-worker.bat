@@ -62,6 +62,12 @@ if not errorlevel 1 goto done
 echo Vulkan worker build failed; keeping CPU worker.
 
 :done
+call :stage_prompts "%FINAL%"
+if errorlevel 1 exit /b 1
+call :stage_tokenizers "%FINAL%"
+if errorlevel 1 exit /b 1
+copy /y "%ROOT%\tools\payload_watermark\worker_config.txt" "%FINAL%\worker_config.txt" >nul
+if errorlevel 1 exit /b 1
 echo Final llama.cpp worker staged in %FINAL%
 endlocal
 exit /b 0
@@ -181,4 +187,32 @@ if defined CUDA_BIN (
 if defined CUDA_RUNTIME_BIN (
   for %%F in ("%CUDA_RUNTIME_BIN%cudart64_*.dll" "%CUDA_RUNTIME_BIN%cublas64_*.dll" "%CUDA_RUNTIME_BIN%cublasLt64_*.dll") do if exist "%%~fF" copy /y "%%~fF" "%FINAL%\" >nul
 )
+exit /b 0
+
+:stage_prompts
+set "PROMPT_DST=%~1\prompts"
+if exist "%PROMPT_DST%" rmdir /s /q "%PROMPT_DST%"
+mkdir "%PROMPT_DST%"
+copy /y "%ROOT%\tools\payload_watermark\prompts\*.txt" "%PROMPT_DST%\" >nul
+exit /b %ERRORLEVEL%
+
+:stage_tokenizers
+set "TOKENIZER_SRC=%ROOT%\tools\payload_watermark\tokenizers"
+set "TOKENIZER_DST=%~1\tokenizers"
+if exist "%TOKENIZER_DST%" rmdir /s /q "%TOKENIZER_DST%"
+mkdir "%TOKENIZER_DST%"
+if exist "%TOKENIZER_SRC%" xcopy /y /i /q "%TOKENIZER_SRC%\*" "%TOKENIZER_DST%\" >nul
+if errorlevel 1 exit /b 1
+call :copy_tokenizer_vocab "ggml-vocab-qwen2.gguf" "qwen3.gguf"
+call :copy_tokenizer_vocab "ggml-vocab-qwen2.gguf" "qwen3_5.gguf"
+call :copy_tokenizer_vocab "ggml-vocab-qwen2.gguf" "qwen3_6.gguf"
+call :copy_tokenizer_vocab "ggml-vocab-gemma-4.gguf" "gemma3.gguf"
+call :copy_tokenizer_vocab "ggml-vocab-gemma-4.gguf" "gemma4.gguf"
+call :copy_tokenizer_vocab "ggml-vocab-deepseek-llm.gguf" "deepseek_r1.gguf"
+call :copy_tokenizer_vocab "ggml-vocab-deepseek-llm.gguf" "deepseek_v4.gguf"
+exit /b 0
+
+:copy_tokenizer_vocab
+if exist "%TOKENIZER_DST%\%~2" exit /b 0
+if exist "%ROOT%\third_party\llama.cpp\models\%~1" copy /y "%ROOT%\third_party\llama.cpp\models\%~1" "%TOKENIZER_DST%\%~2" >nul
 exit /b 0

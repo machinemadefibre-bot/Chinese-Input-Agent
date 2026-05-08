@@ -53,6 +53,7 @@ function Test-InstallerDownloadsWorkerDefaultModel {
     Assert-True $installerConfig.Contains("APP_INSTALL_MODEL_DOWNLOAD_URL") "installer should define a model download URL"
     Assert-True $installerConfig.Contains("APP_INSTALL_MODEL_DOWNLOAD_SHA256") "installer should verify the downloaded model"
     Assert-True $appPaths.Contains("APP_INSTALL_MODEL_NAME L`"base_model.gguf`"") "installer should write the worker default model name"
+    Assert-True $installerConfig.Contains("Qwen3-4B-Instruct-2507-GGUF") "installer should download the stable release model, not the experimental 2B model"
     Assert-True $installer.Contains("APP_INSTALL_MODEL_NAME") "installer should use the centralized worker default model name"
     Assert-True (-not $packageBat.Contains("copy /y `"%MODEL_SRC%`"")) "portable package should not embed the GGUF model"
 }
@@ -72,6 +73,61 @@ function Test-WorkerResponseIdIsChecked {
 
     Assert-True $appLlm.Contains("response_id != id") "app_llm.c should reject mismatched worker response ids"
     Assert-True $appLlm.Contains("wrong request") "app_llm.c should emit a diagnostic for mismatched worker response ids"
+}
+
+function Test-WorkerPromptsAreRuntimeFiles {
+    $workerCpp = Read-RepoFile "tools\payload_watermark\cia_llama_worker.cpp"
+    $packageBat = Read-RepoFile "package-mingw.bat"
+    $workerBat = Read-RepoFile "build-llama-worker.bat"
+    $workerConfig = Read-RepoFile "tools\payload_watermark\worker_config.txt"
+    $defaultPrompt = Read-RepoFile "tools\payload_watermark\prompts\default.txt"
+    $selfIntroPrompt = Read-RepoFile "tools\payload_watermark\prompts\self_intro.txt"
+    $groupKeyPrompt = Read-RepoFile "tools\payload_watermark\prompts\group_key.txt"
+    $outlinePrompt = Read-RepoFile "tools\payload_watermark\prompts\outline.txt"
+    $rejectPhrases = Read-RepoFile "tools\payload_watermark\prompts\reject_phrases.txt"
+
+    Assert-True $workerCpp.Contains("load_prompt_template(") "worker should load carrier prompts from runtime template files"
+    Assert-True $workerCpp.Contains("--prompt-dir") "worker should allow overriding the runtime prompt directory"
+    Assert-True $workerCpp.Contains("--config") "worker should allow overriding runtime worker config"
+    Assert-True $workerCpp.Contains("--tokenizer-dir") "worker should allow overriding runtime tokenizer assets"
+    Assert-True $workerCpp.Contains("decode_multi") "worker should expose multi-tokenizer carrier decode"
+    Assert-True $workerCpp.Contains("CIA_PROMPT_DIR") "worker should allow prompt directory override via environment"
+    Assert-True $workerCpp.Contains("CIA_WORKER_CONFIG") "worker should allow worker config override via environment"
+    Assert-True $workerCpp.Contains("CIA_TOKENIZER_DIR") "worker should allow tokenizer directory override via environment"
+    Assert-True $defaultPrompt.Contains("{topic}") "default prompt should expose the topic placeholder"
+    Assert-True $defaultPrompt.Contains("{length_requirement}") "default prompt should include the dynamic length requirement"
+    Assert-True $selfIntroPrompt.Contains("{length_requirement}") "self-introduction prompt should include the dynamic length requirement"
+    Assert-True $groupKeyPrompt.Contains("{length_requirement}") "group key prompt should include the dynamic length requirement"
+    Assert-True $workerConfig.Contains("outline_enabled=0") "worker outline pass should be disabled by runtime worker_config.txt"
+    Assert-True (-not $defaultPrompt.Contains("{outline}")) "default prompt should not depend on outline text when outline is disabled"
+    Assert-True (-not $selfIntroPrompt.Contains("{outline}")) "self-introduction prompt should not depend on outline text when outline is disabled"
+    Assert-True (-not $groupKeyPrompt.Contains("{outline}")) "group key prompt should not depend on outline text when outline is disabled"
+    Assert-True $outlinePrompt.Contains("{prompt_template}") "outline prompt should know which content template is being generated"
+    Assert-True $outlinePrompt.Contains("{length_requirement}") "outline prompt should include the dynamic length target"
+    Assert-True $defaultPrompt.Contains("/no_think") "default prompt should request Qwen non-thinking output"
+    Assert-True $selfIntroPrompt.Contains("/no_think") "self-introduction prompt should request Qwen non-thinking output"
+    Assert-True $groupKeyPrompt.Contains("/no_think") "group key prompt should request Qwen non-thinking output"
+    Assert-True $defaultPrompt.Contains("</think>") "default prompt should prefill an empty Qwen think block"
+    Assert-True $defaultPrompt.Contains("<|im_start|>system") "default prompt should use a Qwen-style system/user chat template"
+    Assert-True ($rejectPhrases.Length -gt 100) "reject phrase list should be editable without rebuilding worker"
+    Assert-True $workerConfig.Contains("temperature=0.7") "Qwen3 non-thinking sampling defaults should live in runtime worker_config.txt"
+    Assert-True $workerConfig.Contains("top_p=0.8") "Qwen3 non-thinking top-p default should live in runtime worker_config.txt"
+    Assert-True $workerConfig.Contains("top_k=20") "Qwen3 non-thinking top-k default should live in runtime worker_config.txt"
+    Assert-True $workerConfig.Contains("max_tail_tokens=64") "worker free-tail clamp should live in runtime worker_config.txt"
+    Assert-True $workerConfig.Contains("length_payload_multiplier=") "worker length scaling should live in runtime worker_config.txt"
+    Assert-True $workerConfig.Contains("encode_attempts=") "worker retry count should live in runtime worker_config.txt"
+    Assert-True $workerConfig.Contains("outline_enabled=0") "worker outline pass should be controlled by runtime worker_config.txt"
+    Assert-True $workerConfig.Contains("outline_tokens=") "worker outline token budget should live in runtime worker_config.txt"
+    Assert-True $workerConfig.Contains("model=base_model.gguf") "default release model name should live in runtime worker_config.txt"
+    Assert-True $workerConfig.Contains("tokenizer_id=") "current model tokenizer id should live in runtime worker_config.txt"
+    Assert-True $workerConfig.Contains("decode_tokenizers=") "decode tokenizer list should live in runtime worker_config.txt"
+    Assert-True $workerConfig.Contains("decode_threads=") "multi-tokenizer decode thread count should live in runtime worker_config.txt"
+    Assert-True $packageBat.Contains("tools\payload_watermark\prompts") "portable packaging should include runtime prompt templates"
+    Assert-True $packageBat.Contains("tools\payload_watermark\tokenizers") "portable packaging should include staged tokenizer assets when present"
+    Assert-True $packageBat.Contains("worker_config.txt") "portable packaging should include runtime worker config"
+    Assert-True $workerBat.Contains(":stage_prompts") "worker packaging should stage runtime prompt templates"
+    Assert-True $workerBat.Contains(":stage_tokenizers") "worker packaging should stage runtime tokenizer assets"
+    Assert-True $workerBat.Contains("worker_config.txt") "worker packaging should stage runtime worker config"
 }
 
 function Test-CryptoBoxUsesOpaqueContext {
@@ -172,11 +228,13 @@ function Test-AppFlowOwnsCryptoBusinessFlow {
     Assert-True $flow.Contains("app_contact_flow_import_key(") "app_flow.c should remain a thin contact-flow facade"
     Assert-True $flow.Contains("app_carrier_extract_exchange_body(") "app_flow.c should remain a thin carrier-flow facade"
     Assert-True $messageFlow.Contains("crypto_box_encrypt(") "app_message_flow.c should own message encryption orchestration"
-    Assert-True $messageFlow.Contains("app_groups_decrypt_message(") "app_message_flow.c should own group/private decrypt routing"
+    Assert-True ($messageFlow.Contains("app_groups_decrypt_message(") -or $messageFlow.Contains("app_groups_decrypt_message_ex(")) "app_message_flow.c should own group/private decrypt routing"
     Assert-True $contactFlow.Contains("crypto_box_import_contact_package(") "app_contact_flow.c should own contact key import orchestration"
     Assert-True $contactFlow.Contains("crypto_box_export_contact_package(") "app_contact_flow.c should own contact key export orchestration"
     Assert-True $carrierFlow.Contains("local_topk_encode_payload(") "app_carrier_flow.c should own top-k encode calls"
     Assert-True $carrierFlow.Contains("local_topk_decode_payload(") "app_carrier_flow.c should own top-k decode calls"
+    Assert-True $carrierFlow.Contains("local_topk_decode_payload_multi(") "app_carrier_flow.c should expose multi-tokenizer decode calls"
+    Assert-True $contactFlow.Contains("app_carrier_decode_exchange_package_multi(") "contact key import should try all configured tokenizers"
     Assert-True $header.Contains("app_flow_import_key(") "app_flow.h should expose import flow"
 }
 
@@ -200,7 +258,7 @@ function Test-GroupChatTransportInvariants {
     Assert-True $groups.Contains("memcmp(epoch_seed, group->epoch_seed") "same-epoch group package imports should not reset sender chains"
     Assert-True $flow.Contains("app_flow_encrypt_group_message(") "app_flow should expose group encryption orchestration"
     Assert-True $flow.Contains("app_flow_rekey_group_key(") "app_flow should expose group epoch refresh orchestration"
-    Assert-True $messageFlow.Contains("app_groups_decrypt_message(") "message flow should try group decrypt before private profile decrypt"
+    Assert-True ($messageFlow.Contains("app_groups_decrypt_message(") -or $messageFlow.Contains("app_groups_decrypt_message_ex(")) "message flow should try group decrypt before private profile decrypt"
 }
 
 function Test-TopLevelCMakeBuildTargets {
@@ -223,6 +281,7 @@ $tests = @(
     "Test-InstallerDownloadsWorkerDefaultModel",
     "Test-DocsDoNotOverstateForwardSecrecy",
     "Test-WorkerResponseIdIsChecked",
+    "Test-WorkerPromptsAreRuntimeFiles",
     "Test-CryptoBoxUsesOpaqueContext",
     "Test-CryptoBoxUsesSessionTransport",
     "Test-ProfilesDoNotManageCryptoLifecycle",

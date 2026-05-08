@@ -20,6 +20,7 @@ void profiles_clear_all(void);
 void profiles_shutdown(void);
 int profiles_count(void);
 int profiles_active_index(void);
+BOOL profiles_get_id_copy(int index, WCHAR *out, size_t cch);
 BOOL profiles_get_name_copy(int index, WCHAR *out, size_t cch);
 BOOL profiles_set_name(int index, const WCHAR *name, WCHAR *err, size_t err_cch);
 BOOL profiles_get_state_path_by_index(int index, WCHAR *path, size_t cch);
