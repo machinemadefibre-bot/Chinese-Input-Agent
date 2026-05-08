@@ -18,7 +18,7 @@
 
 ChineseInputAgent is a small experiment around one question: can two computers exchange encrypted messages through the chat apps people already keep open, without relying on a cloud API?
 
-It is not a chat app, and it is not another all-in-one AI desktop client. It is closer to a translation layer. The app encrypts plaintext into bytes, then asks a local language model to carry those bytes inside a Chinese article. The receiver copies the article back into the app, and the same tokenizer is used to recover the payload and decrypt it.
+It is not a chat app, and it is not another all-in-one AI desktop client. It is closer to a translation layer. The app encrypts plaintext into bytes, then asks a local language model to carry those bytes inside a Chinese article. The receiver copies the article back into the app, and the app recovers the payload and decrypts it.
 
 This is still an experimental project. The UI works and the end-to-end path is usable, but the cryptography and carrier encoding have not been formally audited. Treat it as a research prototype, not as a mature security product.
 
@@ -41,11 +41,13 @@ This does not mean the project can bypass moderation, platform rules, or legal p
 ## What It Can Do Today
 
 - Exchange a contact public-key package once, then encrypt future messages to that contact.
+- Create and join symmetric group chats. A group behaves like a selectable conversation object; v1 does not prevent impersonation by existing group members.
 - Protect message content with a session transport and authenticated symmetric encryption; Double Ratchet-style forward secrecy is not implemented yet.
 - Generate Chinese carrier text locally with a Qwen GGUF model through llama.cpp.
-- Encode ciphertext with a top-k token carrier and recover it with the same tokenizer.
+- Encode ciphertext with a top-k token carrier and recover it from the generated article.
+- Try multiple tokenizer profiles during decode; the encryption layer decides which candidate is valid.
 - Prefer CUDA, fall back to Vulkan, and then fall back to CPU.
-- Store profiles, contacts, and archives in the portable app's local `data/` directory.
+- Store profiles, contacts, groups, and archives in the portable app's local `data/` directory.
 - Protect the local master key with Windows Hello.
 
 ## What It Is Not
@@ -64,11 +66,13 @@ Download or build the app, then run:
 ChineseInputAgent.exe
 ```
 
-On first launch, the app creates a local profile and asks Windows Hello to unlock the local key. For two-computer communication, exchange contact packages in the import/export key window first. After that, choose a contact at the top of the main window, type plaintext, encrypt it, and send the generated Chinese article through any text channel you control.
+On first launch, the app creates a local profile and asks Windows Hello to unlock the local key. For two-computer communication, exchange contact packages in the key-exchange view first. After that, choose a contact at the top of the main window, type plaintext, encrypt it, and send the generated Chinese article through any text channel you control.
 
 Exchange text includes an 8-character base32 fingerprint for comparison through a trusted channel. It is not strong authentication by itself.
 
 To decrypt a message, copy the whole article you received and click decrypt. The app will try the local contacts and decrypt the matching payload.
+
+For group chat, use the key-exchange view's group mode to create or join a group. Each user sets a local group name and their own display nickname. Local remarks can override how another group member is shown on this machine.
 
 ## Rough Flow
 
@@ -117,6 +121,13 @@ models/base_model.gguf
 
 For portable zip-only or offline installs, place a llama.cpp-compatible Qwen GGUF at that path manually. See [models/README.md](models/README.md) for details.
 
+Runtime worker configuration lives here:
+
+```text
+tools/payload_watermark/worker_config.txt
+tools/payload_watermark/prompts/
+```
+
 ### Package
 
 ```bat
@@ -147,7 +158,9 @@ models/                      local GGUF model directory
 
 The generated Chinese article is only a carrier. It should not be treated as the security layer. Message confidentiality and integrity come from the encryption layer.
 
-The current message format uses an ephemeral sender key and the recipient's long-term identity key. That avoids reusing one message key, but if the recipient's long-term private key is later compromised, previously captured messages may still be decryptable. Do not treat the current protocol as having full forward secrecy.
+The current session transport uses static identity keys plus one-time handshake material to establish sending chains, then derives a fresh message key for each message. It supports a limited amount of out-of-order delivery, but it is not Double Ratchet and it is not a complete Signal or Noise implementation.
+
+Group messages use a separate symmetric group transport. The v1 goal is confidentiality against non-members after each epoch change; it does not cryptographically prove which member sent a message.
 
 The current design goal is to make copying, sending, and recovering text possible through ordinary chat software. It is not designed to resist all traffic analysis, text rewriting, summarization, translation, active attacks, or platform-side text cleanup. If a third-party platform rewrites the text, decoding may fail.
 
