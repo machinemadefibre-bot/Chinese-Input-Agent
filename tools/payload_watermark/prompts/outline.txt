@@ -16,6 +16,3 @@
 /no_think
 <|im_end|>
 <|im_start|>assistant
-<think>
-
-</think>

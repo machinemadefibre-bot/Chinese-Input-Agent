@@ -49,8 +49,7 @@ static const std::string DEFAULT_PROMPT_TEMPLATE =
     "6. 使用正常标点和完整句子。\n"
     "/no_think\n"
     "<|im_end|>\n"
-    "<|im_start|>assistant\n"
-    "<think>\n\n</think>\n\n";
+    "<|im_start|>assistant\n";
 static const std::string GROUP_KEY_PROMPT_TEMPLATE =
     "<|im_start|>system\n"
     "你是简体中文正文写作器。你的唯一任务是输出正文。禁止对话、解释、道歉、标题、清单、Markdown、JSON 和思考过程。/no_think\n"
@@ -68,8 +67,7 @@ static const std::string GROUP_KEY_PROMPT_TEMPLATE =
     "7. 使用正常标点和完整句子。\n"
     "/no_think\n"
     "<|im_end|>\n"
-    "<|im_start|>assistant\n"
-    "<think>\n\n</think>\n\n";
+    "<|im_start|>assistant\n";
 static const std::string SELF_INTRO_PROMPT_TEMPLATE =
     "<|im_start|>system\n"
     "你是简体中文正文写作器。你的唯一任务是输出正文。禁止对话、解释、道歉、标题、清单、Markdown、JSON 和思考过程。/no_think\n"
@@ -87,8 +85,7 @@ static const std::string SELF_INTRO_PROMPT_TEMPLATE =
     "8. 使用正常标点和完整句子。\n"
     "/no_think\n"
     "<|im_end|>\n"
-    "<|im_start|>assistant\n"
-    "<think>\n\n</think>\n\n";
+    "<|im_start|>assistant\n";
 
 static const std::string OUTLINE_PROMPT_TEMPLATE =
     "<|im_start|>system\n"
@@ -101,8 +98,7 @@ static const std::string OUTLINE_PROMPT_TEMPLATE =
     "Length target: {length_requirement}\n"
     "Use 3 to 5 short lines. Do not write the final article. /no_think\n"
     "<|im_end|>\n"
-    "<|im_start|>assistant\n"
-    "<think>\n\n</think>\n\n";
+    "<|im_start|>assistant\n";
 static std::string ascii_lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));

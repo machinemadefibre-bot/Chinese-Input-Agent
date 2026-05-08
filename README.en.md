@@ -158,7 +158,7 @@ models/                      local GGUF model directory
 
 The generated Chinese article is only a carrier. It should not be treated as the security layer. Message confidentiality and integrity come from the encryption layer.
 
-The current session transport uses static identity keys plus one-time handshake material to establish sending chains, then derives a fresh message key for each message. It supports a limited amount of out-of-order delivery, but it is not Double Ratchet and it is not a complete Signal or Noise implementation.
+The current session transport uses static identity keys plus one-time handshake material to establish sending chains, then derives a fresh message key for each message. It supports a limited amount of out-of-order delivery, but it is not Double Ratchet and it is not a complete Signal or Noise implementation. Do not treat it as full forward secrecy.
 
 Group messages use a separate symmetric group transport. The v1 goal is confidentiality against non-members after each epoch change; it does not cryptographically prove which member sent a message.
 
