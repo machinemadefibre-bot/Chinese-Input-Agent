@@ -12,6 +12,7 @@ static CRYPTO_BOX *g_core_active_box;
 static CIA_CORE_CANCEL_FN g_core_cancel;
 static void *g_core_cancel_user;
 static BOOL g_core_initialized;
+static BOOL g_core_profiles_loaded;
 
 static BOOL cia_core_cancelled(void) {
     return g_core_cancel ? g_core_cancel(g_core_cancel_user) : FALSE;
@@ -23,6 +24,10 @@ static void cia_core_close_active_crypto(void) {
 }
 
 static BOOL cia_core_reload_active_crypto(WCHAR *err, size_t err_cch) {
+    if (!g_core_profiles_loaded) {
+        set_error(err, err_cch, L"Profiles are not loaded in this cia_core session.");
+        return FALSE;
+    }
     int profile_index = profiles_active_index();
     if (profile_index < 0) {
         set_error(err, err_cch, L"No active profile is available.");
@@ -36,16 +41,23 @@ static BOOL cia_core_reload_active_crypto(WCHAR *err, size_t err_cch) {
     return TRUE;
 }
 
+static BOOL cia_core_ensure_active_crypto(WCHAR *err, size_t err_cch) {
+    if (g_core_active_box) return TRUE;
+    return cia_core_reload_active_crypto(err, err_cch);
+}
+
 BOOL cia_core_init(const CIA_CORE_OPTIONS *options, WCHAR *err, size_t err_cch) {
     if (g_core_initialized) return TRUE;
     g_core_cancel = options ? options->cancel : NULL;
     g_core_cancel_user = options ? options->cancel_user : NULL;
 
     app_llm_init(cia_core_cancelled);
-    if (!profiles_load(err, err_cch)) goto fail;
+    if (!options || !options->skip_profiles) {
+        if (!profiles_load(err, err_cch)) goto fail;
+        g_core_profiles_loaded = TRUE;
+    }
     if (!app_groups_load(err, err_cch)) goto fail_profiles;
     if (!app_tokenizer_prefs_load(err, err_cch)) goto fail_groups;
-    if (!cia_core_reload_active_crypto(err, err_cch)) goto fail_tokenizers;
 
     g_core_initialized = TRUE;
     if (options && options->start_worker_background) {
@@ -53,16 +65,15 @@ BOOL cia_core_init(const CIA_CORE_OPTIONS *options, WCHAR *err, size_t err_cch) 
     }
     return TRUE;
 
-fail_tokenizers:
-    app_tokenizer_prefs_shutdown();
 fail_groups:
     app_groups_shutdown();
 fail_profiles:
-    profiles_shutdown();
+    if (g_core_profiles_loaded) profiles_shutdown();
 fail:
     app_llm_cleanup();
     g_core_cancel = NULL;
     g_core_cancel_user = NULL;
+    g_core_profiles_loaded = FALSE;
     return FALSE;
 }
 
@@ -72,9 +83,10 @@ void cia_core_cleanup(void) {
     cia_core_close_active_crypto();
     app_tokenizer_prefs_shutdown();
     app_groups_shutdown();
-    profiles_shutdown();
+    if (g_core_profiles_loaded) profiles_shutdown();
     g_core_cancel = NULL;
     g_core_cancel_user = NULL;
+    g_core_profiles_loaded = FALSE;
     g_core_initialized = FALSE;
 }
 
@@ -93,8 +105,7 @@ BOOL cia_core_encrypt_message(const WCHAR *plain, const WCHAR *topic,
                               const CIA_PROGRESS_SINK *progress,
                               WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
-    if (!g_core_active_box) {
-        set_error(err, err_cch, L"cia_core is not initialized.");
+    if (!cia_core_ensure_active_crypto(err, err_cch)) {
         return FALSE;
     }
     return app_flow_encrypt_message(g_core_active_box, plain, topic, progress, out, err, err_cch);
@@ -124,8 +135,7 @@ BOOL cia_core_decrypt_text(const WCHAR *text, CIA_CORE_DECRYPT_RESULT *result,
 BOOL cia_core_export_contact(const CIA_PROGRESS_SINK *progress,
                              WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
-    if (!g_core_active_box) {
-        set_error(err, err_cch, L"cia_core is not initialized.");
+    if (!cia_core_ensure_active_crypto(err, err_cch)) {
         return FALSE;
     }
     return app_flow_export_key(g_core_active_box, progress, out, err, err_cch);

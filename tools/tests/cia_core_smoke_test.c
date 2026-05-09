@@ -1,4 +1,5 @@
 #include "cia_core.h"
+#include "app_groups.h"
 
 #include <stdio.h>
 #include <wchar.h>
@@ -13,12 +14,19 @@ int wmain(void) {
     CIA_CORE_OPTIONS options;
     ZeroMemory(&options, sizeof(options));
     options.start_worker_background = FALSE;
+    options.skip_profiles = TRUE;
 
     if (!cia_core_init(&options, err, ARRAYSIZE(err))) {
         return fail_with_error(L"cia_core_init", err);
     }
 
-    if (!cia_core_append_chat_history(CIA_CORE_CONVERSATION_PRIVATE, 0,
+    int group_index = -1;
+    if (!app_groups_create(L"Smoke Group", L"Smoke Member", &group_index, err, ARRAYSIZE(err))) {
+        cia_core_cleanup();
+        return fail_with_error(L"app_groups_create", err);
+    }
+
+    if (!cia_core_append_chat_history(CIA_CORE_CONVERSATION_GROUP, group_index,
                                       L"Smoke", L"headless core message",
                                       err, ARRAYSIZE(err))) {
         cia_core_cleanup();
@@ -26,7 +34,7 @@ int wmain(void) {
     }
 
     WCHAR *history = NULL;
-    if (!cia_core_load_chat_history(CIA_CORE_CONVERSATION_PRIVATE, 0,
+    if (!cia_core_load_chat_history(CIA_CORE_CONVERSATION_GROUP, group_index,
                                     &history, err, ARRAYSIZE(err))) {
         cia_core_cleanup();
         return fail_with_error(L"cia_core_load_chat_history", err);

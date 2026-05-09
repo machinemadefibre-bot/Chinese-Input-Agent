@@ -350,8 +350,15 @@ function Test-CiaCoreFacade {
     Assert-True $impl.Contains("archive_load_text(") "cia_core.c should reuse archive adapter for private history"
     Assert-True $impl.Contains("app_groups_archive_load_text(") "cia_core.c should reuse group archive adapter"
     Assert-True $testBat.Contains("test_cia_core_smoke.ps1") "test.bat should run the headless cia_core smoke test"
+    Assert-True $cmake.Contains("add_executable(cia_core_smoke_test tools/tests/cia_core_smoke_test.c)") "CMake should define a headless cia_core smoke test target"
+    Assert-True $cmake.Contains("target_link_libraries(cia_core_smoke_test PRIVATE cia_core)") "cia_core smoke test should link cia_core target"
+    Assert-True $cmake.Contains("target_link_libraries(cia_core PUBLIC") "cia_core should export its platform/crypto link dependencies"
+    foreach ($coreLib in @("bcrypt", "crypt32", "ncrypt")) {
+        Assert-True $cmake.Contains("  $coreLib") "cia_core should export link library: $coreLib"
+    }
     Assert-True $smokeScript.Contains('$forbiddenSources') "cia_core smoke test should explicitly guard against linking UI sources"
     Assert-True $smokeScript.Contains('$coreSources -contains $forbidden') "cia_core smoke test should reject UI source entries"
+    Assert-True $smokeScript.Contains("--target cia_core_smoke_test") "cia_core smoke script should build the CMake smoke target"
 }
 
 function Test-WindowsPlatformBoundary {
@@ -383,6 +390,7 @@ function Test-TopLevelCMakeBuildTargets {
     $msvc = Read-RepoFile "build.bat"
 
     Assert-True $cmake.Contains("add_library(cia_core STATIC") "CMakeLists should define cia_core as a static library"
+    Assert-True $cmake.Contains("add_executable(cia_core_smoke_test") "CMakeLists should define the headless cia_core smoke test target"
     Assert-True $cmake.Contains("add_executable(ChineseInputAgent") "CMakeLists should define ChineseInputAgent"
     Assert-True $cmake.Contains("add_executable(ChineseInputAgentInstallerStub") "CMakeLists should define installer stub"
     Assert-True $cmake.Contains("target_link_libraries(ChineseInputAgent PRIVATE") "ChineseInputAgent should have an explicit link block"

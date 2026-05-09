@@ -48,8 +48,14 @@ set(APP_SOURCES
 )
 
 add_library(cia_core STATIC ${CIA_CORE_SOURCES})
+target_link_libraries(cia_core PUBLIC
+  bcrypt
+  crypt32
+  ncrypt
+)
 
 add_executable(ChineseInputAgent WIN32 ${APP_SOURCES})
+add_executable(cia_core_smoke_test tools/tests/cia_core_smoke_test.c)
 
 set(CIA_COMMON_COMPILE_DEFINITIONS
   UNICODE
@@ -68,20 +74,18 @@ set(CIA_COMMON_INCLUDE_DIRS
   "${CMAKE_SOURCE_DIR}/third_party/sqlite"
 )
 
-foreach(target cia_core ChineseInputAgent)
+foreach(target cia_core ChineseInputAgent cia_core_smoke_test)
   target_compile_definitions(${target} PRIVATE ${CIA_COMMON_COMPILE_DEFINITIONS})
   target_include_directories(${target} PRIVATE ${CIA_COMMON_INCLUDE_DIRS})
 endforeach()
+
+target_link_libraries(cia_core_smoke_test PRIVATE cia_core)
 
 target_link_libraries(ChineseInputAgent PRIVATE
   cia_core
   user32
   gdi32
   comctl32
-  advapi32
-  crypt32
-  bcrypt
-  ncrypt
   shell32
 )
 
@@ -110,6 +114,7 @@ target_link_libraries(ChineseInputAgentInstallerStub PRIVATE
 if(MSVC)
   target_compile_options(cia_core PRIVATE /utf-8 /W3)
   target_compile_options(ChineseInputAgent PRIVATE /utf-8 /W3)
+  target_compile_options(cia_core_smoke_test PRIVATE /utf-8 /W3)
   target_compile_options(ChineseInputAgentInstallerStub PRIVATE /utf-8 /W3)
   # app.rc and installer.rc explicitly embed app.manifest; disable MSVC's generated manifest to avoid duplicates.
   target_link_options(ChineseInputAgent PRIVATE /MANIFEST:NO)
@@ -119,7 +124,9 @@ endif()
 if(MINGW)
   target_compile_options(cia_core PRIVATE -finput-charset=UTF-8 -fexec-charset=UTF-8)
   target_compile_options(ChineseInputAgent PRIVATE -finput-charset=UTF-8 -fexec-charset=UTF-8)
+  target_compile_options(cia_core_smoke_test PRIVATE -finput-charset=UTF-8 -fexec-charset=UTF-8)
   target_compile_options(ChineseInputAgentInstallerStub PRIVATE -finput-charset=UTF-8 -fexec-charset=UTF-8)
   target_link_options(ChineseInputAgent PRIVATE -municode -static -static-libgcc)
+  target_link_options(cia_core_smoke_test PRIVATE -municode -static -static-libgcc)
   target_link_options(ChineseInputAgentInstallerStub PRIVATE -municode -static -static-libgcc)
 endif()

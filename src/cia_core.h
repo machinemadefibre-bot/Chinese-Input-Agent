@@ -18,6 +18,8 @@ typedef struct CIA_CORE_OPTIONS {
     CIA_CORE_CANCEL_FN cancel;
     void *cancel_user;
     BOOL start_worker_background;
+    /* Test/headless storage smoke paths can skip profile loading to avoid Windows Hello. */
+    BOOL skip_profiles;
 } CIA_CORE_OPTIONS;
 
 typedef enum CIA_CORE_CONVERSATION_KIND {
