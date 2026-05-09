@@ -328,6 +328,8 @@ function Test-CiaCoreFacade {
     $cmake = Read-RepoFile "CMakeLists.txt"
     $header = Read-RepoFile "src\cia_core.h"
     $impl = Read-RepoFile "src\cia_core.c"
+    $testBat = Read-RepoFile "test.bat"
+    $smokeScript = Read-RepoFile "tools\tests\test_cia_core_smoke.ps1"
 
     Assert-True $cmake.Contains("src/cia_core.c") "cia_core facade should be compiled into the core static library"
     Assert-True $header.Contains("BOOL cia_core_init(") "cia_core.h should expose init"
@@ -347,6 +349,9 @@ function Test-CiaCoreFacade {
     Assert-True $impl.Contains("app_flow_decrypt_clip_auto(") "cia_core.c should reuse app_flow for decrypt"
     Assert-True $impl.Contains("archive_load_text(") "cia_core.c should reuse archive adapter for private history"
     Assert-True $impl.Contains("app_groups_archive_load_text(") "cia_core.c should reuse group archive adapter"
+    Assert-True $testBat.Contains("test_cia_core_smoke.ps1") "test.bat should run the headless cia_core smoke test"
+    Assert-True $smokeScript.Contains('$forbiddenSources') "cia_core smoke test should explicitly guard against linking UI sources"
+    Assert-True $smokeScript.Contains('$coreSources -contains $forbidden') "cia_core smoke test should reject UI source entries"
 }
 
 function Test-WindowsPlatformBoundary {
