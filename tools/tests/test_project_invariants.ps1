@@ -322,6 +322,31 @@ function Test-GroupChatTransportInvariants {
     Assert-True ($messageFlow.Contains("app_groups_decrypt_message(") -or $messageFlow.Contains("app_groups_decrypt_message_ex(")) "message flow should try group decrypt before private profile decrypt"
 }
 
+function Test-CiaCoreFacade {
+    $cmake = Read-RepoFile "CMakeLists.txt"
+    $header = Read-RepoFile "src\cia_core.h"
+    $impl = Read-RepoFile "src\cia_core.c"
+
+    Assert-True $cmake.Contains("src/cia_core.c") "cia_core facade should be compiled into the core static library"
+    Assert-True $header.Contains("BOOL cia_core_init(") "cia_core.h should expose init"
+    Assert-True $header.Contains("void cia_core_cleanup(") "cia_core.h should expose cleanup"
+    Assert-True $header.Contains("cia_core_encrypt_message(") "cia_core.h should expose private message encryption"
+    Assert-True $header.Contains("cia_core_decrypt_text(") "cia_core.h should expose text decryption"
+    Assert-True $header.Contains("cia_core_export_contact(") "cia_core.h should expose contact export"
+    Assert-True $header.Contains("cia_core_import_contact(") "cia_core.h should expose contact import"
+    Assert-True $header.Contains("cia_core_create_group(") "cia_core.h should expose group creation"
+    Assert-True $header.Contains("cia_core_encrypt_group_message(") "cia_core.h should expose group message encryption"
+    Assert-True $header.Contains("cia_core_load_chat_history(") "cia_core.h should expose chat history load"
+    Assert-True $header.Contains("cia_core_append_chat_history(") "cia_core.h should expose chat history append"
+    foreach ($uiToken in @("HWND", "MessageBox", "PostMessage", "WM_APP", "WndProc", "textbox")) {
+        Assert-True (-not $header.Contains($uiToken)) "cia_core.h should not expose UI token: $uiToken"
+    }
+    Assert-True $impl.Contains("app_flow_encrypt_message(") "cia_core.c should reuse app_flow for encryption"
+    Assert-True $impl.Contains("app_flow_decrypt_clip_auto(") "cia_core.c should reuse app_flow for decrypt"
+    Assert-True $impl.Contains("archive_load_text(") "cia_core.c should reuse archive adapter for private history"
+    Assert-True $impl.Contains("app_groups_archive_load_text(") "cia_core.c should reuse group archive adapter"
+}
+
 function Test-TopLevelCMakeBuildTargets {
     $cmake = Read-RepoFile "CMakeLists.txt"
     $mingw = Read-RepoFile "build-mingw.bat"
@@ -361,6 +386,7 @@ $tests = @(
     "Test-ChatHistoryUsesEncryptedRowsInSQLite",
     "Test-AppFlowOwnsCryptoBusinessFlow",
     "Test-GroupChatTransportInvariants",
+    "Test-CiaCoreFacade",
     "Test-TopLevelCMakeBuildTargets"
 )
 
