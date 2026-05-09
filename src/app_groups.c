@@ -4,6 +4,7 @@
 #include "app_paths.h"
 #include "app_shared.h"
 #include "app_storage.h"
+#include "cia_platform_windows.h"
 
 #include <bcrypt.h>
 #include <strsafe.h>
@@ -281,7 +282,7 @@ static BOOL group_file_path(WCHAR *path, size_t cch) {
 }
 
 static BOOL random_bytes(BYTE *out, DWORD len) {
-    return out && BCryptGenRandom(NULL, out, len, BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0;
+    return out && cia_win_random_bytes(out, len);
 }
 
 static BOOL random_u64_nonzero(uint64_t *out) {

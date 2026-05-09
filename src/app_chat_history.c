@@ -1,6 +1,7 @@
 #include "app_chat_history.h"
 #include "app_paths.h"
 #include "app_shared.h"
+#include "cia_platform_windows.h"
 
 #include "sqlite3.h"
 
@@ -10,7 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strsafe.h>
-#include <wincrypt.h>
 
 #define CHAT_SCHEMA_VERSION "1"
 #define CHAT_KIND_PRIVATE 1
@@ -48,7 +48,7 @@ static void byte_builder_secure_free(BYTE_BUILDER *builder)
         return;
     }
     if (builder->data && builder->cap) {
-        SecureZeroMemory(builder->data, builder->cap);
+        cia_win_secure_zero(builder->data, builder->cap);
     }
     byte_builder_free(builder);
 }
@@ -73,7 +73,7 @@ static BOOL byte_builder_reserve(BYTE_BUILDER *builder, DWORD needed)
         memcpy(next, builder->data, builder->len);
     }
     if (builder->data && builder->cap) {
-        SecureZeroMemory(builder->data, builder->cap);
+        cia_win_secure_zero(builder->data, builder->cap);
         xfree(builder->data);
     }
     builder->data = next;
@@ -126,7 +126,7 @@ static BOOL byte_builder_append_u64_le(BYTE_BUILDER *builder, uint64_t value)
 
 static BOOL random_bytes(BYTE *out, DWORD len)
 {
-    return BCryptGenRandom(NULL, out, len, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
+    return cia_win_random_bytes(out, len);
 }
 
 static WCHAR *dup_empty_wide(void)
@@ -790,69 +790,37 @@ static void group_history_key_entropy(uint64_t group_id, BYTE entropy[GROUP_HIST
 static BOOL protect_group_history_key(uint64_t group_id, const BYTE key[CHAT_HISTORY_KEY_BYTES],
                                       BYTE **out, DWORD *out_len)
 {
-    DATA_BLOB in_blob;
-    DATA_BLOB out_blob;
-    DATA_BLOB entropy_blob;
     BYTE entropy[GROUP_HISTORY_ENTROPY_BYTES];
-    BOOL result = FALSE;
 
     *out = NULL;
     *out_len = 0;
     group_history_key_entropy(group_id, entropy);
-    in_blob.pbData = (BYTE *)key;
-    in_blob.cbData = CHAT_HISTORY_KEY_BYTES;
-    entropy_blob.pbData = entropy;
-    entropy_blob.cbData = sizeof(entropy);
-    ZeroMemory(&out_blob, sizeof(out_blob));
-
-    if (CryptProtectData(&in_blob,
-                         L"ChineseInputAgent group chat history key",
-                         &entropy_blob,
-                         NULL,
-                         NULL,
-                         0,
-                         &out_blob)) {
-        BYTE *copy = (BYTE *)xalloc(out_blob.cbData);
-        if (copy) {
-            CopyMemory(copy, out_blob.pbData, out_blob.cbData);
-            *out = copy;
-            *out_len = out_blob.cbData;
-            result = TRUE;
-        }
-        LocalFree(out_blob.pbData);
-    }
-    SecureZeroMemory(entropy, sizeof(entropy));
+    BOOL result = cia_win_dpapi_protect(key, CHAT_HISTORY_KEY_BYTES,
+                                        L"ChineseInputAgent group chat history key",
+                                        entropy, sizeof(entropy), out, out_len);
+    cia_win_secure_zero(entropy, sizeof(entropy));
     return result;
 }
 
 static BOOL unprotect_group_history_key(uint64_t group_id, const BYTE *wrapped, DWORD wrapped_len,
                                         BYTE out_key[CHAT_HISTORY_KEY_BYTES])
 {
-    DATA_BLOB in_blob;
-    DATA_BLOB out_blob;
-    DATA_BLOB entropy_blob;
     BYTE entropy[GROUP_HISTORY_ENTROPY_BYTES];
+    BYTE *unwrapped = NULL;
+    DWORD unwrapped_len = 0;
     BOOL result = FALSE;
 
     group_history_key_entropy(group_id, entropy);
-    in_blob.pbData = (BYTE *)wrapped;
-    in_blob.cbData = wrapped_len;
-    entropy_blob.pbData = entropy;
-    entropy_blob.cbData = sizeof(entropy);
-    ZeroMemory(&out_blob, sizeof(out_blob));
-
-    if (CryptUnprotectData(&in_blob, NULL, &entropy_blob, NULL, NULL, 0, &out_blob) &&
-        out_blob.cbData == CHAT_HISTORY_KEY_BYTES) {
-        CopyMemory(out_key, out_blob.pbData, CHAT_HISTORY_KEY_BYTES);
+    if (cia_win_dpapi_unprotect(wrapped, wrapped_len, entropy, sizeof(entropy),
+                                &unwrapped, &unwrapped_len) &&
+        unwrapped_len == CHAT_HISTORY_KEY_BYTES) {
+        CopyMemory(out_key, unwrapped, CHAT_HISTORY_KEY_BYTES);
         result = TRUE;
     }
-    if (out_blob.pbData) {
-        SecureZeroMemory(out_blob.pbData, out_blob.cbData);
-        LocalFree(out_blob.pbData);
-    }
-    SecureZeroMemory(entropy, sizeof(entropy));
+    secure_free(unwrapped, unwrapped_len);
+    cia_win_secure_zero(entropy, sizeof(entropy));
     if (!result) {
-        SecureZeroMemory(out_key, CHAT_HISTORY_KEY_BYTES);
+        cia_win_secure_zero(out_key, CHAT_HISTORY_KEY_BYTES);
     }
     return result;
 }

@@ -2,6 +2,7 @@
 #include "app_paths.h"
 #include "app_shared.h"
 #include "app_storage.h"
+#include "cia_platform_windows.h"
 #include <bcrypt.h>
 #include <ncrypt.h>
 #include <strsafe.h>
@@ -56,13 +57,13 @@ static BOOL profile_get_legacy_archive_path(const KEY_PROFILE *profile, WCHAR *p
 
 static void profiles_clear_profile(KEY_PROFILE *profile) {
     secure_free(profile->wrapped_key, profile->wrapped_key_len);
-    SecureZeroMemory(profile->master_key, sizeof(profile->master_key));
+    cia_win_secure_zero(profile->master_key, sizeof(profile->master_key));
     ZeroMemory(profile, sizeof(*profile));
 }
 
 static void lock_profile_master(KEY_PROFILE *profile) {
     if (!profile) return;
-    SecureZeroMemory(profile->master_key, sizeof(profile->master_key));
+    cia_win_secure_zero(profile->master_key, sizeof(profile->master_key));
     profile->master_loaded = FALSE;
 }
 
@@ -80,17 +81,19 @@ void profiles_clear_all(void) {
 static BOOL generate_profile_id(WCHAR id[33]) {
     BYTE bytes[16];
     static const WCHAR hex[] = L"0123456789abcdef";
-    if (BCryptGenRandom(NULL, bytes, sizeof(bytes), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) return FALSE;
+    if (!cia_win_random_bytes(bytes, sizeof(bytes))) return FALSE;
     for (int i = 0; i < 16; ++i) {
         id[i * 2] = hex[(bytes[i] >> 4) & 0xf];
         id[i * 2 + 1] = hex[bytes[i] & 0xf];
     }
     id[32] = L'\0';
-    SecureZeroMemory(bytes, sizeof(bytes));
+    cia_win_secure_zero(bytes, sizeof(bytes));
     return TRUE;
 }
 
-
+/* Platform boundary note: Windows Hello / NCrypt profile wrapping is still kept
+   here because it is tightly coupled to profile migration and error messages.
+   Move it behind cia_platform_windows only as a focused follow-up. */
 static BOOL open_or_create_profile_wrap_key(NCRYPT_PROV_HANDLE *out_provider, NCRYPT_KEY_HANDLE *out_key, WCHAR *err, size_t err_cch) {
     *out_provider = 0;
     *out_key = 0;
@@ -348,17 +351,17 @@ static BOOL create_default_profile(WCHAR *err, size_t err_cch) {
         return FALSE;
     }
     BYTE master[APP_PROFILE_MASTER_KEY_BYTES];
-    if (BCryptGenRandom(NULL, master, sizeof(master), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+    if (!cia_win_random_bytes(master, sizeof(master))) {
         set_error(err, err_cch, L"Random generation failed while creating the default profile.");
         return FALSE;
     }
     BOOL default_profile_created = profiles_create_from_master(L"\u9ed8\u8ba4\u5bc6\u94a5", master, &g_profiles[0], err, err_cch);
-    SecureZeroMemory(master, sizeof(master));
+    cia_win_secure_zero(master, sizeof(master));
     if (!default_profile_created) return FALSE;
     g_profile_count = 1;
     g_active_profile = 0;
     BOOL profile_db_saved = profiles_save();
-    SecureZeroMemory(g_profiles[0].master_key, sizeof(g_profiles[0].master_key));
+    cia_win_secure_zero(g_profiles[0].master_key, sizeof(g_profiles[0].master_key));
     g_profiles[0].master_loaded = FALSE;
     return profile_db_saved;
 }

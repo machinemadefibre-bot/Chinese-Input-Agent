@@ -192,14 +192,16 @@ function Test-ProfilesDoNotManageCryptoLifecycle {
 
 function Test-KeyPersistenceUsesAtomicWrites {
     $shared = Read-RepoFile "src\app_shared.c"
+    $platform = Read-RepoFile "src\cia_platform_windows.c"
     $profiles = Read-RepoFile "src\app_profiles.c"
     $archive = Read-RepoFile "src\app_archive.c"
     $chatHistory = Read-RepoFile "src\app_chat_history.c"
     $crypto = Read-RepoFile "src\crypto_box.c"
 
     Assert-True $shared.Contains("write_file_bytes_atomic") "app_shared.c should implement write_file_bytes_atomic"
-    Assert-True $shared.Contains("MoveFileExW") "atomic writes should replace via MoveFileExW"
-    Assert-True $shared.Contains("MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH") "atomic writes should use replace and write-through"
+    Assert-True $shared.Contains("cia_win_write_file_bytes_atomic") "app_shared atomic writes should delegate to the platform boundary"
+    Assert-True $platform.Contains("MoveFileExW") "atomic writes should replace via MoveFileExW"
+    Assert-True $platform.Contains("MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH") "atomic writes should use replace and write-through"
     Assert-True (Get-RepoSlice $profiles "BOOL profiles_save" "BOOL profiles_create_from_master").Contains("write_file_bytes_atomic") "profiles_save should use atomic writes"
     Assert-True $archive.Contains("chat_history_append_private") "private archive append should delegate to SQLite chat history"
     Assert-True $archive.Contains("chat_history_load_private") "private archive load should delegate to SQLite chat history"
@@ -233,8 +235,8 @@ function Test-ChatHistoryUsesEncryptedRowsInSQLite {
     Assert-True $history.Contains("group_history_keys") "chat history should store local wrapped group history keys"
     Assert-True $history.Contains("BCRYPT_CHAIN_MODE_GCM") "chat history rows should use AES-GCM"
     Assert-True $history.Contains("#define CHAT_TAG_BYTES 16") "chat history AES-GCM tag should remain 16 bytes"
-    Assert-True $history.Contains("CryptProtectData") "group history keys should be protected by DPAPI"
-    Assert-True $history.Contains("CryptUnprotectData") "group history keys should be unprotected by DPAPI"
+    Assert-True $history.Contains("cia_win_dpapi_protect") "group history keys should be protected by DPAPI through the platform boundary"
+    Assert-True $history.Contains("cia_win_dpapi_unprotect") "group history keys should be unprotected by DPAPI through the platform boundary"
     Assert-True $history.Contains("group_history_key_entropy") "group history key DPAPI protection should be scoped to the group id"
     Assert-True $history.Contains("PRAGMA secure_delete=ON") "SQLite should enable secure_delete"
     Assert-True $history.Contains("verify_schema_version") "chat history should reject unsupported schema versions"
@@ -347,6 +349,29 @@ function Test-CiaCoreFacade {
     Assert-True $impl.Contains("app_groups_archive_load_text(") "cia_core.c should reuse group archive adapter"
 }
 
+function Test-WindowsPlatformBoundary {
+    $cmake = Read-RepoFile "CMakeLists.txt"
+    $platformHeader = Read-RepoFile "src\cia_platform_windows.h"
+    $platformImpl = Read-RepoFile "src\cia_platform_windows.c"
+    $storage = Read-RepoFile "src\app_storage.c"
+    $shared = Read-RepoFile "src\app_shared.c"
+    $history = Read-RepoFile "src\app_chat_history.c"
+
+    Assert-True $cmake.Contains("src/cia_platform_windows.c") "Windows platform boundary should be compiled into cia_core"
+    Assert-True $platformHeader.Contains("cia_win_random_bytes") "platform boundary should expose random bytes"
+    Assert-True $platformHeader.Contains("cia_win_secure_zero") "platform boundary should expose secure zero"
+    Assert-True $platformHeader.Contains("cia_win_write_file_bytes_atomic") "platform boundary should expose atomic file replace"
+    Assert-True $platformHeader.Contains("cia_win_dpapi_protect") "platform boundary should expose DPAPI protect"
+    Assert-True $platformHeader.Contains("cia_win_dpapi_unprotect") "platform boundary should expose DPAPI unprotect"
+    Assert-True $platformImpl.Contains("BCryptGenRandom") "Windows random should be isolated in the platform boundary"
+    Assert-True $platformImpl.Contains("CryptProtectData") "DPAPI protect should be isolated in the platform boundary"
+    Assert-True $platformImpl.Contains("MoveFileExW") "atomic replace should be isolated in the platform boundary"
+    Assert-True $storage.Contains("cia_win_dpapi_protect") "app_storage should use the platform DPAPI wrapper"
+    Assert-True $storage.Contains("cia_win_random_bytes") "app_storage should use the platform random wrapper"
+    Assert-True $shared.Contains("cia_win_write_file_bytes_atomic") "app_shared atomic write should delegate to platform"
+    Assert-True $history.Contains("cia_win_dpapi_protect") "group history DPAPI should use platform wrapper"
+}
+
 function Test-TopLevelCMakeBuildTargets {
     $cmake = Read-RepoFile "CMakeLists.txt"
     $mingw = Read-RepoFile "build-mingw.bat"
@@ -387,6 +412,7 @@ $tests = @(
     "Test-AppFlowOwnsCryptoBusinessFlow",
     "Test-GroupChatTransportInvariants",
     "Test-CiaCoreFacade",
+    "Test-WindowsPlatformBoundary",
     "Test-TopLevelCMakeBuildTargets"
 )
 

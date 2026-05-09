@@ -34,6 +34,7 @@ $args = @(
     "src\app_chat_history.c",
     "src\app_shared.c",
     "src\app_storage.c",
+    "src\cia_platform_windows.c",
     "third_party\sqlite\sqlite3.c",
     "-lbcrypt",
     "-lcrypt32"

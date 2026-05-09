@@ -1,7 +1,7 @@
 #include "app_storage.h"
+#include "cia_platform_windows.h"
 #include "app_shared.h"
 #include <bcrypt.h>
-#include <wincrypt.h>
 #include <string.h>
 
 #define MASTER_KEY_BYTES APP_STORAGE_MASTER_KEY_BYTES
@@ -10,43 +10,12 @@
 #define LOCAL_BLOB_NONCE_BYTES APP_STORAGE_LOCAL_BLOB_NONCE_BYTES
 #define LOCAL_BLOB_TAG_BYTES APP_STORAGE_LOCAL_BLOB_TAG_BYTES
 BOOL dpapi_protect(const BYTE *plain, DWORD plain_len, BYTE **out, DWORD *out_len) {
-    DATA_BLOB in_blob, out_blob;
-    in_blob.pbData = (BYTE *)plain;
-    in_blob.cbData = plain_len;
-    ZeroMemory(&out_blob, sizeof(out_blob));
-    if (!CryptProtectData(&in_blob, L"ChineseInputAgent local secret", NULL, NULL, NULL, 0, &out_blob)) {
-        return FALSE;
-    }
-    BYTE *copy = (BYTE *)xalloc(out_blob.cbData);
-    if (!copy) {
-        LocalFree(out_blob.pbData);
-        return FALSE;
-    }
-    CopyMemory(copy, out_blob.pbData, out_blob.cbData);
-    *out = copy;
-    *out_len = out_blob.cbData;
-    LocalFree(out_blob.pbData);
-    return TRUE;
+    return cia_win_dpapi_protect(plain, plain_len, L"ChineseInputAgent local secret",
+                                 NULL, 0, out, out_len);
 }
 
 BOOL dpapi_unprotect(const BYTE *blob, DWORD blob_len, BYTE **out, DWORD *out_len) {
-    DATA_BLOB in_blob, out_blob;
-    in_blob.pbData = (BYTE *)blob;
-    in_blob.cbData = blob_len;
-    ZeroMemory(&out_blob, sizeof(out_blob));
-    if (!CryptUnprotectData(&in_blob, NULL, NULL, NULL, NULL, 0, &out_blob)) {
-        return FALSE;
-    }
-    BYTE *copy = (BYTE *)xalloc(out_blob.cbData);
-    if (!copy) {
-        LocalFree(out_blob.pbData);
-        return FALSE;
-    }
-    CopyMemory(copy, out_blob.pbData, out_blob.cbData);
-    *out = copy;
-    *out_len = out_blob.cbData;
-    LocalFree(out_blob.pbData);
-    return TRUE;
+    return cia_win_dpapi_unprotect(blob, blob_len, NULL, 0, out, out_len);
 }
 
 BOOL local_aes_gcm_encrypt(const BYTE key[MASTER_KEY_BYTES], const BYTE *plain, DWORD plain_len,
@@ -63,7 +32,7 @@ BOOL local_aes_gcm_encrypt(const BYTE key[MASTER_KEY_BYTES], const BYTE *plain, 
     BYTE nonce[LOCAL_BLOB_NONCE_BYTES];
     BYTE *envelope = NULL;
 
-    if (BCryptGenRandom(NULL, nonce, sizeof(nonce), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) return FALSE;
+    if (!cia_win_random_bytes(nonce, sizeof(nonce))) return FALSE;
     if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, NULL, 0) < 0) goto cleanup;
     if (BCryptSetProperty(alg, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_GCM,
                           sizeof(BCRYPT_CHAIN_MODE_GCM), 0) < 0) goto cleanup;
@@ -108,7 +77,7 @@ cleanup:
     if (alg) BCryptCloseAlgorithmProvider(alg, 0);
     secure_free(key_object, obj_len);
     secure_free(envelope, envelope ? total : 0);
-    SecureZeroMemory(nonce, sizeof(nonce));
+    cia_win_secure_zero(nonce, sizeof(nonce));
     return encrypt_succeeded;
 }
 

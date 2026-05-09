@@ -281,6 +281,8 @@ static BOOL local_llm_worker_alive_locked(void) {
     return GetExitCodeProcess(g_llm_worker.process.hProcess, &code) && code == STILL_ACTIVE;
 }
 
+/* Platform boundary note: worker process launching is intentionally not moved
+   yet; app_llm still owns the JSON worker protocol and cancellation behavior. */
 static BOOL start_local_llm_worker_locked(WCHAR *err, size_t err_cch) {
     if (local_llm_worker_alive_locked()) return TRUE;
     close_local_llm_worker_locked(FALSE);

@@ -1,5 +1,6 @@
 #include "crypto_box.h"
 #include "app_shared.h"
+#include "cia_platform_windows.h"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -103,7 +104,7 @@ static void *box_alloc(size_t bytes) {
 
 static void box_secure_free(void *p, size_t bytes) {
     if (p) {
-        SecureZeroMemory(p, bytes);
+        cia_win_secure_zero(p, bytes);
         HeapFree(GetProcessHeap(), 0, p);
     }
 }
@@ -554,16 +555,15 @@ static BOOL generate_handshake_key(CRYPTO_BOX *box) {
         validate_public_key_blob(box->local_handshake_public, sizeof(box->local_handshake_public))) {
         return TRUE;
     }
-    SecureZeroMemory(box->local_handshake_private, sizeof(box->local_handshake_private));
-    SecureZeroMemory(box->local_handshake_public, sizeof(box->local_handshake_public));
-    if (BCryptGenRandom(NULL, box->local_handshake_private, sizeof(box->local_handshake_private),
-                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+    cia_win_secure_zero(box->local_handshake_private, sizeof(box->local_handshake_private));
+    cia_win_secure_zero(box->local_handshake_public, sizeof(box->local_handshake_public));
+    if (!cia_win_random_bytes(box->local_handshake_private, sizeof(box->local_handshake_private))) {
         return FALSE;
     }
     x25519_clamp_private(box->local_handshake_private);
     if (!x25519_public_from_private(box->local_handshake_private, box->local_handshake_public)) {
-        SecureZeroMemory(box->local_handshake_private, sizeof(box->local_handshake_private));
-        SecureZeroMemory(box->local_handshake_public, sizeof(box->local_handshake_public));
+        cia_win_secure_zero(box->local_handshake_private, sizeof(box->local_handshake_private));
+        cia_win_secure_zero(box->local_handshake_public, sizeof(box->local_handshake_public));
         return FALSE;
     }
     box->local_handshake_ready = TRUE;
@@ -766,7 +766,7 @@ static BOOL protect_state_with_key(const BYTE state_key[STATE_KEY_BYTES], const 
     DWORD total = overhead + plain_len;
     BOOL state_protected = FALSE;
 
-    if (BCryptGenRandom(NULL, nonce, sizeof(nonce), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) return FALSE;
+    if (!cia_win_random_bytes(nonce, sizeof(nonce))) return FALSE;
     state_envelope = (uint8_t *)box_alloc(total ? total : 1);
     if (!state_envelope) goto cleanup;
     memcpy(state_envelope, "CIST", 4);
@@ -970,15 +970,15 @@ static BOOL generate_identity(CRYPTO_BOX *box) {
     BOOL identity_generated = FALSE;
     ZeroMemory(priv, sizeof(priv));
     ZeroMemory(pub, sizeof(pub));
-    if (BCryptGenRandom(NULL, priv, sizeof(priv), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) goto cleanup;
+    if (!cia_win_random_bytes(priv, sizeof(priv))) goto cleanup;
     x25519_clamp_private(priv);
     if (!x25519_public_from_private(priv, pub)) goto cleanup;
     identity_generated = box &&
                          buf_set(&box->public_key, pub, sizeof(pub)) &&
                          buf_set(&box->private_key, priv, sizeof(priv));
 cleanup:
-    SecureZeroMemory(priv, sizeof(priv));
-    SecureZeroMemory(pub, sizeof(pub));
+    cia_win_secure_zero(priv, sizeof(priv));
+    cia_win_secure_zero(pub, sizeof(pub));
     return identity_generated;
 }
 

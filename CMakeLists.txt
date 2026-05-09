@@ -30,6 +30,7 @@ set(CIA_CORE_SOURCES
   src/app_message_flow.c
   src/app_tokenizer_prefs.c
   src/cia_core.c
+  src/cia_platform_windows.c
   src/crypto_box.c
   third_party/curve25519-donna/curve25519-donna.c
   third_party/sqlite/sqlite3.c

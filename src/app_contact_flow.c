@@ -4,8 +4,8 @@
 #include "app_groups.h"
 #include "app_profiles.h"
 #include "app_shared.h"
+#include "cia_platform_windows.h"
 
-#include <bcrypt.h>
 #include <strsafe.h>
 #include <string.h>
 
@@ -252,7 +252,7 @@ static BOOL import_decoded_key_package(BYTE *pkg, DWORD pkg_len,
     }
 
     BYTE master[APP_PROFILE_MASTER_KEY_BYTES];
-    if (BCryptGenRandom(NULL, master, sizeof(master), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+    if (!cia_win_random_bytes(master, sizeof(master))) {
         secure_free(pkg, pkg_len);
         set_error(err, err_cch, L"\u65e0\u6cd5\u751f\u6210\u672c\u5730\u968f\u673a\u5bc6\u94a5\u3002");
         return FALSE;

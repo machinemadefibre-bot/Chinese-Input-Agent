@@ -2,6 +2,7 @@
 #include "app_constants.h"
 #include "app_limits.h"
 #include "app_paths.h"
+#include "cia_platform_windows.h"
 #include <shlobj.h>
 #include <wincrypt.h>
 #include <stdio.h>
@@ -22,7 +23,7 @@ void xfree(void *ptr) {
 
 void secure_free(void *ptr, SIZE_T bytes) {
     if (ptr) {
-        SecureZeroMemory(ptr, bytes);
+        cia_win_secure_zero(ptr, bytes);
         xfree(ptr);
     }
 }
@@ -326,31 +327,7 @@ BOOL write_file_bytes(const WCHAR *path, const BYTE *bytes, DWORD len) {
 }
 
 BOOL write_file_bytes_atomic(const WCHAR *path, const BYTE *bytes, DWORD len) {
-    if (!path || !path[0] || (!bytes && len)) return FALSE;
-
-    WCHAR target_dir[MAX_PATH];
-    WCHAR temp_path[MAX_PATH];
-    if (FAILED(StringCchCopyW(target_dir, ARRAYSIZE(target_dir), path))) return FALSE;
-    strip_last_path_component(target_dir);
-    if (!target_dir[0]) return FALSE;
-    if (!GetTempFileNameW(target_dir, APP_TEMP_FILE_PREFIX, 0, temp_path)) return FALSE;
-
-    HANDLE h = CreateFileW(temp_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-        DeleteFileW(temp_path);
-        return FALSE;
-    }
-
-    DWORD written = 0;
-    BOOL temp_file_written = WriteFile(h, bytes, len, &written, NULL) && written == len && FlushFileBuffers(h);
-    CloseHandle(h);
-    BOOL replace_succeeded = temp_file_written;
-    if (replace_succeeded) {
-        replace_succeeded = MoveFileExW(temp_path, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-    }
-    if (!replace_succeeded) DeleteFileW(temp_path);
-    return replace_succeeded;
+    return cia_win_write_file_bytes_atomic(path, bytes, len);
 }
 
 BOOL write_text_utf8_file(const WCHAR *path, const WCHAR *text) {
