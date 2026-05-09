@@ -12,11 +12,27 @@ static volatile LONG g_work_active;
 static volatile LONG g_cancel_work;
 static APP_WORK_HOST g_host;
 
+#define WORK_GROUP_EXPORT_CACHE_SLOTS 16
+
+typedef struct WORK_GROUP_EXPORT_CACHE_ENTRY {
+    BOOL used;
+    int group_index;
+    WCHAR *text;
+} WORK_GROUP_EXPORT_CACHE_ENTRY;
+
+static CRYPTO_BOX *g_cached_contact_export_box;
+static WCHAR *g_cached_contact_export_text;
+static WORK_GROUP_EXPORT_CACHE_ENTRY g_cached_group_exports[WORK_GROUP_EXPORT_CACHE_SLOTS];
 static DWORD WINAPI work_thread_proc(LPVOID param);
 static void reset_work_state_flags(void);
 static void app_work_post_llm_stream_progress(void *user, const WCHAR *partial,
                                               size_t tokens_done, size_t tokens_total, double tps);
-
+static void cache_contact_export(CRYPTO_BOX *box, const WCHAR *text);
+static BOOL copy_cached_contact_export(CRYPTO_BOX *box, WCHAR **out,
+                                       BOOL *cache_hit, WCHAR *err, size_t err_cch);
+static void cache_group_export(int group_index, const WCHAR *text);
+static BOOL copy_cached_group_export(int group_index, WCHAR **out,
+                                     BOOL *cache_hit, WCHAR *err, size_t err_cch);
 void app_work_configure(const APP_WORK_HOST *host) {
     if (host) {
         g_host = *host;
@@ -67,6 +83,91 @@ void app_work_cancel(void) {
 
 BOOL app_work_cancelled(void) {
     return InterlockedCompareExchange(&g_cancel_work, 0, 0) != 0;
+}
+
+static void clear_cached_contact_export(void) {
+    secure_free_wide(g_cached_contact_export_text);
+    g_cached_contact_export_text = NULL;
+    g_cached_contact_export_box = NULL;
+}
+
+static void clear_cached_group_exports(void) {
+    for (size_t slot = 0; slot < WORK_GROUP_EXPORT_CACHE_SLOTS; ++slot) {
+        secure_free_wide(g_cached_group_exports[slot].text);
+        g_cached_group_exports[slot].text = NULL;
+        g_cached_group_exports[slot].group_index = -1;
+        g_cached_group_exports[slot].used = FALSE;
+    }
+}
+
+void app_work_clear_key_export_cache(void) {
+    clear_cached_contact_export();
+    clear_cached_group_exports();
+}
+
+static void cache_contact_export(CRYPTO_BOX *box, const WCHAR *text) {
+    clear_cached_contact_export();
+    if (!box || !text) return;
+    WCHAR *copy = win_dup_wide(text);
+    if (!copy) return;
+    g_cached_contact_export_box = box;
+    g_cached_contact_export_text = copy;
+}
+
+static BOOL copy_cached_contact_export(CRYPTO_BOX *box, WCHAR **out,
+                                       BOOL *cache_hit, WCHAR *err, size_t err_cch) {
+    *out = NULL;
+    if (cache_hit) *cache_hit = FALSE;
+    if (!box || box != g_cached_contact_export_box || !g_cached_contact_export_text) return TRUE;
+    if (cache_hit) *cache_hit = TRUE;
+    *out = win_dup_wide(g_cached_contact_export_text);
+    if (!*out) {
+        set_error(err, err_cch, L"Out of memory.");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void cache_group_export(int group_index, const WCHAR *text) {
+    if (group_index < 0 || !text) return;
+    size_t target_slot = WORK_GROUP_EXPORT_CACHE_SLOTS;
+    for (size_t slot = 0; slot < WORK_GROUP_EXPORT_CACHE_SLOTS; ++slot) {
+        if (g_cached_group_exports[slot].used && g_cached_group_exports[slot].group_index == group_index) {
+            target_slot = slot;
+            break;
+        }
+        if (!g_cached_group_exports[slot].used && target_slot == WORK_GROUP_EXPORT_CACHE_SLOTS) {
+            target_slot = slot;
+        }
+    }
+    if (target_slot == WORK_GROUP_EXPORT_CACHE_SLOTS) target_slot = 0;
+    secure_free_wide(g_cached_group_exports[target_slot].text);
+    g_cached_group_exports[target_slot].text = win_dup_wide(text);
+    if (!g_cached_group_exports[target_slot].text) {
+        g_cached_group_exports[target_slot].used = FALSE;
+        g_cached_group_exports[target_slot].group_index = -1;
+        return;
+    }
+    g_cached_group_exports[target_slot].used = TRUE;
+    g_cached_group_exports[target_slot].group_index = group_index;
+}
+
+static BOOL copy_cached_group_export(int group_index, WCHAR **out,
+                                     BOOL *cache_hit, WCHAR *err, size_t err_cch) {
+    *out = NULL;
+    if (cache_hit) *cache_hit = FALSE;
+    if (group_index < 0) return TRUE;
+    for (size_t slot = 0; slot < WORK_GROUP_EXPORT_CACHE_SLOTS; ++slot) {
+        if (!g_cached_group_exports[slot].used || g_cached_group_exports[slot].group_index != group_index) continue;
+        if (cache_hit) *cache_hit = TRUE;
+        *out = win_dup_wide(g_cached_group_exports[slot].text);
+        if (!*out) {
+            set_error(err, err_cch, L"Out of memory.");
+            return FALSE;
+        }
+        return TRUE;
+    }
+    return TRUE;
 }
 
 void app_work_complete_message_handled(void) {
@@ -206,15 +307,27 @@ static BOOL worker_export_key(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t
         set_error(err, err_cch, L"No active crypto context is open.");
         return FALSE;
     }
+    BOOL cache_hit = FALSE;
+    if (!copy_cached_contact_export(box, out, &cache_hit, err, err_cch) || cache_hit) {
+        return cache_hit && *out;
+    }
     CIA_PROGRESS_SINK progress = progress_sink_for_ctx(ctx);
-    return app_flow_export_key(box, &progress, out, err, err_cch);
+    BOOL exported = app_flow_export_key(box, &progress, out, err, err_cch);
+    if (exported) cache_contact_export(box, *out);
+    return exported;
 }
 
 static BOOL worker_export_group(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
+    int group_index = ctx ? ctx->group_index : -1;
+    BOOL cache_hit = FALSE;
+    if (!copy_cached_group_export(group_index, out, &cache_hit, err, err_cch) || cache_hit) {
+        return cache_hit && *out;
+    }
     CIA_PROGRESS_SINK progress = progress_sink_for_ctx(ctx);
-    return app_flow_export_group_key(ctx ? ctx->group_index : -1,
-                                     &progress, out, err, err_cch);
+    BOOL exported = app_flow_export_group_key(group_index, &progress, out, err, err_cch);
+    if (exported) cache_group_export(group_index, *out);
+    return exported;
 }
 
 static BOOL worker_create_group(APP_WORK_CTX *ctx, WCHAR **out, int *group_index_out,
@@ -318,6 +431,12 @@ static DWORD WINAPI work_thread_proc(LPVOID param) {
     if (work_succeeded && !app_work_cancelled()) {
         terminal_msg = WM_APP_WORK_DONE;
         terminal_text = result ? result : L"";
+        if (ctx->kind == APP_WORK_KIND_IMPORT_KEY) {
+            app_work_clear_key_export_cache();
+        } else if (ctx->kind == APP_WORK_KIND_CREATE_GROUP || ctx->kind == APP_WORK_KIND_REKEY_GROUP) {
+            clear_cached_group_exports();
+            cache_group_export(result_group_index, result);
+        }
     } else if (app_work_cancelled()) {
         terminal_msg = WM_APP_WORK_CANCELLED;
         terminal_text = L"";

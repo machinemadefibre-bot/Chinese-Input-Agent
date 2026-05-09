@@ -132,6 +132,7 @@ static void refresh_key_combo(void) {
 }
 
 static void close_active_crypto(void) {
+    app_work_clear_key_export_cache();
     crypto_box_close(g_active_box);
     g_active_box = NULL;
 }

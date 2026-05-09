@@ -593,6 +593,49 @@ static bool contains_punctuation(const std::string & text) {
     return false;
 }
 
+static bool last_significant_codepoint(const std::string & text, uint32_t & out) {
+    size_t i = 0;
+    uint32_t cp = 0;
+    bool found = false;
+    while (next_utf8(text, i, cp)) {
+        if (cp == ' ' || cp == '\r' || cp == '\n' || cp == '\t' || cp == 0x3000) continue;
+        out = cp;
+        found = true;
+    }
+    return found;
+}
+
+static bool is_sentence_terminal_punctuation(uint32_t cp) {
+    return cp == 0x3002 || cp == 0xff01 || cp == 0xff1f ||
+           cp == '.' || cp == '!' || cp == '?';
+}
+
+static bool is_clause_continuation_punctuation(uint32_t cp) {
+    return cp == 0xff0c || cp == 0x3001 || cp == 0xff1b || cp == 0xff1a ||
+           cp == ',' || cp == ';' || cp == ':';
+}
+
+static bool is_ignorable_token_prefix(uint32_t cp) {
+    return cp == ' ' || cp == '\r' || cp == '\n' || cp == '\t' ||
+           cp == 0x3000 || cp == 0x2581;
+}
+
+static bool disallowed_punctuation_transition(const std::string & generated_text,
+                                              const std::string & piece) {
+    uint32_t prev = 0;
+    if (!last_significant_codepoint(generated_text, prev) ||
+        !is_sentence_terminal_punctuation(prev)) return false;
+    size_t i = 0;
+    uint32_t cp = 0;
+    while (next_utf8(piece, i, cp)) {
+        if (is_ignorable_token_prefix(cp)) continue;
+        if (is_clause_continuation_punctuation(cp)) return true;
+        if (is_cjk(cp) || is_sentence_terminal_punctuation(cp)) return false;
+        if (is_any_punctuation(cp)) return false;
+    }
+    return false;
+}
+
 static bool is_punctuation_only_text(const std::string & text) {
     if (text.empty()) return false;
     bool any = false;
@@ -1221,6 +1264,7 @@ static bool disallowed_article_continuation(const std::string & generated_text,
                                             const std::string & piece,
                                             const std::vector<std::string> & reject_phrases) {
     if (contains_bracket(piece) || piece.find("<|") != std::string::npos) return true;
+    if (disallowed_punctuation_transition(generated_text, piece)) return true;
     std::string probe = generated_text + piece;
     std::string tail = probe.size() > 4096 ? probe.substr(probe.size() - 4096) : probe;
     if (looks_like_meta_or_compliance_text(tail)) return true;
@@ -1748,6 +1792,7 @@ public:
             auto tx = table.token_text.find(id);
             const std::string & piece = tx == table.token_text.end() ? std::string() : tx->second;
             if (!piece.empty() && contains_bracket(piece)) continue;
+            if (!piece.empty() && disallowed_punctuation_transition(generated_text, piece)) continue;
             float score = apply_contiguous_repeat_penalty(logits[id], generated_tokens, id);
             data.push_back({id, score, 0.0f});
         }
@@ -1783,6 +1828,7 @@ public:
         for (int id : table.punctuation_tokens) {
             auto tx = table.token_text.find(id);
             std::string piece = tx == table.token_text.end() ? token_piece(vocab, id) : tx->second;
+            if (disallowed_punctuation_transition(generated_text, piece)) continue;
             bool stable = false;
             try { stable = stable_append_tail(vocab, tail_text, tail_tokens, id, piece); } catch (const std::exception &) { stable = false; }
             if (!stable) continue;
@@ -2099,6 +2145,7 @@ public:
                     continue;
                 }
                 if (recovered == payload) return text;
+
                 last_error = "自检拒绝：载体文本恢复出的二进制载荷与原始载荷不一致";
             } catch (const std::exception & e) {
                 last_error = e.what();

@@ -67,6 +67,7 @@ void app_work_cancel(void);
 BOOL app_work_is_active(void);
 BOOL app_work_cancelled(void);
 void app_work_complete_message_handled(void);
+void app_work_clear_key_export_cache(void);
 void app_work_free_ctx(APP_WORK_CTX *ctx);
 void app_work_free_message(APP_WORK_MESSAGE *message);
 
