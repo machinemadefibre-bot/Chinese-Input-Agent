@@ -47,7 +47,7 @@ This does not mean the project can bypass moderation, platform rules, or legal p
 - Encode ciphertext with a top-k token carrier and recover it from the generated article.
 - Try multiple tokenizer profiles during decode; the encryption layer decides which candidate is valid.
 - Prefer CUDA, fall back to Vulkan, and then fall back to CPU.
-- Store profiles, contacts, groups, and chat history in the portable app's local `data/` directory. Chat history message bodies are stored as per-row encrypted SQLite blobs; conversation kind/key, timestamps, nonce, tag, and message UUID remain plaintext metadata. This is not SQLCipher-style whole-database encryption.
+- Store profiles, contacts, groups, and chat history in the portable app's local `data/` directory. Chat history message bodies are stored as per-row encrypted SQLite blobs; conversation kind/key, timestamps, nonce, tag, and message UUID remain plaintext metadata. This is not SQLCipher-style whole-database encryption. Private history keys are derived from the profile master key; group history uses a local DPAPI-protected group history key.
 - Protect the local master key with Windows Hello.
 
 ## What It Is Not

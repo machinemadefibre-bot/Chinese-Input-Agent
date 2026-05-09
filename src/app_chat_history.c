@@ -295,108 +295,6 @@ static BOOL chat_db_exists(void)
     return file_exists_w(path);
 }
 
-static BOOL hmac_sha256_segments(const BYTE *key,
-                                 DWORD key_len,
-                                 const BYTE **segments,
-                                 const DWORD *segment_lens,
-                                 size_t segment_count,
-                                 BYTE out[CHAT_HISTORY_KEY_BYTES])
-{
-    BCRYPT_ALG_HANDLE algorithm = NULL;
-    BCRYPT_HASH_HANDLE hash = NULL;
-    BYTE *object = NULL;
-    DWORD object_len = 0;
-    DWORD result_len = 0;
-    BOOL result = FALSE;
-
-    if (BCryptOpenAlgorithmProvider(&algorithm,
-                                    BCRYPT_SHA256_ALGORITHM,
-                                    NULL,
-                                    BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0) {
-        goto cleanup;
-    }
-    if (BCryptGetProperty(algorithm,
-                          BCRYPT_OBJECT_LENGTH,
-                          (PUCHAR)&object_len,
-                          sizeof(object_len),
-                          &result_len,
-                          0) != 0) {
-        goto cleanup;
-    }
-    object = (BYTE *)xalloc(object_len);
-    if (!object) {
-        goto cleanup;
-    }
-    if (BCryptCreateHash(algorithm,
-                         &hash,
-                         object,
-                         object_len,
-                         (PUCHAR)key,
-                         key_len,
-                         0) != 0) {
-        goto cleanup;
-    }
-    for (size_t idx = 0; idx < segment_count; ++idx) {
-        if (segment_lens[idx] &&
-            BCryptHashData(hash, (PUCHAR)segments[idx], segment_lens[idx], 0) != 0) {
-            goto cleanup;
-        }
-    }
-    if (BCryptFinishHash(hash, out, CHAT_HISTORY_KEY_BYTES, 0) != 0) {
-        goto cleanup;
-    }
-    result = TRUE;
-
-cleanup:
-    if (!result) {
-        SecureZeroMemory(out, CHAT_HISTORY_KEY_BYTES);
-    }
-    if (hash) {
-        BCryptDestroyHash(hash);
-    }
-    if (object) {
-        secure_free(object, object_len);
-    }
-    if (algorithm) {
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-    }
-    return result;
-}
-
-static BOOL derive_private_history_key(const WCHAR *profile_id,
-                                       const BYTE profile_master[CHAT_HISTORY_KEY_BYTES],
-                                       BYTE out_key[CHAT_HISTORY_KEY_BYTES],
-                                       WCHAR *err,
-                                       size_t err_cch)
-{
-    static const BYTE label[] = "ChineseInputAgent private chat history v1";
-    char *profile_id_utf8 = NULL;
-    if (!profile_id || !profile_id[0] || !profile_master) {
-        set_error(err, err_cch, L"Invalid private chat history key input.");
-        return FALSE;
-    }
-    if (!wide_to_utf8(profile_id, &profile_id_utf8, NULL)) {
-        set_error(err, err_cch, L"Unable to encode profile id.");
-        return FALSE;
-    }
-    const BYTE *segments[2] = { label, (const BYTE *)profile_id_utf8 };
-    DWORD segment_lens[2] = {
-        (DWORD)(sizeof(label) - 1),
-        (DWORD)strlen(profile_id_utf8)
-    };
-    BOOL result = hmac_sha256_segments(profile_master,
-                                       CHAT_HISTORY_KEY_BYTES,
-                                       segments,
-                                       segment_lens,
-                                       ARRAYSIZE(segments),
-                                       out_key);
-    secure_free_str(profile_id_utf8);
-    if (!result) {
-        set_error(err, err_cch, L"Unable to derive private chat history key.");
-    }
-    return result;
-}
-
 static BOOL aes_gcm_encrypt_raw(const BYTE key[CHAT_HISTORY_KEY_BYTES],
                                 const BYTE *nonce,
                                 DWORD nonce_len,
@@ -1214,7 +1112,7 @@ cleanup:
 }
 
 BOOL chat_history_append_private(const WCHAR *profile_id,
-                                 const BYTE profile_master[CHAT_HISTORY_KEY_BYTES],
+                                 const BYTE private_history_key[CHAT_HISTORY_KEY_BYTES],
                                  const WCHAR *sender,
                                  const WCHAR *plain,
                                  WCHAR *err,
@@ -1222,12 +1120,10 @@ BOOL chat_history_append_private(const WCHAR *profile_id,
 {
     sqlite3 *db = NULL;
     char *profile_key = NULL;
-    BYTE history_key[CHAT_HISTORY_KEY_BYTES];
     BOOL transaction_started = FALSE;
     BOOL result = FALSE;
-    SecureZeroMemory(history_key, sizeof(history_key));
 
-    if (!profile_id || !profile_id[0] || !profile_master) {
+    if (!profile_id || !profile_id[0] || !private_history_key) {
         set_error(err, err_cch, L"Invalid private chat history input.");
         return FALSE;
     }
@@ -1235,8 +1131,7 @@ BOOL chat_history_append_private(const WCHAR *profile_id,
         set_error(err, err_cch, L"Unable to encode private chat history key.");
         return FALSE;
     }
-    if (!derive_private_history_key(profile_id, profile_master, history_key, err, err_cch) ||
-        !open_chat_db(&db, err, err_cch) ||
+    if (!open_chat_db(&db, err, err_cch) ||
         !begin_transaction(db, err, err_cch)) {
         goto cleanup;
     }
@@ -1244,7 +1139,7 @@ BOOL chat_history_append_private(const WCHAR *profile_id,
     if (!insert_encrypted_message(db,
                                   CHAT_KIND_PRIVATE,
                                   profile_key,
-                                  history_key,
+                                  private_history_key,
                                   sender,
                                   plain,
                                   err,
@@ -1265,26 +1160,23 @@ cleanup:
         sqlite3_close(db);
     }
     secure_free_str(profile_key);
-    SecureZeroMemory(history_key, sizeof(history_key));
     return result;
 }
 
 BOOL chat_history_load_private(const WCHAR *profile_id,
-                               const BYTE profile_master[CHAT_HISTORY_KEY_BYTES],
+                               const BYTE private_history_key[CHAT_HISTORY_KEY_BYTES],
                                WCHAR **out,
                                WCHAR *err,
                                size_t err_cch)
 {
     sqlite3 *db = NULL;
     char *profile_key = NULL;
-    BYTE history_key[CHAT_HISTORY_KEY_BYTES];
     BOOL result = FALSE;
-    SecureZeroMemory(history_key, sizeof(history_key));
 
     if (out) {
         *out = NULL;
     }
-    if (!out || !profile_id || !profile_id[0] || !profile_master) {
+    if (!out || !profile_id || !profile_id[0] || !private_history_key) {
         set_error(err, err_cch, L"Invalid private chat history load input.");
         return FALSE;
     }
@@ -1296,9 +1188,8 @@ BOOL chat_history_load_private(const WCHAR *profile_id,
         set_error(err, err_cch, L"Unable to encode private chat history key.");
         return FALSE;
     }
-    if (!derive_private_history_key(profile_id, profile_master, history_key, err, err_cch) ||
-        !open_chat_db(&db, err, err_cch) ||
-        !load_messages(db, CHAT_KIND_PRIVATE, profile_key, history_key, out, err, err_cch)) {
+    if (!open_chat_db(&db, err, err_cch) ||
+        !load_messages(db, CHAT_KIND_PRIVATE, profile_key, private_history_key, out, err, err_cch)) {
         goto cleanup;
     }
     result = TRUE;
@@ -1308,7 +1199,6 @@ cleanup:
         sqlite3_close(db);
     }
     secure_free_str(profile_key);
-    SecureZeroMemory(history_key, sizeof(history_key));
     return result;
 }
 

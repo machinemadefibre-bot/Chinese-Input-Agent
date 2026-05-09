@@ -9,8 +9,8 @@
 #define APP_PROFILE_MAX_PROFILES 64
 
 typedef struct KEY_PROFILE KEY_PROFILE;
-typedef BOOL (*PROFILE_MASTER_KEY_FN)(const BYTE profile_master[APP_PROFILE_MASTER_KEY_BYTES],
-                                      void *user, WCHAR *err, size_t err_cch);
+typedef BOOL (*PROFILE_DERIVED_KEY_FN)(const BYTE derived_key[APP_PROFILE_MASTER_KEY_BYTES],
+                                       void *user, WCHAR *err, size_t err_cch);
 
 BOOL profiles_load(WCHAR *err, size_t err_cch);
 BOOL profiles_save(void);
@@ -30,7 +30,7 @@ BOOL profiles_append_from_master(const WCHAR *name, const BYTE profile_master[AP
                                  int *index_out, WCHAR *err, size_t err_cch);
 void profiles_remove_at(int index);
 BOOL profiles_open_crypto(int index, CRYPTO_BOX **out, WCHAR *err, size_t err_cch);
-BOOL profiles_with_master_key(int index, PROFILE_MASTER_KEY_FN callback, void *user,
-                              WCHAR *err, size_t err_cch);
+BOOL profiles_with_private_history_key(int index, PROFILE_DERIVED_KEY_FN callback, void *user,
+                                       WCHAR *err, size_t err_cch);
 
 #endif

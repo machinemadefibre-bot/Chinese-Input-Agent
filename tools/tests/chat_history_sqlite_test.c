@@ -1,4 +1,4 @@
-#include "app_chat_history.h"
+﻿#include "app_chat_history.h"
 #include "app_paths.h"
 #include "app_shared.h"
 #include "sqlite3.h"
@@ -8,7 +8,7 @@
 #include <string.h>
 #include <strsafe.h>
 
-static BYTE g_master[CHAT_HISTORY_KEY_BYTES] = {
+static BYTE g_private_history_key[CHAT_HISTORY_KEY_BYTES] = {
     0x10, 0x22, 0x34, 0x46, 0x58, 0x6a, 0x7c, 0x8e,
     0x91, 0xa3, 0xb5, 0xc7, 0xd9, 0xeb, 0xfd, 0x0f,
     0x01, 0x13, 0x25, 0x37, 0x49, 0x5b, 0x6d, 0x7f,
@@ -68,7 +68,7 @@ static void test_missing_db_returns_empty(const WCHAR *root)
     WCHAR err[512] = L"";
     WCHAR *out = NULL;
     check(set_case_dir(root, L"missing", dir, ARRAYSIZE(dir)), L"set missing DB test dir");
-    check(chat_history_load_private(L"profile-missing", g_master, &out, err, ARRAYSIZE(err)),
+    check(chat_history_load_private(L"profile-missing", g_private_history_key, &out, err, ARRAYSIZE(err)),
           L"missing DB load should succeed");
     check(out && out[0] == L'\0', L"missing DB should load empty history");
     secure_free_wide(out);
@@ -84,9 +84,9 @@ static void test_private_roundtrip_and_no_plaintext(const WCHAR *root)
     DWORD db_len = 0;
 
     check(set_case_dir(root, L"private_basic", dir, ARRAYSIZE(dir)), L"set private test dir");
-    check(chat_history_append_private(L"profile-private", g_master, L"AliceSecret", L"alpha secret body", err, ARRAYSIZE(err)),
+    check(chat_history_append_private(L"profile-private", g_private_history_key, L"AliceSecret", L"alpha secret body", err, ARRAYSIZE(err)),
           L"private append should succeed");
-    check(chat_history_load_private(L"profile-private", g_master, &out, err, ARRAYSIZE(err)),
+    check(chat_history_load_private(L"profile-private", g_private_history_key, &out, err, ARRAYSIZE(err)),
           L"private load should succeed");
     check(contains_wide(out, L"\u53d1\u9001\u4eba\uff1aAliceSecret\r\nalpha secret body\r\n\r\n"),
           L"private load should reconstruct display record");
@@ -105,12 +105,12 @@ static void test_private_order(const WCHAR *root)
     WCHAR err[512] = L"";
     WCHAR *out = NULL;
     check(set_case_dir(root, L"private_order", dir, ARRAYSIZE(dir)), L"set order test dir");
-    check(chat_history_append_private(L"profile-order", g_master, L"A", L"first", err, ARRAYSIZE(err)),
+    check(chat_history_append_private(L"profile-order", g_private_history_key, L"A", L"first", err, ARRAYSIZE(err)),
           L"first append should succeed");
     Sleep(10);
-    check(chat_history_append_private(L"profile-order", g_master, L"A", L"second", err, ARRAYSIZE(err)),
+    check(chat_history_append_private(L"profile-order", g_private_history_key, L"A", L"second", err, ARRAYSIZE(err)),
           L"second append should succeed");
-    check(chat_history_load_private(L"profile-order", g_master, &out, err, ARRAYSIZE(err)),
+    check(chat_history_load_private(L"profile-order", g_private_history_key, &out, err, ARRAYSIZE(err)),
           L"ordered load should succeed");
     WCHAR *first = wcsstr(out, L"first");
     WCHAR *second = wcsstr(out, L"second");
@@ -152,10 +152,10 @@ static void test_private_tamper_fails(const WCHAR *root, const WCHAR *case_name,
     WCHAR err[512] = L"";
     WCHAR *out = NULL;
     check(set_case_dir(root, case_name, dir, ARRAYSIZE(dir)), L"set tamper test dir");
-    check(chat_history_append_private(L"profile-tamper", g_master, L"A", L"tamper body", err, ARRAYSIZE(err)),
+    check(chat_history_append_private(L"profile-tamper", g_private_history_key, L"A", L"tamper body", err, ARRAYSIZE(err)),
           L"tamper append should succeed");
     exec_tamper_sql(sql);
-    check(!chat_history_load_private(L"profile-tamper", g_master, &out, err, ARRAYSIZE(err)),
+    check(!chat_history_load_private(L"profile-tamper", g_private_history_key, &out, err, ARRAYSIZE(err)),
           L"tampered row should fail load");
     secure_free_wide(out);
 }
@@ -166,10 +166,10 @@ static void test_schema_version_mismatch_fails(const WCHAR *root)
     WCHAR err[512] = L"";
     WCHAR *out = NULL;
     check(set_case_dir(root, L"schema_mismatch", dir, ARRAYSIZE(dir)), L"set schema mismatch test dir");
-    check(chat_history_append_private(L"profile-schema", g_master, L"A", L"schema body", err, ARRAYSIZE(err)),
+    check(chat_history_append_private(L"profile-schema", g_private_history_key, L"A", L"schema body", err, ARRAYSIZE(err)),
           L"schema append should succeed");
     exec_tamper_sql("UPDATE meta SET value='999' WHERE key='schema_version';");
-    check(!chat_history_load_private(L"profile-schema", g_master, &out, err, ARRAYSIZE(err)),
+    check(!chat_history_load_private(L"profile-schema", g_private_history_key, &out, err, ARRAYSIZE(err)),
           L"schema mismatch should fail load");
     check(wcsstr(err, L"Unsupported chat history schema version") != NULL,
           L"schema mismatch should report unsupported version");
@@ -185,9 +185,9 @@ static void test_private_long_text(const WCHAR *root)
     WCHAR *body = make_repeated_wide(L'B', 8192);
     check(sender && body, L"allocate long text");
     check(set_case_dir(root, L"private_long", dir, ARRAYSIZE(dir)), L"set long text test dir");
-    check(chat_history_append_private(L"profile-long", g_master, sender, body, err, ARRAYSIZE(err)),
+    check(chat_history_append_private(L"profile-long", g_private_history_key, sender, body, err, ARRAYSIZE(err)),
           L"long private append should succeed");
-    check(chat_history_load_private(L"profile-long", g_master, &out, err, ARRAYSIZE(err)),
+    check(chat_history_load_private(L"profile-long", g_private_history_key, &out, err, ARRAYSIZE(err)),
           L"long private load should succeed");
     check(wcsstr(out, sender) != NULL && wcsstr(out, body) != NULL,
           L"long private load should recover sender and body");
@@ -235,7 +235,7 @@ static void test_corrupt_db_fails(const WCHAR *root)
     check(set_case_dir(root, L"corrupt", dir, ARRAYSIZE(dir)), L"set corrupt test dir");
     db_path(path, ARRAYSIZE(path));
     check(write_file_bytes(path, junk, sizeof(junk)), L"write corrupt DB");
-    check(!chat_history_load_private(L"profile-corrupt", g_master, &out, err, ARRAYSIZE(err)),
+    check(!chat_history_load_private(L"profile-corrupt", g_private_history_key, &out, err, ARRAYSIZE(err)),
           L"corrupt DB should fail clearly");
     secure_free_wide(out);
 }

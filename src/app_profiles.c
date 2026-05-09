@@ -5,6 +5,7 @@
 #include <bcrypt.h>
 #include <ncrypt.h>
 #include <strsafe.h>
+#include <string.h>
 
 /* Persisted profile database format. Keep these values stable unless a migration is added. */
 #define PROFILES_MAGIC 0x31505348u
@@ -22,6 +23,11 @@ struct KEY_PROFILE {
 static KEY_PROFILE g_profiles[APP_PROFILE_MAX_PROFILES];
 static int g_profile_count;
 static int g_active_profile = -1;
+
+static const char PROFILE_KEY_LABEL_CRYPTO_STATE[] =
+    "ChineseInputAgent crypto state protection v1";
+static const char PROFILE_KEY_LABEL_PRIVATE_HISTORY[] =
+    "ChineseInputAgent private chat history v1";
 
 static BOOL get_profiles_path(WCHAR *path, size_t cch) {
     return get_app_file(path, cch, APP_PROFILES_FILE_NAME);
@@ -52,6 +58,17 @@ static void profiles_clear_profile(KEY_PROFILE *profile) {
     secure_free(profile->wrapped_key, profile->wrapped_key_len);
     SecureZeroMemory(profile->master_key, sizeof(profile->master_key));
     ZeroMemory(profile, sizeof(*profile));
+}
+
+static void lock_profile_master(KEY_PROFILE *profile) {
+    if (!profile) return;
+    SecureZeroMemory(profile->master_key, sizeof(profile->master_key));
+    profile->master_loaded = FALSE;
+}
+
+static void lock_profile_master_if_inactive(int index) {
+    if (index < 0 || index >= g_profile_count || index == g_active_profile) return;
+    lock_profile_master(&g_profiles[index]);
 }
 
 void profiles_clear_all(void) {
@@ -187,6 +204,87 @@ static BOOL unwrap_profile_master_key(KEY_PROFILE *profile, WCHAR *err, size_t e
     }
     profile->master_loaded = TRUE;
     return TRUE;
+}
+
+static BOOL hmac_sha256_segments(const BYTE *key, DWORD key_len,
+                                 const BYTE **segments, const DWORD *segment_lens,
+                                 size_t segment_count,
+                                 BYTE out[APP_PROFILE_MASTER_KEY_BYTES]) {
+    BCRYPT_ALG_HANDLE algorithm = NULL;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    BYTE *object = NULL;
+    DWORD object_len = 0;
+    DWORD result_len = 0;
+    BOOL hmac_succeeded = FALSE;
+
+    if (BCryptOpenAlgorithmProvider(&algorithm,
+                                    BCRYPT_SHA256_ALGORITHM,
+                                    NULL,
+                                    BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0) goto cleanup;
+    if (BCryptGetProperty(algorithm,
+                          BCRYPT_OBJECT_LENGTH,
+                          (PUCHAR)&object_len,
+                          sizeof(object_len),
+                          &result_len,
+                          0) != 0) goto cleanup;
+    object = (BYTE *)xalloc(object_len);
+    if (!object) goto cleanup;
+    if (BCryptCreateHash(algorithm,
+                         &hash,
+                         object,
+                         object_len,
+                         (PUCHAR)key,
+                         key_len,
+                         0) != 0) goto cleanup;
+    for (size_t idx = 0; idx < segment_count; ++idx) {
+        if (segment_lens[idx] &&
+            BCryptHashData(hash, (PUCHAR)segments[idx], segment_lens[idx], 0) != 0) goto cleanup;
+    }
+    if (BCryptFinishHash(hash, out, APP_PROFILE_MASTER_KEY_BYTES, 0) != 0) goto cleanup;
+    hmac_succeeded = TRUE;
+
+cleanup:
+    if (!hmac_succeeded) SecureZeroMemory(out, APP_PROFILE_MASTER_KEY_BYTES);
+    if (hash) BCryptDestroyHash(hash);
+    if (object) secure_free(object, object_len);
+    if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+    return hmac_succeeded;
+}
+
+static BOOL derive_profile_local_key(KEY_PROFILE *profile,
+                                     const BYTE profile_root_key[APP_PROFILE_MASTER_KEY_BYTES],
+                                     const char *label,
+                                     BYTE out_key[APP_PROFILE_MASTER_KEY_BYTES],
+                                     WCHAR *err,
+                                     size_t err_cch) {
+    char *profile_id_utf8 = NULL;
+    if (!profile || !profile_root_key || !label || !out_key) {
+        set_error(err, err_cch, L"Invalid profile key derivation request.");
+        return FALSE;
+    }
+    if (!wide_to_utf8(profile->id, &profile_id_utf8, NULL)) {
+        set_error(err, err_cch, L"Unable to encode profile id for key derivation.");
+        return FALSE;
+    }
+    const BYTE *segments[2] = {
+        (const BYTE *)label,
+        (const BYTE *)profile_id_utf8
+    };
+    DWORD segment_lens[2] = {
+        (DWORD)strlen(label),
+        (DWORD)strlen(profile_id_utf8)
+    };
+    BOOL derived = hmac_sha256_segments(profile_root_key,
+                                        APP_PROFILE_MASTER_KEY_BYTES,
+                                        segments,
+                                        segment_lens,
+                                        ARRAYSIZE(segments),
+                                        out_key);
+    secure_free_str(profile_id_utf8);
+    if (!derived) {
+        set_error(err, err_cch, L"Profile key derivation failed.");
+    }
+    return derived;
 }
 
 BOOL profiles_save(void) {
@@ -361,8 +459,7 @@ BOOL profiles_activate(int index, WCHAR *err, size_t err_cch) {
 void profiles_lock_inactive_masters(void) {
     for (int profile_idx = 0; profile_idx < g_profile_count; ++profile_idx) {
         if (profile_idx == g_active_profile) continue;
-        SecureZeroMemory(g_profiles[profile_idx].master_key, sizeof(g_profiles[profile_idx].master_key));
-        g_profiles[profile_idx].master_loaded = FALSE;
+        lock_profile_master(&g_profiles[profile_idx]);
     }
 }
 
@@ -428,38 +525,69 @@ BOOL profiles_open_crypto(int index, CRYPTO_BOX **out, WCHAR *err, size_t err_cc
         return FALSE;
     }
     KEY_PROFILE *profile = &g_profiles[index];
+    BYTE state_key[APP_PROFILE_MASTER_KEY_BYTES];
+    BOOL opened = FALSE;
+    SecureZeroMemory(state_key, sizeof(state_key));
     if (!profile->master_loaded && !unwrap_profile_master_key(profile, err, err_cch)) return FALSE;
     WCHAR state_path[MAX_PATH];
     if (!profile_get_state_path(profile, state_path, ARRAYSIZE(state_path))) {
         set_error(err, err_cch, L"Profile state path is not available.");
-        if (index != g_active_profile) {
-            SecureZeroMemory(profile->master_key, sizeof(profile->master_key));
-            profile->master_loaded = FALSE;
-        }
-        return FALSE;
+        goto cleanup;
     }
-    BOOL opened = crypto_box_open(profile->master_key, state_path, out, err, err_cch);
-    if (!opened && index != g_active_profile) {
-        SecureZeroMemory(profile->master_key, sizeof(profile->master_key));
-        profile->master_loaded = FALSE;
+    if (!derive_profile_local_key(profile,
+                                  profile->master_key,
+                                  PROFILE_KEY_LABEL_CRYPTO_STATE,
+                                  state_key,
+                                  err,
+                                  err_cch)) {
+        goto cleanup;
     }
+    opened = crypto_box_open(state_key, state_path, out, err, err_cch);
+    if (!opened && file_exists_w(state_path)) {
+        opened = crypto_box_open_with_legacy_state_key(state_key,
+                                                       profile->master_key,
+                                                       state_path,
+                                                       out,
+                                                       err,
+                                                       err_cch);
+    }
+cleanup:
+    SecureZeroMemory(state_key, sizeof(state_key));
+    lock_profile_master_if_inactive(index);
     return opened;
 }
 
-BOOL profiles_with_master_key(int index, PROFILE_MASTER_KEY_FN callback, void *user,
-                              WCHAR *err, size_t err_cch) {
+static BOOL profiles_with_derived_key(int index,
+                                      const char *label,
+                                      PROFILE_DERIVED_KEY_FN callback,
+                                      void *user,
+                                      WCHAR *err,
+                                      size_t err_cch) {
     KEY_PROFILE *profile = profile_at(index);
-    if (!profile || !callback) {
-        set_error(err, err_cch, L"Invalid profile master-key request.");
+    BYTE derived_key[APP_PROFILE_MASTER_KEY_BYTES];
+    BOOL callback_succeeded = FALSE;
+    SecureZeroMemory(derived_key, sizeof(derived_key));
+    if (!profile || !label || !callback) {
+        set_error(err, err_cch, L"Invalid profile derived-key request.");
         return FALSE;
     }
     if (!profile->master_loaded && !unwrap_profile_master_key(profile, err, err_cch)) return FALSE;
-    BOOL callback_succeeded = callback(profile->master_key, user, err, err_cch);
-    if (index != g_active_profile) {
-        SecureZeroMemory(profile->master_key, sizeof(profile->master_key));
-        profile->master_loaded = FALSE;
+    if (derive_profile_local_key(profile, profile->master_key, label, derived_key, err, err_cch)) {
+        callback_succeeded = callback(derived_key, user, err, err_cch);
     }
+    SecureZeroMemory(derived_key, sizeof(derived_key));
+    lock_profile_master_if_inactive(index);
     return callback_succeeded;
+}
+
+BOOL profiles_with_private_history_key(int index, PROFILE_DERIVED_KEY_FN callback, void *user,
+                                       WCHAR *err, size_t err_cch) {
+    return profiles_with_derived_key(index,
+                                     PROFILE_KEY_LABEL_PRIVATE_HISTORY,
+                                     callback,
+                                     user,
+                                     err,
+                                     err_cch);
 }
 
 static BOOL profiles_append_imported(KEY_PROFILE *profile, int *index_out, WCHAR *err, size_t err_cch) {

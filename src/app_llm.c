@@ -16,7 +16,6 @@ typedef struct LOCAL_LLM_WORKER {
 static LOCAL_LLM_WORKER g_llm_worker;
 static HANDLE g_llm_worker_job;
 static APP_LLM_CANCEL_FN g_cancel_fn;
-static APP_LLM_PROGRESS_FN g_progress_fn;
 
 static WCHAR *llm_dup_wide(const WCHAR *s) {
     size_t n = wcslen(s ? s : L"");
@@ -31,10 +30,9 @@ static BOOL app_llm_cancelled(void) {
     return g_cancel_fn ? g_cancel_fn() : FALSE;
 }
 
-void app_llm_init(APP_LLM_CANCEL_FN cancel_fn, APP_LLM_PROGRESS_FN progress_fn) {
+void app_llm_init(APP_LLM_CANCEL_FN cancel_fn) {
     ZeroMemory(&g_llm_worker, sizeof(g_llm_worker));
     g_cancel_fn = cancel_fn;
-    g_progress_fn = progress_fn;
     InitializeCriticalSection(&g_llm_worker.lock);
     g_llm_worker.lock_ready = TRUE;
 }
@@ -412,7 +410,7 @@ fail:
 static BOOL local_llm_worker_request(const char *cmd, const WCHAR *payload_path, const WCHAR *text_path,
                                      const WCHAR *topic_path, const WCHAR *seed, const WCHAR *prompt_template,
                                      const WCHAR *preferred_tokenizer, const WCHAR *out_path,
-                                     int tail_tokens, HWND progress_target, WCHAR *err, size_t err_cch) {
+                                     int tail_tokens, const CIA_PROGRESS_SINK *progress, WCHAR *err, size_t err_cch) {
     if (!g_llm_worker.lock_ready) {
         set_error(err, err_cch, L"Local top-k worker manager is not initialized.");
         return FALSE;
@@ -471,7 +469,7 @@ static BOOL local_llm_worker_request(const char *cmd, const WCHAR *payload_path,
             return FALSE;
         }
         if (json_line_has_string(response.data, "type", "progress")) {
-            if (progress_target && IsWindow(progress_target)) {
+            if (progress && progress->on_progress) {
                 size_t tokens_done = 0, tokens_total = 0;
                 double tps = 0.0;
                 WCHAR *partial = NULL;
@@ -479,7 +477,7 @@ static BOOL local_llm_worker_request(const char *cmd, const WCHAR *payload_path,
                 json_get_size_t_field(response.data, "total", &tokens_total);
                 json_get_double_field(response.data, "tps", &tps);
                 if (json_get_wide_string_field(response.data, "text", &partial)) {
-                    if (g_progress_fn) g_progress_fn(progress_target, partial, tokens_done, tokens_total, tps);
+                    progress->on_progress(progress->user, partial, tokens_done, tokens_total, tps);
                     secure_free_wide(partial);
                 }
             }
@@ -549,8 +547,9 @@ void shutdown_local_llm_worker(void) {
 }
 
 BOOL local_topk_encode_payload(const BYTE *payload, DWORD payload_len, const WCHAR *seed, const WCHAR *topic,
-                                      const WCHAR *prompt_template, const WCHAR *prefix, int tail_tokens, HWND progress_target,
-                                      WCHAR **out, WCHAR *err, size_t err_cch) {
+                               const WCHAR *prompt_template, const WCHAR *prefix, int tail_tokens,
+                               const CIA_PROGRESS_SINK *progress,
+                               WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
     if ((!payload && payload_len) || !seed || !seed[0]) {
         set_error(err, err_cch, L"Invalid local top-k encode request.");
@@ -574,7 +573,7 @@ BOOL local_topk_encode_payload(const BYTE *payload, DWORD payload_len, const WCH
 
     WCHAR worker_err[512] = L"";
     BOOL ran = local_llm_worker_request("encode", payload_path, NULL, topic_path, seed, prompt_template, NULL,
-                                        out_path, tail_tokens, progress_target,
+                                        out_path, tail_tokens, progress,
                                         worker_err, ARRAYSIZE(worker_err));
     if (!ran) {
         if (app_llm_cancelled()) {

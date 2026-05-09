@@ -21,31 +21,31 @@ BOOL app_flow_extract_key_package_body(const WCHAR *text, WCHAR **out,
 }
 
 BOOL app_flow_encrypt_message(CRYPTO_BOX *box, const WCHAR *plain, const WCHAR *topic,
-                              HWND progress_target, WCHAR **out, WCHAR *err, size_t err_cch) {
-    return app_message_flow_encrypt_message(box, plain, topic, progress_target, out, err, err_cch);
+                              const CIA_PROGRESS_SINK *progress, WCHAR **out, WCHAR *err, size_t err_cch) {
+    return app_message_flow_encrypt_message(box, plain, topic, progress, out, err, err_cch);
 }
 
 BOOL app_flow_encrypt_group_message(int group_index, const WCHAR *plain, const WCHAR *topic,
-                                    HWND progress_target, WCHAR **out, WCHAR *err, size_t err_cch) {
-    return app_message_flow_encrypt_group_message(group_index, plain, topic, progress_target, out, err, err_cch);
+                                    const CIA_PROGRESS_SINK *progress, WCHAR **out, WCHAR *err, size_t err_cch) {
+    return app_message_flow_encrypt_group_message(group_index, plain, topic, progress, out, err, err_cch);
 }
 
-BOOL app_flow_export_key(CRYPTO_BOX *box, HWND progress_target, WCHAR **out, WCHAR *err, size_t err_cch) {
-    return app_contact_flow_export_key(box, progress_target, out, err, err_cch);
+BOOL app_flow_export_key(CRYPTO_BOX *box, const CIA_PROGRESS_SINK *progress, WCHAR **out, WCHAR *err, size_t err_cch) {
+    return app_contact_flow_export_key(box, progress, out, err, err_cch);
 }
 
-BOOL app_flow_export_group_key(int group_index, HWND progress_target, WCHAR **out, WCHAR *err, size_t err_cch) {
-    return app_contact_flow_export_group_key(group_index, progress_target, out, err, err_cch);
+BOOL app_flow_export_group_key(int group_index, const CIA_PROGRESS_SINK *progress, WCHAR **out, WCHAR *err, size_t err_cch) {
+    return app_contact_flow_export_group_key(group_index, progress, out, err, err_cch);
 }
 
-BOOL app_flow_rekey_group_key(int group_index, HWND progress_target, WCHAR **out, WCHAR *err, size_t err_cch) {
-    return app_contact_flow_rekey_group_key(group_index, progress_target, out, err, err_cch);
+BOOL app_flow_rekey_group_key(int group_index, const CIA_PROGRESS_SINK *progress, WCHAR **out, WCHAR *err, size_t err_cch) {
+    return app_contact_flow_rekey_group_key(group_index, progress, out, err, err_cch);
 }
 
 BOOL app_flow_create_group(const WCHAR *group_name, const WCHAR *local_sender_name,
-                           HWND progress_target,
+                           const CIA_PROGRESS_SINK *progress,
                            int *group_index_out, WCHAR **out, WCHAR *err, size_t err_cch) {
-    return app_contact_flow_create_group(group_name, local_sender_name, progress_target,
+    return app_contact_flow_create_group(group_name, local_sender_name, progress,
                                          group_index_out, out, err, err_cch);
 }
 

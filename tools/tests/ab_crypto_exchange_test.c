@@ -97,18 +97,18 @@ static void write_group_counter(BYTE *message, DWORD len, uint32_t counter) {
     message[18] = (BYTE)((counter >> 24) & 0xffu);
 }
 
-static int open_box(const WCHAR *label, const BYTE master_key[32], const WCHAR *state_path, CRYPTO_BOX **out) {
+static int open_box(const WCHAR *label, const BYTE state_key[32], const WCHAR *state_path, CRYPTO_BOX **out) {
     WCHAR err[512] = L"";
-    if (!crypto_box_open(master_key, state_path, out, err, ARRAYSIZE(err))) {
+    if (!crypto_box_open(state_key, state_path, out, err, ARRAYSIZE(err))) {
         return failf(L"%s open failed: %ls", label, err);
     }
     return 0;
 }
 
-static int reopen_box(const WCHAR *label, const BYTE master_key[32], const WCHAR *state_path, CRYPTO_BOX **box) {
+static int reopen_box(const WCHAR *label, const BYTE state_key[32], const WCHAR *state_path, CRYPTO_BOX **box) {
     crypto_box_close(*box);
     *box = NULL;
-    return open_box(label, master_key, state_path, box);
+    return open_box(label, state_key, state_path, box);
 }
 
 static void free_message(TEST_MESSAGE *message) {

@@ -69,7 +69,5 @@ BOOL app_work_cancelled(void);
 void app_work_complete_message_handled(void);
 void app_work_free_ctx(APP_WORK_CTX *ctx);
 void app_work_free_message(APP_WORK_MESSAGE *message);
-void app_work_post_llm_stream_progress(HWND target_textbox, const WCHAR *partial,
-                                       size_t tokens_done, size_t tokens_total, double tps);
 
 #endif

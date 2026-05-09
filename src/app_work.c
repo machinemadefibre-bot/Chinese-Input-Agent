@@ -14,6 +14,8 @@ static APP_WORK_HOST g_host;
 
 static DWORD WINAPI work_thread_proc(LPVOID param);
 static void reset_work_state_flags(void);
+static void app_work_post_llm_stream_progress(void *user, const WCHAR *partial,
+                                              size_t tokens_done, size_t tokens_total, double tps);
 
 void app_work_configure(const APP_WORK_HOST *host) {
     if (host) {
@@ -144,8 +146,15 @@ static void finish_unposted_terminal_work(UINT msg) {
     reset_work_state_flags();
 }
 
-void app_work_post_llm_stream_progress(HWND target_textbox, const WCHAR *partial,
-                                       size_t tokens_done, size_t tokens_total, double tps) {
+static CIA_PROGRESS_SINK progress_sink_for_ctx(APP_WORK_CTX *ctx) {
+    CIA_PROGRESS_SINK progress = { app_work_post_llm_stream_progress, ctx ? ctx->target_textbox : NULL };
+    return progress;
+}
+
+static void app_work_post_llm_stream_progress(void *user, const WCHAR *partial,
+                                              size_t tokens_done, size_t tokens_total, double tps) {
+    HWND target_textbox = (HWND)user;
+    if (!target_textbox || !IsWindow(target_textbox)) return;
     const size_t bar_width = WORK_PROGRESS_BAR_WIDTH;
     if (tokens_total == 0) tokens_total = 1;
     if (tokens_done > tokens_total) tokens_done = tokens_total;
@@ -177,15 +186,17 @@ static BOOL worker_encrypt(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t er
         set_error(err, err_cch, L"No active crypto context is open.");
         return FALSE;
     }
+    CIA_PROGRESS_SINK progress = progress_sink_for_ctx(ctx);
     return app_flow_encrypt_message(box, ctx ? ctx->input : NULL, ctx ? ctx->topic : NULL,
-                                    ctx ? ctx->target_textbox : NULL, out, err, err_cch);
+                                    &progress, out, err, err_cch);
 }
 
 static BOOL worker_group_encrypt(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
+    CIA_PROGRESS_SINK progress = progress_sink_for_ctx(ctx);
     return app_flow_encrypt_group_message(ctx ? ctx->group_index : -1, ctx ? ctx->input : NULL,
                                           ctx ? ctx->topic : NULL,
-                                          ctx ? ctx->target_textbox : NULL, out, err, err_cch);
+                                          &progress, out, err, err_cch);
 }
 
 static BOOL worker_export_key(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
@@ -195,21 +206,24 @@ static BOOL worker_export_key(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t
         set_error(err, err_cch, L"No active crypto context is open.");
         return FALSE;
     }
-    return app_flow_export_key(box, ctx ? ctx->target_textbox : NULL, out, err, err_cch);
+    CIA_PROGRESS_SINK progress = progress_sink_for_ctx(ctx);
+    return app_flow_export_key(box, &progress, out, err, err_cch);
 }
 
 static BOOL worker_export_group(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
+    CIA_PROGRESS_SINK progress = progress_sink_for_ctx(ctx);
     return app_flow_export_group_key(ctx ? ctx->group_index : -1,
-                                     ctx ? ctx->target_textbox : NULL, out, err, err_cch);
+                                     &progress, out, err, err_cch);
 }
 
 static BOOL worker_create_group(APP_WORK_CTX *ctx, WCHAR **out, int *group_index_out,
                                 WCHAR *err, size_t err_cch) {
     *out = NULL;
     if (group_index_out) *group_index_out = -1;
+    CIA_PROGRESS_SINK progress = progress_sink_for_ctx(ctx);
     return app_flow_create_group(ctx ? ctx->input : NULL, ctx ? ctx->name : NULL,
-                                 ctx ? ctx->target_textbox : NULL,
+                                 &progress,
                                  group_index_out, out, err, err_cch);
 }
 
@@ -217,8 +231,9 @@ static BOOL worker_rekey_group(APP_WORK_CTX *ctx, WCHAR **out, int *group_index_
                                WCHAR *err, size_t err_cch) {
     *out = NULL;
     if (group_index_out) *group_index_out = ctx ? ctx->group_index : -1;
+    CIA_PROGRESS_SINK progress = progress_sink_for_ctx(ctx);
     return app_flow_rekey_group_key(ctx ? ctx->group_index : -1,
-                                    ctx ? ctx->target_textbox : NULL, out, err, err_cch);
+                                    &progress, out, err, err_cch);
 }
 
 static BOOL worker_set_group_alias(APP_WORK_CTX *ctx, WCHAR **out, int *group_index_out,

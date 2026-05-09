@@ -136,12 +136,15 @@ function Test-CryptoBoxUsesOpaqueContext {
 
     Assert-True $header.Contains("typedef struct CRYPTO_BOX CRYPTO_BOX;") "crypto_box.h should expose CRYPTO_BOX as an opaque context"
     Assert-True $header.Contains("crypto_box_open(") "crypto_box.h should expose crypto_box_open"
+    Assert-True $header.Contains("state_encryption_key") "crypto_box_open should accept a state encryption key, not a profile master key"
     Assert-True $header.Contains("crypto_box_close(") "crypto_box.h should expose crypto_box_close"
     Assert-True $header.Contains("crypto_box_encrypt(CRYPTO_BOX *box") "crypto_box_encrypt should take an explicit context"
     Assert-True $header.Contains("crypto_box_decrypt(CRYPTO_BOX *box") "crypto_box_decrypt should take an explicit context"
     Assert-True (-not $header.Contains("crypto_box_init(")) "crypto_box_init should not remain in the public API"
     Assert-True (-not $header.Contains("crypto_box_shutdown(")) "crypto_box_shutdown should not remain in the public API"
     Assert-True $impl.Contains("struct CRYPTO_BOX") "crypto_box.c should own the CRYPTO_BOX layout"
+    Assert-True $impl.Contains("BYTE state_key[STATE_KEY_BYTES]") "CRYPTO_BOX should store only the state encryption key"
+    Assert-True (-not $impl.Contains("master_key")) "crypto_box.c should not name or store a profile master key"
     Assert-True (-not $impl.Contains("static BYTE g_master_key")) "crypto_box.c should not keep a global master key"
     Assert-True (-not $impl.Contains("static WCHAR g_state_path")) "crypto_box.c should not keep a global state path"
 }
@@ -175,8 +178,12 @@ function Test-ProfilesDoNotManageCryptoLifecycle {
     Assert-True $header.Contains("typedef struct KEY_PROFILE KEY_PROFILE;") "app_profiles.h should keep KEY_PROFILE opaque"
     Assert-True (-not $header.Contains("BYTE master_key[")) "app_profiles.h should not expose profile master-key fields"
     Assert-True (-not $header.Contains("master_loaded")) "app_profiles.h should not expose profile master-key residency state"
-    Assert-True $header.Contains("profiles_with_master_key(") "app_profiles.h should expose explicit master-key lease API"
-    Assert-True $profiles.Contains("SecureZeroMemory(g_profiles[profile_idx].master_key") "inactive profile master keys should be securely cleared"
+    Assert-True $header.Contains("profiles_with_private_history_key(") "app_profiles.h should expose a narrow private history key helper"
+    Assert-True (-not $header.Contains("profiles_with_master_key(")) "app_profiles.h should not expose a general profile root-key lease"
+    Assert-True $profiles.Contains("lock_profile_master(&g_profiles[profile_idx])") "inactive profile master keys should be securely cleared"
+    Assert-True $profiles.Contains("PROFILE_KEY_LABEL_CRYPTO_STATE") "profiles layer should derive a dedicated crypto state key"
+    Assert-True $profiles.Contains("PROFILE_KEY_LABEL_PRIVATE_HISTORY") "profiles layer should derive a dedicated private history key"
+    Assert-True $profiles.Contains("lock_profile_master_if_inactive(index)") "profiles_open_crypto should clear non-active root keys internally"
     Assert-True (-not $activate.Contains("crypto_box_init")) "profiles_activate should not initialize crypto_box"
     Assert-True (-not $activate.Contains("crypto_box_shutdown")) "profiles_activate should not shut down crypto_box"
     Assert-True (-not $activate.Contains("crypto_box_export_contact_package")) "profiles_activate should not export crypto material"
@@ -209,6 +216,7 @@ function Test-ChatHistoryUsesEncryptedRowsInSQLite {
     $history = Read-RepoFile "src\app_chat_history.c"
     $archive = Read-RepoFile "src\app_archive.c"
     $groups = Read-RepoFile "src\app_groups.c"
+    $profiles = Read-RepoFile "src\app_profiles.c"
 
     Assert-True $cmake.Contains("src/app_chat_history.c") "CMakeLists should include app_chat_history.c"
     Assert-True $cmake.Contains("third_party/sqlite/sqlite3.c") "CMakeLists should compile SQLite amalgamation"
@@ -231,11 +239,14 @@ function Test-ChatHistoryUsesEncryptedRowsInSQLite {
     Assert-True $history.Contains("PRAGMA secure_delete=ON") "SQLite should enable secure_delete"
     Assert-True $history.Contains("verify_schema_version") "chat history should reject unsupported schema versions"
     Assert-True $history.Contains("Unsupported chat history schema version") "schema mismatch should return a clear error"
-    Assert-True $history.Contains("hmac_sha256_segments") "private history keys should be derived by HMAC-SHA256"
+    Assert-True $profiles.Contains("hmac_sha256_segments") "private history keys should be derived by HMAC-SHA256 in the profiles layer"
+    Assert-True (-not $history.Contains("derive_private_history_key")) "chat history should receive a derived key instead of deriving from the profile root key"
     Assert-True $history.Contains("message_uuid BLOB NOT NULL UNIQUE") "chat history rows should have unique message UUIDs"
     Assert-True $history.Contains("ciphertext BLOB NOT NULL") "chat history body should be stored as ciphertext"
     Assert-True $history.Contains("timestamp_text") "chat history display timestamps should remain stored metadata"
     Assert-True $archive.Contains("chat_history_append_private") "private archive adapter should use chat history append"
+    Assert-True $archive.Contains("profiles_with_private_history_key") "private archive adapter should not request the profile root key"
+    Assert-True (-not $archive.Contains("profiles_with_master_key")) "private archive adapter should not touch the profile root key"
     Assert-True $groups.Contains("chat_history_append_group") "group archive adapter should use chat history append"
     Assert-True (-not $groups.Contains("group_archive_path")) "group archive adapter should not use legacy archive files"
 }
@@ -248,6 +259,9 @@ function Test-AppFlowOwnsCryptoBusinessFlow {
     $contactFlow = Read-RepoFile "src\app_contact_flow.c"
     $carrierFlow = Read-RepoFile "src\app_carrier_flow.c"
     $header = Read-RepoFile "src\app_flow.h"
+    $carrierHeader = Read-RepoFile "src\app_carrier_flow.h"
+    $llmHeader = Read-RepoFile "src\app_llm.h"
+    $progressHeader = Read-RepoFile "src\app_progress.h"
 
     foreach ($call in @(
         "crypto_box_encrypt(",
@@ -279,6 +293,10 @@ function Test-AppFlowOwnsCryptoBusinessFlow {
     Assert-True $carrierFlow.Contains("local_topk_decode_payload_multi(") "app_carrier_flow.c should expose multi-tokenizer decode calls"
     Assert-True $contactFlow.Contains("app_carrier_decode_exchange_package_multi(") "contact key import should try all configured tokenizers"
     Assert-True $header.Contains("app_flow_import_key(") "app_flow.h should expose import flow"
+    Assert-True $progressHeader.Contains("typedef struct CIA_PROGRESS_SINK") "core should expose a generic progress sink"
+    Assert-True (-not $header.Contains("HWND progress_target")) "app_flow.h should not expose HWND progress targets"
+    Assert-True (-not $carrierHeader.Contains("HWND progress_target")) "app_carrier_flow.h should not expose HWND progress targets"
+    Assert-True (-not $llmHeader.Contains("HWND progress_target")) "app_llm.h should not expose HWND progress targets"
 }
 
 function Test-GroupChatTransportInvariants {
@@ -309,8 +327,13 @@ function Test-TopLevelCMakeBuildTargets {
     $mingw = Read-RepoFile "build-mingw.bat"
     $msvc = Read-RepoFile "build.bat"
 
+    Assert-True $cmake.Contains("add_library(cia_core STATIC") "CMakeLists should define cia_core as a static library"
     Assert-True $cmake.Contains("add_executable(ChineseInputAgent") "CMakeLists should define ChineseInputAgent"
     Assert-True $cmake.Contains("add_executable(ChineseInputAgentInstallerStub") "CMakeLists should define installer stub"
+    Assert-True $cmake.Contains("target_link_libraries(ChineseInputAgent PRIVATE") "ChineseInputAgent should have an explicit link block"
+    Assert-True $cmake.Contains("  cia_core") "ChineseInputAgent should link cia_core"
+    Assert-True $cmake.Contains("set(CIA_CORE_SOURCES") "CMakeLists should keep core sources separate from UI sources"
+    Assert-True $cmake.Contains("set(APP_SOURCES") "CMakeLists should keep UI executable sources separate"
     Assert-True $cmake.Contains("src/app_flow.c") "CMakeLists should include app_flow.c"
     Assert-True $cmake.Contains("src/app_carrier_flow.c") "CMakeLists should include app_carrier_flow.c"
     Assert-True $cmake.Contains("src/app_contact_flow.c") "CMakeLists should include app_contact_flow.c"
@@ -318,7 +341,11 @@ function Test-TopLevelCMakeBuildTargets {
     Assert-True $cmake.Contains("src/app_groups.c") "CMakeLists should include app_groups.c"
     Assert-True $cmake.Contains("src/app_chat_history.c") "CMakeLists should include app_chat_history.c"
     Assert-True $cmake.Contains("third_party/sqlite/sqlite3.c") "CMakeLists should include SQLite amalgamation"
+    Assert-True $cmake.Contains("src/app_work.c") "CMakeLists should keep app_work.c in the UI executable"
+    Assert-True $cmake.Contains("src/app.rc") "CMakeLists should keep app.rc in the UI executable"
     Assert-True $mingw.Contains("cmake.exe -S") "build-mingw.bat should be a CMake wrapper"
+    Assert-True $mingw.Contains("CMAKE_C_COMPILER_AR") "build-mingw.bat should configure the static library archiver"
+    Assert-True $mingw.Contains("CMAKE_C_COMPILER_RANLIB") "build-mingw.bat should configure the static library ranlib tool"
     Assert-True $msvc.Contains("cmake.exe -S") "build.bat should be a CMake wrapper"
 }
 

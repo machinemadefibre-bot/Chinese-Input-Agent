@@ -82,7 +82,7 @@ static BOOL build_key_import_success_message(const WCHAR *contact_name, const WC
     return TRUE;
 }
 
-BOOL app_contact_flow_export_key(CRYPTO_BOX *box, HWND progress_target,
+BOOL app_contact_flow_export_key(CRYPTO_BOX *box, const CIA_PROGRESS_SINK *progress,
                                  WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
     BYTE *pkg = NULL;
@@ -98,12 +98,12 @@ BOOL app_contact_flow_export_key(CRYPTO_BOX *box, HWND progress_target,
         return FALSE;
     }
     BOOL key_package_encoded = app_carrier_encode_contact_package(pkg, pkg_len, fingerprint,
-                                                                  progress_target, out, err, err_cch);
+                                                                  progress, out, err, err_cch);
     secure_free(pkg, pkg_len);
     return key_package_encoded;
 }
 
-BOOL app_contact_flow_export_group_key(int group_index, HWND progress_target,
+BOOL app_contact_flow_export_group_key(int group_index, const CIA_PROGRESS_SINK *progress,
                                        WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
     BYTE *pkg = NULL;
@@ -117,22 +117,22 @@ BOOL app_contact_flow_export_group_key(int group_index, HWND progress_target,
         return FALSE;
     }
     BOOL package_encoded = app_carrier_encode_group_package(pkg, pkg_len, fingerprint,
-                                                            progress_target, out, err, err_cch);
+                                                            progress, out, err, err_cch);
     secure_free(pkg, pkg_len);
     return package_encoded;
 }
 
-BOOL app_contact_flow_rekey_group_key(int group_index, HWND progress_target,
+BOOL app_contact_flow_rekey_group_key(int group_index, const CIA_PROGRESS_SINK *progress,
                                       WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
     if (!app_groups_rekey(group_index, err, err_cch)) {
         return FALSE;
     }
-    return app_contact_flow_export_group_key(group_index, progress_target, out, err, err_cch);
+    return app_contact_flow_export_group_key(group_index, progress, out, err, err_cch);
 }
 
 BOOL app_contact_flow_create_group(const WCHAR *group_name, const WCHAR *local_sender_name,
-                                   HWND progress_target,
+                                   const CIA_PROGRESS_SINK *progress,
                                    int *group_index_out, WCHAR **out,
                                    WCHAR *err, size_t err_cch) {
     if (group_index_out) *group_index_out = -1;
@@ -143,7 +143,7 @@ BOOL app_contact_flow_create_group(const WCHAR *group_name, const WCHAR *local_s
                            &group_index, err, err_cch)) {
         return FALSE;
     }
-    if (!app_contact_flow_export_group_key(group_index, progress_target, out, err, err_cch)) {
+    if (!app_contact_flow_export_group_key(group_index, progress, out, err, err_cch)) {
         return FALSE;
     }
     if (group_index_out) *group_index_out = group_index;

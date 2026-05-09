@@ -105,7 +105,7 @@ static BOOL encode_exchange_package(const BYTE *pkg, DWORD pkg_len,
                                     const WCHAR *prefix_end,
                                     const WCHAR *topic,
                                     const WCHAR *prompt_template,
-                                    HWND progress_target,
+                                    const CIA_PROGRESS_SINK *progress,
                                     WCHAR **out,
                                     WCHAR *err,
                                     size_t err_cch) {
@@ -118,25 +118,25 @@ static BOOL encode_exchange_package(const BYTE *pkg, DWORD pkg_len,
         return FALSE;
     }
     BOOL package_encoded = local_topk_encode_payload(pkg, pkg_len, KEY_PACKAGE_TOPK_SEED, topic, prompt_template,
-                                                     prefix.data, -1, progress_target, out, err, err_cch);
+                                                     prefix.data, -1, progress, out, err, err_cch);
     wstrb_free(&prefix);
     return package_encoded;
 }
 
 BOOL app_carrier_encode_contact_package(const BYTE *pkg, DWORD pkg_len, const WCHAR *fingerprint,
-                                        HWND progress_target, WCHAR **out, WCHAR *err, size_t err_cch) {
+                                        const CIA_PROGRESS_SINK *progress, WCHAR **out, WCHAR *err, size_t err_cch) {
     return encode_exchange_package(pkg, pkg_len, fingerprint,
                                    KEY_PACKAGE_PREFIX_START, KEY_PACKAGE_PREFIX_END,
                                    CONTACT_KEY_PACKAGE_TOPIC, CONTACT_KEY_PROMPT_TEMPLATE,
-                                   progress_target, out, err, err_cch);
+                                   progress, out, err, err_cch);
 }
 
 BOOL app_carrier_encode_group_package(const BYTE *pkg, DWORD pkg_len, const WCHAR *fingerprint,
-                                      HWND progress_target, WCHAR **out, WCHAR *err, size_t err_cch) {
+                                      const CIA_PROGRESS_SINK *progress, WCHAR **out, WCHAR *err, size_t err_cch) {
     return encode_exchange_package(pkg, pkg_len, fingerprint,
                                    GROUP_PACKAGE_PREFIX_START, GROUP_PACKAGE_PREFIX_END,
                                    GROUP_KEY_PACKAGE_TOPIC, GROUP_KEY_PROMPT_TEMPLATE,
-                                   progress_target, out, err, err_cch);
+                                   progress, out, err, err_cch);
 }
 
 BOOL app_carrier_decode_exchange_package(const WCHAR *carrier, BYTE **out, DWORD *out_len,
@@ -197,10 +197,10 @@ BOOL app_carrier_get_message_seed(CRYPTO_BOX *box, WCHAR *seed, size_t seed_cch,
 
 BOOL app_carrier_encode_message_payload(const BYTE *payload, DWORD payload_len,
                                         const WCHAR *seed, const WCHAR *topic,
-                                        HWND progress_target, WCHAR **out,
+                                        const CIA_PROGRESS_SINK *progress, WCHAR **out,
                                         WCHAR *err, size_t err_cch) {
     return local_topk_encode_payload(payload, payload_len, seed, topic, NULL, NULL, -1,
-                                     progress_target, out, err, err_cch);
+                                     progress, out, err, err_cch);
 }
 
 BOOL app_carrier_decode_message_payload(const WCHAR *carrier, const WCHAR *seed,

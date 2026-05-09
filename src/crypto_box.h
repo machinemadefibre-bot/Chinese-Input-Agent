@@ -10,8 +10,14 @@ extern "C" {
 
 typedef struct CRYPTO_BOX CRYPTO_BOX;
 
-BOOL crypto_box_open(const BYTE master_key[32], const WCHAR *state_path, CRYPTO_BOX **out,
+BOOL crypto_box_open(const BYTE state_encryption_key[32], const WCHAR *state_path, CRYPTO_BOX **out,
                      WCHAR *err, size_t err_cch);
+BOOL crypto_box_open_with_legacy_state_key(const BYTE state_encryption_key[32],
+                                           const BYTE legacy_state_encryption_key[32],
+                                           const WCHAR *state_path,
+                                           CRYPTO_BOX **out,
+                                           WCHAR *err,
+                                           size_t err_cch);
 void crypto_box_close(CRYPTO_BOX *box);
 
 BOOL crypto_box_encrypt(CRYPTO_BOX *box, const BYTE *plain, DWORD plain_len, BYTE **out, DWORD *out_len,

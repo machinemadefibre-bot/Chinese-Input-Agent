@@ -4,16 +4,17 @@
 #include <windows.h>
 #include <stddef.h>
 
+#include "app_progress.h"
 #include "crypto_box.h"
 
-BOOL app_contact_flow_export_key(CRYPTO_BOX *box, HWND progress_target,
+BOOL app_contact_flow_export_key(CRYPTO_BOX *box, const CIA_PROGRESS_SINK *progress,
                                  WCHAR **out, WCHAR *err, size_t err_cch);
-BOOL app_contact_flow_export_group_key(int group_index, HWND progress_target,
+BOOL app_contact_flow_export_group_key(int group_index, const CIA_PROGRESS_SINK *progress,
                                        WCHAR **out, WCHAR *err, size_t err_cch);
-BOOL app_contact_flow_rekey_group_key(int group_index, HWND progress_target,
+BOOL app_contact_flow_rekey_group_key(int group_index, const CIA_PROGRESS_SINK *progress,
                                       WCHAR **out, WCHAR *err, size_t err_cch);
 BOOL app_contact_flow_create_group(const WCHAR *group_name, const WCHAR *local_sender_name,
-                                   HWND progress_target,
+                                   const CIA_PROGRESS_SINK *progress,
                                    int *group_index_out, WCHAR **out,
                                    WCHAR *err, size_t err_cch);
 BOOL app_contact_flow_set_group_member_alias(int group_index, const WCHAR *sender_id_hex,

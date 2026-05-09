@@ -973,7 +973,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     (void)cmd;
     g_instance = instance;
     configure_app_work(NULL);
-    app_llm_init(app_work_cancelled, app_work_post_llm_stream_progress);
+    app_llm_init(app_work_cancelled);
 
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof(icc);

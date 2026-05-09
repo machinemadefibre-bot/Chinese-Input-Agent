@@ -9,14 +9,14 @@ typedef struct ARCHIVE_APPEND_CTX {
     const WCHAR *plain;
 } ARCHIVE_APPEND_CTX;
 
-static BOOL archive_append_with_master(const BYTE master_key[APP_PROFILE_MASTER_KEY_BYTES],
-                                       void *user,
-                                       WCHAR *err,
-                                       size_t err_cch)
+static BOOL archive_append_with_history_key(const BYTE private_history_key[APP_PROFILE_MASTER_KEY_BYTES],
+                                            void *user,
+                                            WCHAR *err,
+                                            size_t err_cch)
 {
     ARCHIVE_APPEND_CTX *ctx = (ARCHIVE_APPEND_CTX *)user;
     return chat_history_append_private(ctx->profile_id,
-                                       master_key,
+                                       private_history_key,
                                        ctx->sender,
                                        ctx->plain,
                                        err,
@@ -40,11 +40,11 @@ BOOL archive_append_text(int profile_index, const WCHAR *sender, const WCHAR *pl
         append_ctx.sender = profile_name[0] ? profile_name : L"\u672a\u547d\u540d";
     }
     append_ctx.plain = plain ? plain : L"";
-    return profiles_with_master_key(profile_index,
-                                    archive_append_with_master,
-                                    &append_ctx,
-                                    err,
-                                    err_cch);
+    return profiles_with_private_history_key(profile_index,
+                                             archive_append_with_history_key,
+                                             &append_ctx,
+                                             err,
+                                             err_cch);
 }
 
 typedef struct ARCHIVE_LOAD_CTX {
@@ -52,13 +52,13 @@ typedef struct ARCHIVE_LOAD_CTX {
     WCHAR **out;
 } ARCHIVE_LOAD_CTX;
 
-static BOOL archive_load_with_master(const BYTE master_key[APP_PROFILE_MASTER_KEY_BYTES],
-                                     void *user,
-                                     WCHAR *err,
-                                     size_t err_cch)
+static BOOL archive_load_with_history_key(const BYTE private_history_key[APP_PROFILE_MASTER_KEY_BYTES],
+                                          void *user,
+                                          WCHAR *err,
+                                          size_t err_cch)
 {
     ARCHIVE_LOAD_CTX *ctx = (ARCHIVE_LOAD_CTX *)user;
-    return chat_history_load_private(ctx->profile_id, master_key, ctx->out, err, err_cch);
+    return chat_history_load_private(ctx->profile_id, private_history_key, ctx->out, err, err_cch);
 }
 
 BOOL archive_load_text(int profile_index, WCHAR **out, WCHAR *err, size_t err_cch)
@@ -77,10 +77,9 @@ BOOL archive_load_text(int profile_index, WCHAR **out, WCHAR *err, size_t err_cc
         return FALSE;
     }
     load_ctx.out = out;
-    return profiles_with_master_key(profile_index,
-                                    archive_load_with_master,
-                                    &load_ctx,
-                                    err,
-                                    err_cch);
+    return profiles_with_private_history_key(profile_index,
+                                             archive_load_with_history_key,
+                                             &load_ctx,
+                                             err,
+                                             err_cch);
 }
-

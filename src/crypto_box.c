@@ -14,7 +14,7 @@ int curve25519_donna(uint8_t *out, const uint8_t *secret, const uint8_t *basepoi
 #define STATE_MAGIC 0x31454943u
 #define STATE_VERSION 5u
 #define STATE_VERSION_PRE_SESSION 4u
-#define MASTER_KEY_BYTES 32
+#define STATE_KEY_BYTES 32
 #define X25519_KEY_BYTES 32
 #define CONTACT_CHECKSUM_BYTES 8
 #define CONTACT_PACKAGE_FORMAT_BASE 0x20u
@@ -68,7 +68,7 @@ typedef struct SKIPPED_MESSAGE_KEY {
 } SKIPPED_MESSAGE_KEY;
 
 struct CRYPTO_BOX {
-    BYTE master_key[MASTER_KEY_BYTES];
+    BYTE state_key[STATE_KEY_BYTES];
     WCHAR state_path[MAX_PATH];
     BOX_BUF public_key;
     BOX_BUF private_key;
@@ -756,11 +756,11 @@ static unsigned count_free_skipped_keys(CRYPTO_BOX *box) {
     return free_count;
 }
 
-static BOOL protect_state(CRYPTO_BOX *box, const uint8_t *plain, DWORD plain_len, uint8_t **out, DWORD *out_len) {
+static BOOL protect_state_with_key(const BYTE state_key[STATE_KEY_BYTES], const uint8_t *plain, DWORD plain_len, uint8_t **out, DWORD *out_len) {
     *out = NULL;
     *out_len = 0;
     const DWORD overhead = STATE_HEADER_BYTES + STATE_NONCE_BYTES + STATE_TAG_BYTES;
-    if (!box || (!plain && plain_len) || plain_len > 0xffffffffu - overhead) return FALSE;
+    if (!state_key || (!plain && plain_len) || plain_len > 0xffffffffu - overhead) return FALSE;
     uint8_t nonce[STATE_NONCE_BYTES];
     uint8_t *state_envelope = NULL;
     DWORD total = overhead + plain_len;
@@ -779,7 +779,7 @@ static BOOL protect_state(CRYPTO_BOX *box, const uint8_t *plain, DWORD plain_len
     state_envelope[10] = (uint8_t)((plain_len >> 16) & 0xff);
     state_envelope[11] = (uint8_t)((plain_len >> 24) & 0xff);
     memcpy(state_envelope + STATE_HEADER_BYTES, nonce, sizeof(nonce));
-    if (!aes_gcm_encrypt_raw(box->master_key, state_envelope, STATE_HEADER_BYTES,
+    if (!aes_gcm_encrypt_raw(state_key, state_envelope, STATE_HEADER_BYTES,
                              nonce, sizeof(nonce),
                              plain, plain_len,
                              state_envelope + STATE_HEADER_BYTES + STATE_NONCE_BYTES,
@@ -795,11 +795,16 @@ cleanup:
     return state_protected;
 }
 
-static BOOL unprotect_state(CRYPTO_BOX *box, const uint8_t *state_envelope, DWORD state_envelope_len, uint8_t **out, DWORD *out_len) {
+static BOOL protect_state(CRYPTO_BOX *box, const uint8_t *plain, DWORD plain_len, uint8_t **out, DWORD *out_len) {
+    if (!box) return FALSE;
+    return protect_state_with_key(box->state_key, plain, plain_len, out, out_len);
+}
+
+static BOOL unprotect_state_with_key(const BYTE state_key[STATE_KEY_BYTES], const uint8_t *state_envelope, DWORD state_envelope_len, uint8_t **out, DWORD *out_len) {
     *out = NULL;
     *out_len = 0;
     const DWORD overhead = STATE_HEADER_BYTES + STATE_NONCE_BYTES + STATE_TAG_BYTES;
-    if (!box ||
+    if (!state_key ||
         !state_envelope ||
         state_envelope_len < overhead ||
         memcmp(state_envelope, "CIST", 4) != 0 ||
@@ -810,7 +815,7 @@ static BOOL unprotect_state(CRYPTO_BOX *box, const uint8_t *state_envelope, DWOR
     if (plain_len > state_envelope_len - overhead || overhead + plain_len != state_envelope_len) return FALSE;
     uint8_t *plain = (uint8_t *)box_alloc(plain_len ? plain_len : 1);
     if (!plain) return FALSE;
-    if (!aes_gcm_decrypt_raw(box->master_key, state_envelope, STATE_HEADER_BYTES,
+    if (!aes_gcm_decrypt_raw(state_key, state_envelope, STATE_HEADER_BYTES,
                              state_envelope + STATE_HEADER_BYTES, STATE_NONCE_BYTES,
                              state_envelope + STATE_HEADER_BYTES + STATE_NONCE_BYTES, STATE_TAG_BYTES,
                              state_envelope + STATE_HEADER_BYTES + STATE_NONCE_BYTES + STATE_TAG_BYTES,
@@ -863,14 +868,14 @@ cleanup:
     return state_saved;
 }
 
-static BOOL load_state(CRYPTO_BOX *box) {
+static BOOL load_state_with_key(CRYPTO_BOX *box, const BYTE state_key[STATE_KEY_BYTES]) {
     uint8_t *file = NULL;
     DWORD file_len = 0;
     uint8_t *plain = NULL;
     DWORD plain_len = 0;
     BOOL state_loaded = FALSE;
-    if (!box || !box->state_path[0] || !read_file_all(box->state_path, &file, &file_len)) return FALSE;
-    if (!unprotect_state(box, file, file_len, &plain, &plain_len)) goto cleanup;
+    if (!box || !state_key || !box->state_path[0] || !read_file_all(box->state_path, &file, &file_len)) return FALSE;
+    if (!unprotect_state_with_key(state_key, file, file_len, &plain, &plain_len)) goto cleanup;
     READ_CURSOR c = { plain, plain_len, 0 };
     uint32_t magic = 0, version = 0;
     const uint8_t *pub = NULL, *priv = NULL, *remote = NULL;
@@ -954,6 +959,11 @@ cleanup:
     return state_loaded;
 }
 
+static BOOL load_state(CRYPTO_BOX *box) {
+    if (!box) return FALSE;
+    return load_state_with_key(box, box->state_key);
+}
+
 static BOOL generate_identity(CRYPTO_BOX *box) {
     uint8_t priv[X25519_KEY_BYTES];
     uint8_t pub[X25519_KEY_BYTES];
@@ -972,12 +982,16 @@ cleanup:
     return identity_generated;
 }
 
-BOOL crypto_box_open(const BYTE master_key[32], const WCHAR *state_path, CRYPTO_BOX **out,
-                     WCHAR *err, size_t err_cch) {
+static BOOL crypto_box_open_internal(const BYTE state_encryption_key[32],
+                                     const BYTE legacy_state_encryption_key[32],
+                                     const WCHAR *state_path,
+                                     CRYPTO_BOX **out,
+                                     WCHAR *err,
+                                     size_t err_cch) {
     if (out) *out = NULL;
     if (!out) return FALSE;
-    if (!master_key) {
-        set_box_error(err, err_cch, L"Master key is not ready.");
+    if (!state_encryption_key) {
+        set_box_error(err, err_cch, L"State encryption key is not ready.");
         return FALSE;
     }
     CRYPTO_BOX *box = (CRYPTO_BOX *)box_alloc(sizeof(CRYPTO_BOX));
@@ -985,14 +999,20 @@ BOOL crypto_box_open(const BYTE master_key[32], const WCHAR *state_path, CRYPTO_
         set_box_error(err, err_cch, L"Out of memory.");
         return FALSE;
     }
-    memcpy(box->master_key, master_key, MASTER_KEY_BYTES);
+    memcpy(box->state_key, state_encryption_key, STATE_KEY_BYTES);
     if (state_path && state_path[0]) StringCchCopyW(box->state_path, ARRAYSIZE(box->state_path), state_path);
     else box->state_path[0] = L'\0';
     BOOL state_exists = box_file_exists(box->state_path);
     if (state_exists && !load_state(box)) {
-        set_box_error(err, err_cch, L"Key state file exists but could not be decrypted or parsed.");
-        crypto_box_close(box);
-        return FALSE;
+        BOOL migrated_legacy_state = FALSE;
+        if (legacy_state_encryption_key && load_state_with_key(box, legacy_state_encryption_key)) {
+            migrated_legacy_state = save_state(box);
+        }
+        if (!migrated_legacy_state) {
+            set_box_error(err, err_cch, L"Key state file exists but could not be decrypted or parsed.");
+            crypto_box_close(box);
+            return FALSE;
+        }
     }
     if (!box->public_key.data || !box->private_key.data) {
         if (!generate_identity(box) || !save_state(box)) {
@@ -1005,12 +1025,31 @@ BOOL crypto_box_open(const BYTE master_key[32], const WCHAR *state_path, CRYPTO_
     return TRUE;
 }
 
+BOOL crypto_box_open(const BYTE state_encryption_key[32], const WCHAR *state_path, CRYPTO_BOX **out,
+                     WCHAR *err, size_t err_cch) {
+    return crypto_box_open_internal(state_encryption_key, NULL, state_path, out, err, err_cch);
+}
+
+BOOL crypto_box_open_with_legacy_state_key(const BYTE state_encryption_key[32],
+                                           const BYTE legacy_state_encryption_key[32],
+                                           const WCHAR *state_path,
+                                           CRYPTO_BOX **out,
+                                           WCHAR *err,
+                                           size_t err_cch) {
+    return crypto_box_open_internal(state_encryption_key,
+                                    legacy_state_encryption_key,
+                                    state_path,
+                                    out,
+                                    err,
+                                    err_cch);
+}
+
 void crypto_box_close(CRYPTO_BOX *box) {
     if (!box) return;
     buf_clear(&box->public_key);
     buf_clear(&box->private_key);
     buf_clear(&box->remote_public_key);
-    SecureZeroMemory(box->master_key, sizeof(box->master_key));
+    SecureZeroMemory(box->state_key, sizeof(box->state_key));
     SecureZeroMemory(box->state_path, sizeof(box->state_path));
     box_secure_free(box, sizeof(*box));
 }
