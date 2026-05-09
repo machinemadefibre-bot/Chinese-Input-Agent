@@ -16,6 +16,7 @@ set(APP_SOURCES
   src/app_profiles.c
   src/app_groups.c
   src/app_archive.c
+  src/app_chat_history.c
   src/app_llm.c
   src/app_flow.c
   src/app_carrier_flow.c
@@ -30,6 +31,7 @@ set(APP_SOURCES
   src/win_util.c
   src/crypto_box.c
   third_party/curve25519-donna/curve25519-donna.c
+  third_party/sqlite/sqlite3.c
   src/app.rc
 )
 
@@ -41,10 +43,13 @@ target_compile_definitions(ChineseInputAgent PRIVATE
   _CRT_SECURE_NO_WARNINGS
   _WINDOWS
   HAVE_SECUREZEROMEMORY=1
+  SQLITE_OMIT_LOAD_EXTENSION
+  SQLITE_DEFAULT_MEMSTATUS=0
 )
 target_include_directories(ChineseInputAgent PRIVATE
   "${CMAKE_SOURCE_DIR}/src"
   "${CMAKE_SOURCE_DIR}/third_party/curve25519-donna"
+  "${CMAKE_SOURCE_DIR}/third_party/sqlite"
 )
 target_link_libraries(ChineseInputAgent PRIVATE
   user32

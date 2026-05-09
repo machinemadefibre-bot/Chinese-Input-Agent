@@ -1,5 +1,6 @@
 #include "app_groups.h"
 
+#include "app_chat_history.h"
 #include "app_paths.h"
 #include "app_shared.h"
 #include "app_storage.h"
@@ -277,13 +278,6 @@ static int find_group_by_id(uint64_t group_id) {
 
 static BOOL group_file_path(WCHAR *path, size_t cch) {
     return get_app_file(path, cch, APP_GROUPS_FILE_NAME);
-}
-
-static BOOL group_archive_path(uint64_t group_id, WCHAR *path, size_t cch) {
-    WCHAR name[64];
-    if (FAILED(StringCchPrintfW(name, ARRAYSIZE(name), APP_GROUP_ARCHIVE_FILE_FORMAT,
-                                (unsigned long long)group_id))) return FALSE;
-    return get_app_file(path, cch, name);
 }
 
 static BOOL random_bytes(BYTE *out, DWORD len) {
@@ -1650,136 +1644,38 @@ BOOL app_groups_decrypt_message(const BYTE *message, DWORD message_len,
                                          group_index_out, NULL, err, err_cch);
 }
 
-static WCHAR *dup_wide(const WCHAR *text) {
-    size_t len = wcslen(text ? text : L"");
-    if (len > SIZE_MAX / sizeof(WCHAR) - 1) return NULL;
-    WCHAR *copy = (WCHAR *)xalloc((len + 1) * sizeof(WCHAR));
-    if (copy) CopyMemory(copy, text ? text : L"", (len + 1) * sizeof(WCHAR));
-    return copy;
-}
-
-static BOOL build_archive_record(const WCHAR *sender, const WCHAR *plain, WCHAR **out) {
-    *out = NULL;
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    WSTRB record_builder = {0};
-    if (!wstrb_appendf(&record_builder, L"[%04u-%02u-%02u %02u:%02u:%02u] \u53d1\u9001\u4eba\uff1a%s\r\n",
-                       st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
-                       sender && sender[0] ? sender : L"\u672a\u547d\u540d") ||
-        !wstrb_append(&record_builder, plain ? plain : L"")) {
-        wstrb_secure_free(&record_builder);
-        return FALSE;
-    }
-    size_t len = wcslen(plain ? plain : L"");
-    if (len == 0 || (plain[len - 1] != L'\n' && plain[len - 1] != L'\r')) {
-        if (!wstrb_append(&record_builder, L"\r\n")) {
-            wstrb_secure_free(&record_builder);
-            return FALSE;
-        }
-    }
-    if (!wstrb_append(&record_builder, L"\r\n")) {
-        wstrb_secure_free(&record_builder);
-        return FALSE;
-    }
-    *out = record_builder.data;
-    record_builder.data = NULL;
-    return TRUE;
-}
-
 BOOL app_groups_archive_append_text(int index, const WCHAR *sender, const WCHAR *plain,
                                     WCHAR *err, size_t err_cch) {
     APP_GROUP *group = group_at(index);
-    WCHAR path[MAX_PATH];
-    WCHAR *record = NULL;
-    char *record_utf8 = NULL;
-    int record_len = 0;
-    BYTE *file = NULL;
-    DWORD file_len = 0;
-    BYTE *old = NULL;
-    DWORD old_len = 0;
-    BYTE *merged = NULL;
-    DWORD merged_len = 0;
-    BYTE *protected_blob = NULL;
-    DWORD protected_len = 0;
-    BOOL archive_saved = FALSE;
     WCHAR local_sender_label[GROUP_MEMBER_NAME_CCH + 32] = L"";
-    if (!group || !group_archive_path(group->group_id, path, ARRAYSIZE(path))) {
-        set_error(err, err_cch, L"Group archive path is not available.");
+    const WCHAR *history_sender = sender;
+    if (!group) {
+        set_error(err, err_cch, L"Group archive is not available.");
         return FALSE;
     }
-    if ((!sender || !sender[0]) &&
-        !app_groups_get_local_sender_label(index, local_sender_label, ARRAYSIZE(local_sender_label))) {
-        set_error(err, err_cch, L"Failed to build group sender label.");
-        goto cleanup;
-    }
-    if (!build_archive_record(sender && sender[0] ? sender : local_sender_label, plain, &record) ||
-        !wide_to_utf8(record, &record_utf8, &record_len)) {
-        set_error(err, err_cch, L"Failed to build group archive record.");
-        goto cleanup;
-    }
-    if (read_file_bytes(path, &file, &file_len)) {
-        if (!dpapi_unprotect(file, file_len, &old, &old_len)) {
-            set_error(err, err_cch, L"Group archive file exists but could not be decrypted.");
-            goto cleanup;
+    if (!history_sender || !history_sender[0]) {
+        if (!app_groups_get_local_sender_label(index, local_sender_label, ARRAYSIZE(local_sender_label))) {
+            set_error(err, err_cch, L"Failed to build group sender label.");
+            return FALSE;
         }
-    } else if (file_exists_w(path)) {
-        set_error(err, err_cch, L"Group archive file exists but could not be read.");
-        goto cleanup;
+        history_sender = local_sender_label;
     }
-    if (record_len < 0 || (DWORD)record_len > 0xffffffffu - old_len) {
-        set_error(err, err_cch, L"Group archive data is too large.");
-        goto cleanup;
-    }
-    merged_len = old_len + (DWORD)record_len;
-    merged = (BYTE *)xalloc(merged_len ? merged_len : 1);
-    if (!merged) {
-        set_error(err, err_cch, L"Out of memory while updating group archive.");
-        goto cleanup;
-    }
-    if (old && old_len) CopyMemory(merged, old, old_len);
-    CopyMemory(merged + old_len, record_utf8, (DWORD)record_len);
-    archive_saved = dpapi_protect(merged, merged_len, &protected_blob, &protected_len) &&
-                    write_file_bytes_atomic(path, protected_blob, protected_len);
-    if (!archive_saved) set_error(err, err_cch, L"Failed to write group archive.");
-cleanup:
-    secure_free_wide(record);
-    secure_free_str(record_utf8);
-    secure_free(file, file_len);
-    secure_free(old, old_len);
-    secure_free(merged, merged_len);
-    secure_free(protected_blob, protected_len);
-    return archive_saved;
+    return chat_history_append_group(group->group_id, history_sender, plain, err, err_cch);
 }
 
 BOOL app_groups_archive_load_text(int index, WCHAR **out,
                                   WCHAR *err, size_t err_cch) {
-    *out = NULL;
+    if (out) {
+        *out = NULL;
+    }
+    if (!out) {
+        set_error(err, err_cch, L"Group archive output is not available.");
+        return FALSE;
+    }
     APP_GROUP *group = group_at(index);
-    WCHAR path[MAX_PATH];
-    BYTE *file = NULL;
-    DWORD file_len = 0;
-    BYTE *plain = NULL;
-    DWORD plain_len = 0;
-    BOOL loaded = FALSE;
-    if (!group || !group_archive_path(group->group_id, path, ARRAYSIZE(path))) {
-        set_error(err, err_cch, L"Group archive path is not available.");
+    if (!group) {
+        set_error(err, err_cch, L"Group archive is not available.");
         return FALSE;
     }
-    if (!read_file_bytes(path, &file, &file_len)) {
-        if (file_exists_w(path)) {
-            set_error(err, err_cch, L"Group archive file exists but could not be read.");
-            return FALSE;
-        }
-        *out = dup_wide(L"");
-        return *out != NULL;
-    }
-    loaded = dpapi_unprotect(file, file_len, &plain, &plain_len) &&
-             utf8_to_wide_n((const char *)plain, (int)plain_len, out);
-    secure_free(file, file_len);
-    secure_free(plain, plain_len);
-    if (!loaded) {
-        set_error(err, err_cch, L"Group archive file could not be decrypted or decoded.");
-        return FALSE;
-    }
-    return TRUE;
+    return chat_history_load_group(group->group_id, out, err, err_cch);
 }

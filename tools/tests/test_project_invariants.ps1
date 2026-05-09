@@ -107,12 +107,12 @@ function Test-WorkerPromptsAreRuntimeFiles {
     Assert-True $defaultPrompt.Contains("/no_think") "default prompt should request Qwen non-thinking output"
     Assert-True $selfIntroPrompt.Contains("/no_think") "self-introduction prompt should request Qwen non-thinking output"
     Assert-True $groupKeyPrompt.Contains("/no_think") "group key prompt should request Qwen non-thinking output"
-    Assert-True $defaultPrompt.Contains("</think>") "default prompt should prefill an empty Qwen think block"
+    Assert-True (-not [regex]::IsMatch($defaultPrompt, '<\|im_start\|>assistant\s*<think>')) "default prompt should not prefill a Qwen think block"
     Assert-True $defaultPrompt.Contains("<|im_start|>system") "default prompt should use a Qwen-style system/user chat template"
     Assert-True ($rejectPhrases.Length -gt 100) "reject phrase list should be editable without rebuilding worker"
     Assert-True $workerConfig.Contains("temperature=0.7") "Qwen3 non-thinking sampling defaults should live in runtime worker_config.txt"
     Assert-True $workerConfig.Contains("top_p=0.8") "Qwen3 non-thinking top-p default should live in runtime worker_config.txt"
-    Assert-True $workerConfig.Contains("top_k=20") "Qwen3 non-thinking top-k default should live in runtime worker_config.txt"
+    Assert-True $workerConfig.Contains("top_k=128") "Qwen3 carrier top-k default should live in runtime worker_config.txt"
     Assert-True $workerConfig.Contains("max_tail_tokens=64") "worker free-tail clamp should live in runtime worker_config.txt"
     Assert-True $workerConfig.Contains("length_payload_multiplier=") "worker length scaling should live in runtime worker_config.txt"
     Assert-True $workerConfig.Contains("encode_attempts=") "worker retry count should live in runtime worker_config.txt"
@@ -187,14 +187,53 @@ function Test-KeyPersistenceUsesAtomicWrites {
     $shared = Read-RepoFile "src\app_shared.c"
     $profiles = Read-RepoFile "src\app_profiles.c"
     $archive = Read-RepoFile "src\app_archive.c"
+    $chatHistory = Read-RepoFile "src\app_chat_history.c"
     $crypto = Read-RepoFile "src\crypto_box.c"
 
     Assert-True $shared.Contains("write_file_bytes_atomic") "app_shared.c should implement write_file_bytes_atomic"
     Assert-True $shared.Contains("MoveFileExW") "atomic writes should replace via MoveFileExW"
     Assert-True $shared.Contains("MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH") "atomic writes should use replace and write-through"
     Assert-True (Get-RepoSlice $profiles "BOOL profiles_save" "BOOL profiles_create_from_master").Contains("write_file_bytes_atomic") "profiles_save should use atomic writes"
-    Assert-True (Get-RepoSlice $archive "static BOOL archive_append_with_master" "BOOL archive_load_text").Contains("write_file_bytes_atomic") "archive rewrite should use atomic writes"
+    Assert-True $archive.Contains("chat_history_append_private") "private archive append should delegate to SQLite chat history"
+    Assert-True $archive.Contains("chat_history_load_private") "private archive load should delegate to SQLite chat history"
+    Assert-True (-not $archive.Contains("profiles_get_archive_path_by_index")) "private archive adapter should not read legacy archive paths"
+    Assert-True $chatHistory.Contains("BEGIN IMMEDIATE TRANSACTION") "chat history append should use a SQLite transaction"
+    Assert-True $chatHistory.Contains("ROLLBACK") "chat history append failure should roll back the SQLite transaction"
     Assert-True (Get-RepoSlice $crypto "static BOOL write_file_all" "static BOOL box_file_exists").Contains("write_file_bytes_atomic") "crypto state save should use atomic writes"
+}
+
+function Test-ChatHistoryUsesEncryptedSQLite {
+    $cmake = Read-RepoFile "CMakeLists.txt"
+    $paths = Read-RepoFile "src\app_paths.h"
+    $header = Read-RepoFile "src\app_chat_history.h"
+    $history = Read-RepoFile "src\app_chat_history.c"
+    $archive = Read-RepoFile "src\app_archive.c"
+    $groups = Read-RepoFile "src\app_groups.c"
+
+    Assert-True $cmake.Contains("src/app_chat_history.c") "CMakeLists should include app_chat_history.c"
+    Assert-True $cmake.Contains("third_party/sqlite/sqlite3.c") "CMakeLists should compile SQLite amalgamation"
+    Assert-True $cmake.Contains("SQLITE_OMIT_LOAD_EXTENSION") "SQLite extension loading should be omitted"
+    Assert-True $cmake.Contains("SQLITE_DEFAULT_MEMSTATUS=0") "SQLite memory status should be disabled"
+    Assert-True $paths.Contains("APP_CHAT_HISTORY_DB_NAME L`"chat_history.db`"") "chat history DB file name should be centralized"
+    Assert-True $header.Contains("chat_history_append_private") "chat history module should expose private append"
+    Assert-True $header.Contains("chat_history_load_private") "chat history module should expose private load"
+    Assert-True $header.Contains("chat_history_append_group") "chat history module should expose group append"
+    Assert-True $header.Contains("chat_history_load_group") "chat history module should expose group load"
+    Assert-True (-not $history.Contains('#include "app_profiles.h"')) "chat history module should not depend on profiles"
+    Assert-True (-not $history.Contains('#include "app_groups.h"')) "chat history module should not depend on groups"
+    Assert-True $history.Contains("CREATE TABLE IF NOT EXISTS messages") "chat history should create the messages table"
+    Assert-True $history.Contains("group_history_keys") "chat history should store local wrapped group history keys"
+    Assert-True $history.Contains("BCRYPT_CHAIN_MODE_GCM") "chat history rows should use AES-GCM"
+    Assert-True $history.Contains("#define CHAT_TAG_BYTES 16") "chat history AES-GCM tag should remain 16 bytes"
+    Assert-True $history.Contains("dpapi_protect") "group history keys should be protected by DPAPI"
+    Assert-True $history.Contains("dpapi_unprotect") "group history keys should be unprotected by DPAPI"
+    Assert-True $history.Contains("hmac_sha256_segments") "private history keys should be derived by HMAC-SHA256"
+    Assert-True $history.Contains("message_uuid BLOB NOT NULL UNIQUE") "chat history rows should have unique message UUIDs"
+    Assert-True $history.Contains("ciphertext BLOB NOT NULL") "chat history body should be stored as ciphertext"
+    Assert-True $history.Contains("timestamp_text") "chat history display timestamps should remain stored metadata"
+    Assert-True $archive.Contains("chat_history_append_private") "private archive adapter should use chat history append"
+    Assert-True $groups.Contains("chat_history_append_group") "group archive adapter should use chat history append"
+    Assert-True (-not $groups.Contains("group_archive_path")) "group archive adapter should not use legacy archive files"
 }
 
 function Test-AppFlowOwnsCryptoBusinessFlow {
@@ -253,7 +292,7 @@ function Test-GroupChatTransportInvariants {
     Assert-True $groups.Contains("alias_name") "group state should support local member alias overrides"
     Assert-True $groups.Contains("resolve_member_lookup") "group aliases should resolve by member id or known nickname"
     Assert-True $groups.Contains("current_local_minute_of_day") "group message payload should include a short timestamp"
-    Assert-True $groups.Contains("write_file_bytes_atomic") "group database and archive writes should use atomic writes"
+    Assert-True $groups.Contains("write_file_bytes_atomic") "group database writes should use atomic writes"
     Assert-True $groups.Contains("BOOL app_groups_rekey(") "group chat should support explicit epoch refresh"
     Assert-True $groups.Contains("memcmp(epoch_seed, group->epoch_seed") "same-epoch group package imports should not reset sender chains"
     Assert-True $flow.Contains("app_flow_encrypt_group_message(") "app_flow should expose group encryption orchestration"
@@ -273,6 +312,8 @@ function Test-TopLevelCMakeBuildTargets {
     Assert-True $cmake.Contains("src/app_contact_flow.c") "CMakeLists should include app_contact_flow.c"
     Assert-True $cmake.Contains("src/app_message_flow.c") "CMakeLists should include app_message_flow.c"
     Assert-True $cmake.Contains("src/app_groups.c") "CMakeLists should include app_groups.c"
+    Assert-True $cmake.Contains("src/app_chat_history.c") "CMakeLists should include app_chat_history.c"
+    Assert-True $cmake.Contains("third_party/sqlite/sqlite3.c") "CMakeLists should include SQLite amalgamation"
     Assert-True $mingw.Contains("cmake.exe -S") "build-mingw.bat should be a CMake wrapper"
     Assert-True $msvc.Contains("cmake.exe -S") "build.bat should be a CMake wrapper"
 }
@@ -286,6 +327,7 @@ $tests = @(
     "Test-CryptoBoxUsesSessionTransport",
     "Test-ProfilesDoNotManageCryptoLifecycle",
     "Test-KeyPersistenceUsesAtomicWrites",
+    "Test-ChatHistoryUsesEncryptedSQLite",
     "Test-AppFlowOwnsCryptoBusinessFlow",
     "Test-GroupChatTransportInvariants",
     "Test-TopLevelCMakeBuildTargets"
