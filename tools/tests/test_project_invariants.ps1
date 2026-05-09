@@ -202,7 +202,7 @@ function Test-KeyPersistenceUsesAtomicWrites {
     Assert-True (Get-RepoSlice $crypto "static BOOL write_file_all" "static BOOL box_file_exists").Contains("write_file_bytes_atomic") "crypto state save should use atomic writes"
 }
 
-function Test-ChatHistoryUsesEncryptedSQLite {
+function Test-ChatHistoryUsesEncryptedRowsInSQLite {
     $cmake = Read-RepoFile "CMakeLists.txt"
     $paths = Read-RepoFile "src\app_paths.h"
     $header = Read-RepoFile "src\app_chat_history.h"
@@ -225,8 +225,12 @@ function Test-ChatHistoryUsesEncryptedSQLite {
     Assert-True $history.Contains("group_history_keys") "chat history should store local wrapped group history keys"
     Assert-True $history.Contains("BCRYPT_CHAIN_MODE_GCM") "chat history rows should use AES-GCM"
     Assert-True $history.Contains("#define CHAT_TAG_BYTES 16") "chat history AES-GCM tag should remain 16 bytes"
-    Assert-True $history.Contains("dpapi_protect") "group history keys should be protected by DPAPI"
-    Assert-True $history.Contains("dpapi_unprotect") "group history keys should be unprotected by DPAPI"
+    Assert-True $history.Contains("CryptProtectData") "group history keys should be protected by DPAPI"
+    Assert-True $history.Contains("CryptUnprotectData") "group history keys should be unprotected by DPAPI"
+    Assert-True $history.Contains("group_history_key_entropy") "group history key DPAPI protection should be scoped to the group id"
+    Assert-True $history.Contains("PRAGMA secure_delete=ON") "SQLite should enable secure_delete"
+    Assert-True $history.Contains("verify_schema_version") "chat history should reject unsupported schema versions"
+    Assert-True $history.Contains("Unsupported chat history schema version") "schema mismatch should return a clear error"
     Assert-True $history.Contains("hmac_sha256_segments") "private history keys should be derived by HMAC-SHA256"
     Assert-True $history.Contains("message_uuid BLOB NOT NULL UNIQUE") "chat history rows should have unique message UUIDs"
     Assert-True $history.Contains("ciphertext BLOB NOT NULL") "chat history body should be stored as ciphertext"
@@ -327,7 +331,7 @@ $tests = @(
     "Test-CryptoBoxUsesSessionTransport",
     "Test-ProfilesDoNotManageCryptoLifecycle",
     "Test-KeyPersistenceUsesAtomicWrites",
-    "Test-ChatHistoryUsesEncryptedSQLite",
+    "Test-ChatHistoryUsesEncryptedRowsInSQLite",
     "Test-AppFlowOwnsCryptoBusinessFlow",
     "Test-GroupChatTransportInvariants",
     "Test-TopLevelCMakeBuildTargets"

@@ -5,6 +5,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <strsafe.h>
 
 static BYTE g_master[CHAT_HISTORY_KEY_BYTES] = {
@@ -132,6 +133,19 @@ static void exec_tamper_sql(const char *sql)
     sqlite3_close(db);
 }
 
+static WCHAR *make_repeated_wide(WCHAR ch, size_t count)
+{
+    WCHAR *out = (WCHAR *)xalloc((count + 1) * sizeof(WCHAR));
+    if (!out) {
+        return NULL;
+    }
+    for (size_t idx = 0; idx < count; ++idx) {
+        out[idx] = ch;
+    }
+    out[count] = L'\0';
+    return out;
+}
+
 static void test_private_tamper_fails(const WCHAR *root, const WCHAR *case_name, const char *sql)
 {
     WCHAR dir[MAX_PATH];
@@ -146,6 +160,42 @@ static void test_private_tamper_fails(const WCHAR *root, const WCHAR *case_name,
     secure_free_wide(out);
 }
 
+static void test_schema_version_mismatch_fails(const WCHAR *root)
+{
+    WCHAR dir[MAX_PATH];
+    WCHAR err[512] = L"";
+    WCHAR *out = NULL;
+    check(set_case_dir(root, L"schema_mismatch", dir, ARRAYSIZE(dir)), L"set schema mismatch test dir");
+    check(chat_history_append_private(L"profile-schema", g_master, L"A", L"schema body", err, ARRAYSIZE(err)),
+          L"schema append should succeed");
+    exec_tamper_sql("UPDATE meta SET value='999' WHERE key='schema_version';");
+    check(!chat_history_load_private(L"profile-schema", g_master, &out, err, ARRAYSIZE(err)),
+          L"schema mismatch should fail load");
+    check(wcsstr(err, L"Unsupported chat history schema version") != NULL,
+          L"schema mismatch should report unsupported version");
+    secure_free_wide(out);
+}
+
+static void test_private_long_text(const WCHAR *root)
+{
+    WCHAR dir[MAX_PATH];
+    WCHAR err[512] = L"";
+    WCHAR *out = NULL;
+    WCHAR *sender = make_repeated_wide(L'S', 1024);
+    WCHAR *body = make_repeated_wide(L'B', 8192);
+    check(sender && body, L"allocate long text");
+    check(set_case_dir(root, L"private_long", dir, ARRAYSIZE(dir)), L"set long text test dir");
+    check(chat_history_append_private(L"profile-long", g_master, sender, body, err, ARRAYSIZE(err)),
+          L"long private append should succeed");
+    check(chat_history_load_private(L"profile-long", g_master, &out, err, ARRAYSIZE(err)),
+          L"long private load should succeed");
+    check(wcsstr(out, sender) != NULL && wcsstr(out, body) != NULL,
+          L"long private load should recover sender and body");
+    secure_free_wide(out);
+    secure_free_wide(sender);
+    secure_free_wide(body);
+}
+
 static void test_group_roundtrip(const WCHAR *root)
 {
     WCHAR dir[MAX_PATH];
@@ -158,6 +208,20 @@ static void test_group_roundtrip(const WCHAR *root)
           L"group load should succeed");
     check(contains_wide(out, L"\u53d1\u9001\u4eba\uff1aGroupAlice\r\ngroup body\r\n\r\n"),
           L"group load should reconstruct display record");
+    secure_free_wide(out);
+}
+
+static void test_group_wrapped_key_tamper_fails(const WCHAR *root)
+{
+    WCHAR dir[MAX_PATH];
+    WCHAR err[512] = L"";
+    WCHAR *out = NULL;
+    check(set_case_dir(root, L"group_key_tamper", dir, ARRAYSIZE(dir)), L"set group key tamper test dir");
+    check(chat_history_append_group(0x1020304050607080ULL, L"GroupAlice", L"group secret body", err, ARRAYSIZE(err)),
+          L"group append should succeed");
+    exec_tamper_sql("UPDATE group_history_keys SET wrapped_key=zeroblob(length(wrapped_key));");
+    check(!chat_history_load_group(0x1020304050607080ULL, &out, err, ARRAYSIZE(err)),
+          L"tampered group history key should fail load");
     secure_free_wide(out);
 }
 
@@ -189,7 +253,10 @@ int wmain(int argc, WCHAR **argv)
     test_private_tamper_fails(argv[1], L"tamper_nonce", "UPDATE messages SET nonce=zeroblob(12);");
     test_private_tamper_fails(argv[1], L"tamper_ciphertext", "UPDATE messages SET ciphertext=zeroblob(length(ciphertext));");
     test_private_tamper_fails(argv[1], L"tamper_aad", "UPDATE messages SET timestamp_ms=timestamp_ms+1;");
+    test_schema_version_mismatch_fails(argv[1]);
+    test_private_long_text(argv[1]);
     test_group_roundtrip(argv[1]);
+    test_group_wrapped_key_tamper_fails(argv[1]);
     test_corrupt_db_fails(argv[1]);
 
     wprintf(L"ok chat_history_sqlite_test\n");

@@ -1,7 +1,6 @@
 #include "app_chat_history.h"
 #include "app_paths.h"
 #include "app_shared.h"
-#include "app_storage.h"
 
 #include "sqlite3.h"
 
@@ -11,16 +10,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strsafe.h>
+#include <wincrypt.h>
 
 #define CHAT_SCHEMA_VERSION "1"
 #define CHAT_KIND_PRIVATE 1
 #define CHAT_KIND_GROUP 2
+/* Kept at 0 intentionally: current UI does not need sent/received filtering,
+   and writing it would expose more plaintext metadata in SQLite. */
 #define CHAT_DIRECTION_UNKNOWN 0
 #define CHAT_MESSAGE_UUID_BYTES 16
 #define CHAT_NONCE_BYTES 12
 #define CHAT_TAG_BYTES 16
 #define CHAT_RECORD_VERSION 1
 #define CHAT_TIMESTAMP_TEXT_BYTES 32
+#define GROUP_HISTORY_ENTROPY_BYTES 20
 
 typedef struct BYTE_BUILDER {
     BYTE *data;
@@ -33,7 +36,7 @@ static void byte_builder_free(BYTE_BUILDER *builder)
     if (!builder) {
         return;
     }
-    free(builder->data);
+    xfree(builder->data);
     builder->data = NULL;
     builder->len = 0;
     builder->cap = 0;
@@ -62,9 +65,16 @@ static BOOL byte_builder_reserve(BYTE_BUILDER *builder, DWORD needed)
         }
         new_cap *= 2;
     }
-    BYTE *next = (BYTE *)realloc(builder->data, new_cap);
+    BYTE *next = (BYTE *)xalloc(new_cap);
     if (!next) {
         return FALSE;
+    }
+    if (builder->data && builder->len) {
+        memcpy(next, builder->data, builder->len);
+    }
+    if (builder->data && builder->cap) {
+        SecureZeroMemory(builder->data, builder->cap);
+        xfree(builder->data);
     }
     builder->data = next;
     builder->cap = new_cap;
@@ -176,12 +186,50 @@ static BOOL exec_sql(sqlite3 *db, const char *sql, WCHAR *err, size_t err_cch, c
     return TRUE;
 }
 
+static BOOL configure_db(sqlite3 *db, WCHAR *err, size_t err_cch)
+{
+    /* DELETE journaling keeps the portable data footprint to the single .db file.
+       WAL would also leave plaintext metadata and encrypted row blobs in -wal/-shm
+       sidecars. FULL synchronous keeps append durability ahead of speed here. */
+    static const char *pragma_sql =
+        "PRAGMA foreign_keys=ON;"
+        "PRAGMA secure_delete=ON;"
+        "PRAGMA journal_mode=DELETE;"
+        "PRAGMA synchronous=FULL;";
+    return exec_sql(db, pragma_sql, err, err_cch, L"Unable to configure chat history database");
+}
+
+static BOOL verify_schema_version(sqlite3 *db, WCHAR *err, size_t err_cch)
+{
+    sqlite3_stmt *stmt = NULL;
+    BOOL version_ok = FALSE;
+    static const char *sql = "SELECT value FROM meta WHERE key='schema_version';";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        set_db_error(db, err, err_cch, L"Unable to read chat history schema version");
+        return FALSE;
+    }
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        const char *version = (const char *)sqlite3_column_text(stmt, 0);
+        if (version && strcmp(version, CHAT_SCHEMA_VERSION) == 0) {
+            version_ok = TRUE;
+        } else {
+            set_error(err,
+                      err_cch,
+                      L"Unsupported chat history schema version. Delete chat_history.db to start fresh.");
+        }
+    } else if (rc == SQLITE_DONE) {
+        set_error(err, err_cch, L"Chat history schema version is missing.");
+    } else {
+        set_db_error(db, err, err_cch, L"Unable to read chat history schema version");
+    }
+    sqlite3_finalize(stmt);
+    return version_ok;
+}
+
 static BOOL init_schema(sqlite3 *db, WCHAR *err, size_t err_cch)
 {
     static const char *schema_sql =
-        "PRAGMA foreign_keys=ON;"
-        "PRAGMA journal_mode=DELETE;"
-        "PRAGMA synchronous=FULL;"
         "CREATE TABLE IF NOT EXISTS meta ("
         "  key TEXT PRIMARY KEY,"
         "  value TEXT NOT NULL"
@@ -205,7 +253,8 @@ static BOOL init_schema(sqlite3 *db, WCHAR *err, size_t err_cch)
         "CREATE INDEX IF NOT EXISTS idx_messages_conversation_time "
         "ON messages(conversation_kind, conversation_key, timestamp_ms, id);"
         "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', '" CHAT_SCHEMA_VERSION "');";
-    return exec_sql(db, schema_sql, err, err_cch, L"Unable to initialize chat history database");
+    return exec_sql(db, schema_sql, err, err_cch, L"Unable to initialize chat history database") &&
+           verify_schema_version(db, err, err_cch);
 }
 
 static BOOL open_chat_db(sqlite3 **out_db, WCHAR *err, size_t err_cch)
@@ -229,7 +278,7 @@ static BOOL open_chat_db(sqlite3 **out_db, WCHAR *err, size_t err_cch)
         return FALSE;
     }
     sqlite3_busy_timeout(db, 3000);
-    if (!init_schema(db, err, err_cch)) {
+    if (!configure_db(db, err, err_cch) || !init_schema(db, err, err_cch)) {
         sqlite3_close(db);
         return FALSE;
     }
@@ -826,6 +875,90 @@ static void format_group_key(uint64_t group_id, char out[17])
     StringCchPrintfA(out, 17, "%016llx", (unsigned long long)group_id);
 }
 
+/* Group chat is intentionally independent from profiles, and current group
+   state is local-only DPAPI-protected data. There is no profile master key in
+   the group archive API, so the local history key follows the same local
+   protection model and binds the DPAPI blob to group_id as optional entropy. */
+static void group_history_key_entropy(uint64_t group_id, BYTE entropy[GROUP_HISTORY_ENTROPY_BYTES])
+{
+    static const BYTE label[] = "CIAGROUPHIST";
+    ZeroMemory(entropy, GROUP_HISTORY_ENTROPY_BYTES);
+    CopyMemory(entropy, label, sizeof(label) - 1);
+    for (int idx = 0; idx < 8; ++idx) {
+        entropy[sizeof(label) - 1 + idx] = (BYTE)((group_id >> (idx * 8)) & 0xff);
+    }
+}
+
+static BOOL protect_group_history_key(uint64_t group_id, const BYTE key[CHAT_HISTORY_KEY_BYTES],
+                                      BYTE **out, DWORD *out_len)
+{
+    DATA_BLOB in_blob;
+    DATA_BLOB out_blob;
+    DATA_BLOB entropy_blob;
+    BYTE entropy[GROUP_HISTORY_ENTROPY_BYTES];
+    BOOL result = FALSE;
+
+    *out = NULL;
+    *out_len = 0;
+    group_history_key_entropy(group_id, entropy);
+    in_blob.pbData = (BYTE *)key;
+    in_blob.cbData = CHAT_HISTORY_KEY_BYTES;
+    entropy_blob.pbData = entropy;
+    entropy_blob.cbData = sizeof(entropy);
+    ZeroMemory(&out_blob, sizeof(out_blob));
+
+    if (CryptProtectData(&in_blob,
+                         L"ChineseInputAgent group chat history key",
+                         &entropy_blob,
+                         NULL,
+                         NULL,
+                         0,
+                         &out_blob)) {
+        BYTE *copy = (BYTE *)xalloc(out_blob.cbData);
+        if (copy) {
+            CopyMemory(copy, out_blob.pbData, out_blob.cbData);
+            *out = copy;
+            *out_len = out_blob.cbData;
+            result = TRUE;
+        }
+        LocalFree(out_blob.pbData);
+    }
+    SecureZeroMemory(entropy, sizeof(entropy));
+    return result;
+}
+
+static BOOL unprotect_group_history_key(uint64_t group_id, const BYTE *wrapped, DWORD wrapped_len,
+                                        BYTE out_key[CHAT_HISTORY_KEY_BYTES])
+{
+    DATA_BLOB in_blob;
+    DATA_BLOB out_blob;
+    DATA_BLOB entropy_blob;
+    BYTE entropy[GROUP_HISTORY_ENTROPY_BYTES];
+    BOOL result = FALSE;
+
+    group_history_key_entropy(group_id, entropy);
+    in_blob.pbData = (BYTE *)wrapped;
+    in_blob.cbData = wrapped_len;
+    entropy_blob.pbData = entropy;
+    entropy_blob.cbData = sizeof(entropy);
+    ZeroMemory(&out_blob, sizeof(out_blob));
+
+    if (CryptUnprotectData(&in_blob, NULL, &entropy_blob, NULL, NULL, 0, &out_blob) &&
+        out_blob.cbData == CHAT_HISTORY_KEY_BYTES) {
+        CopyMemory(out_key, out_blob.pbData, CHAT_HISTORY_KEY_BYTES);
+        result = TRUE;
+    }
+    if (out_blob.pbData) {
+        SecureZeroMemory(out_blob.pbData, out_blob.cbData);
+        LocalFree(out_blob.pbData);
+    }
+    SecureZeroMemory(entropy, sizeof(entropy));
+    if (!result) {
+        SecureZeroMemory(out_key, CHAT_HISTORY_KEY_BYTES);
+    }
+    return result;
+}
+
 static BOOL get_group_history_key(sqlite3 *db,
                                   uint64_t group_id,
                                   BOOL create_if_missing,
@@ -848,19 +981,11 @@ static BOOL get_group_history_key(sqlite3 *db,
     if (rc == SQLITE_ROW) {
         const BYTE *wrapped = (const BYTE *)sqlite3_column_blob(stmt, 0);
         int wrapped_len = sqlite3_column_bytes(stmt, 0);
-        BYTE *plain = NULL;
-        DWORD plain_len = 0;
         if (!wrapped || wrapped_len <= 0 ||
-            !dpapi_unprotect(wrapped, (DWORD)wrapped_len, &plain, &plain_len) ||
-            plain_len != CHAT_HISTORY_KEY_BYTES) {
-            if (plain) {
-                secure_free(plain, plain_len);
-            }
+            !unprotect_group_history_key(group_id, wrapped, (DWORD)wrapped_len, out_key)) {
             set_error(err, err_cch, L"Unable to decrypt group chat history key.");
             goto cleanup;
         }
-        memcpy(out_key, plain, CHAT_HISTORY_KEY_BYTES);
-        secure_free(plain, plain_len);
         result = TRUE;
         goto cleanup;
     }
@@ -881,7 +1006,7 @@ static BOOL get_group_history_key(sqlite3 *db,
     }
     BYTE *wrapped_key = NULL;
     DWORD wrapped_len = 0;
-    if (!dpapi_protect(out_key, CHAT_HISTORY_KEY_BYTES, &wrapped_key, &wrapped_len)) {
+    if (!protect_group_history_key(group_id, out_key, &wrapped_key, &wrapped_len)) {
         set_error(err, err_cch, L"Unable to protect group chat history key.");
         SecureZeroMemory(out_key, CHAT_HISTORY_KEY_BYTES);
         goto cleanup;
