@@ -50,11 +50,20 @@ function Test-InstallerDownloadsWorkerDefaultModel {
             Sort-Object -Unique
     )
     Assert-True ($workerNames -contains "base_model.gguf") "worker should search for installer-downloaded base_model.gguf"
-    Assert-True $installerConfig.Contains("APP_INSTALL_MODEL_DOWNLOAD_URL") "installer should define a model download URL"
-    Assert-True $installerConfig.Contains("APP_INSTALL_MODEL_DOWNLOAD_SHA256") "installer should verify the downloaded model"
+    Assert-True $installerConfig.Contains("APP_INSTALL_MODEL_OPTIONS") "installer should define selectable model options"
+    Assert-True $installerConfig.Contains("APP_INSTALL_QUANT_OPTIONS") "installer should define selectable quantization options"
+    Assert-True $installerConfig.Contains("Qwen3-0.6B") "installer should include the 0.6B option"
+    Assert-True $installerConfig.Contains("Qwen3-4B-Instruct-2507-GGUF") "installer should default to the stable 4B 2507 release model"
+    Assert-True $installerConfig.Contains("UD-Q4_K_XL") "installer should include the default Unsloth Dynamic Q4_K_XL quant"
+    Assert-True $installerConfig.Contains("Q3_K_S") "installer quant list should support the minimum Q3_K_S option"
+    Assert-True (-not $installerConfig.Contains("Thinking-2507")) "installer should not offer suffix thinking variants"
+    Assert-True $installer.Contains('Invoke-RestMethod -Uri $treeUrl') "installer should query Hugging Face model metadata for selected files"
+    Assert-True $installer.Contains("Get-FileHash -Algorithm SHA256") "installer should verify downloaded model files"
+    Assert-True $installer.Contains("worker_config.txt") "installer should update worker_config.txt for the selected model"
+    Assert-True $installer.Contains("IDC_INSTALLER_MODEL_COMBO") "installer should expose a model selector"
+    Assert-True $installer.Contains("IDC_INSTALLER_QUANT_COMBO") "installer should expose a quantization selector"
     Assert-True $appPaths.Contains("APP_INSTALL_MODEL_NAME L`"base_model.gguf`"") "installer should write the worker default model name"
-    Assert-True $installerConfig.Contains("Qwen3-4B-Instruct-2507-GGUF") "installer should download the stable release model, not the experimental 2B model"
-    Assert-True $installer.Contains("APP_INSTALL_MODEL_NAME") "installer should use the centralized worker default model name"
+    Assert-True (-not $installer.Contains("APP_INSTALL_MODEL_DOWNLOAD_URL")) "installer should not be locked to one hardcoded model URL"
     Assert-True (-not $packageBat.Contains("copy /y `"%MODEL_SRC%`"")) "portable package should not embed the GGUF model"
 }
 

@@ -33,6 +33,8 @@ typedef struct PAYLOAD_TRAILER {
 typedef struct INSTALL_CTX {
     WCHAR target[MAX_PATH];
     BOOL launch_after;
+    int model_index;
+    int quant_index;
 } INSTALL_CTX;
 
 static HINSTANCE g_instance;
@@ -42,6 +44,8 @@ static HWND g_progress;
 static HWND g_install_button;
 static HWND g_close_button;
 static HWND g_launch_check;
+static HWND g_model_combo;
+static HWND g_quant_combo;
 static HFONT g_font;
 
 static void *xalloc(SIZE_T bytes) {
@@ -63,6 +67,58 @@ static WCHAR *dup_wide(const WCHAR *text) {
 static void set_font(HWND hwnd) {
     if (!hwnd) return;
     SendMessageW(hwnd, WM_SETFONT, (WPARAM)g_font, TRUE);
+}
+
+static int clamp_combo_index(int index, int count, int fallback) {
+    return (index >= 0 && index < count) ? index : fallback;
+}
+
+static const APP_INSTALL_MODEL_OPTION *install_model_option(int index) {
+    int safe_index = clamp_combo_index(index, (int)ARRAYSIZE(APP_INSTALL_MODEL_OPTIONS), APP_INSTALL_DEFAULT_MODEL_INDEX);
+    return &APP_INSTALL_MODEL_OPTIONS[safe_index];
+}
+
+static const APP_INSTALL_QUANT_OPTION *install_quant_option(int index) {
+    int safe_index = clamp_combo_index(index, (int)ARRAYSIZE(APP_INSTALL_QUANT_OPTIONS), APP_INSTALL_DEFAULT_QUANT_INDEX);
+    return &APP_INSTALL_QUANT_OPTIONS[safe_index];
+}
+
+static void populate_install_option_combos(void) {
+    for (size_t i = 0; i < ARRAYSIZE(APP_INSTALL_MODEL_OPTIONS); ++i) {
+        SendMessageW(g_model_combo, CB_ADDSTRING, 0, (LPARAM)APP_INSTALL_MODEL_OPTIONS[i].label);
+    }
+    for (size_t i = 0; i < ARRAYSIZE(APP_INSTALL_QUANT_OPTIONS); ++i) {
+        SendMessageW(g_quant_combo, CB_ADDSTRING, 0, (LPARAM)APP_INSTALL_QUANT_OPTIONS[i].label);
+    }
+    SendMessageW(g_model_combo, CB_SETCURSEL, APP_INSTALL_DEFAULT_MODEL_INDEX, 0);
+    SendMessageW(g_quant_combo, CB_SETCURSEL, APP_INSTALL_DEFAULT_QUANT_INDEX, 0);
+}
+
+static void set_install_controls_enabled(BOOL enabled) {
+    EnableWindow(g_install_button, enabled);
+    EnableWindow(g_close_button, enabled);
+    EnableWindow(g_path_edit, enabled);
+    EnableWindow(GetDlgItem(GetParent(g_path_edit), IDC_INSTALLER_BROWSE), enabled);
+    EnableWindow(g_model_combo, enabled);
+    EnableWindow(g_quant_combo, enabled);
+    EnableWindow(g_launch_check, enabled);
+}
+
+static BOOL directory_has_gguf(const WCHAR *dir) {
+    WCHAR pattern[MAX_PATH];
+    if (FAILED(StringCchPrintfW(pattern, ARRAYSIZE(pattern), L"%s\\*.gguf", dir ? dir : L""))) return FALSE;
+    WIN32_FIND_DATAW fd;
+    HANDLE find = FindFirstFileW(pattern, &fd);
+    if (find == INVALID_HANDLE_VALUE) return FALSE;
+    BOOL found = FALSE;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            found = TRUE;
+            break;
+        }
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+    return found;
 }
 
 static void post_status(int pos, const WCHAR *text) {
@@ -267,49 +323,93 @@ static BOOL write_expand_script(const WCHAR *script_path, const WCHAR *zip_path,
     return write_succeeded;
 }
 
-static BOOL write_model_download_script(const WCHAR *script_path, const WCHAR *target, WCHAR *err, size_t err_cch) {
+static BOOL write_model_download_script(const WCHAR *script_path, const WCHAR *target,
+                                        const APP_INSTALL_MODEL_OPTION *model,
+                                        const APP_INSTALL_QUANT_OPTION *quant,
+                                        WCHAR *err, size_t err_cch) {
     WCHAR *target_q = ps_single_quote(target);
-    if (!target_q) {
+    WCHAR *repo_q = ps_single_quote(model ? model->repo : L"");
+    WCHAR *prefix_q = ps_single_quote(model ? model->file_prefix : L"");
+    WCHAR *quant_q = ps_single_quote(quant ? quant->suffix : L"");
+    if (!target_q || !repo_q || !prefix_q || !quant_q) {
+        xfree(target_q);
+        xfree(repo_q);
+        xfree(prefix_q);
+        xfree(quant_q);
         StringCchCopyW(err, err_cch, L"内存不足。");
         return FALSE;
     }
-    WCHAR content[8192];
+    WCHAR content[16384];
     HRESULT hr = StringCchPrintfW(
         content,
         ARRAYSIZE(content),
         L"$ErrorActionPreference = 'Stop'\r\n"
         L"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12\r\n"
         L"$target = %s\r\n"
+        L"$repo = %s\r\n"
+        L"$filePrefix = %s\r\n"
+        L"$quant = %s\r\n"
         L"$modelsDir = Join-Path $target '%s'\r\n"
-        L"$modelPath = Join-Path $modelsDir '%s'\r\n"
-        L"$tmpPath = $modelPath + '.download'\r\n"
-        L"$url = '%s'\r\n"
-        L"$expected = '%s'\r\n"
+        L"$treeUrl = \"https://huggingface.co/api/models/$repo/tree/main?recursive=1\"\r\n"
+        L"$downloadBase = \"https://huggingface.co/$repo/resolve/main\"\r\n"
+        L"$baseName = \"$filePrefix-$quant\"\r\n"
         L"New-Item -ItemType Directory -Force -Path $modelsDir | Out-Null\r\n"
-        L"if (Test-Path -LiteralPath $modelPath) {\r\n"
-        L"  $existing = (Get-FileHash -Algorithm SHA256 -LiteralPath $modelPath).Hash.ToLowerInvariant()\r\n"
-        L"  if ($existing -eq $expected) { exit 0 }\r\n"
-        L"  Remove-Item -LiteralPath $modelPath -Force\r\n"
+        L"$tree = Invoke-RestMethod -Uri $treeUrl -UseBasicParsing\r\n"
+        L"$files = @($tree | Where-Object {\r\n"
+        L"  $leaf = ([string]$_.path) -replace '^.*/',''\r\n"
+        L"  $_.type -eq 'file' -and ($leaf -eq \"$baseName.gguf\" -or $leaf -like \"$baseName-*-of-*.gguf\")\r\n"
+        L"} | Sort-Object path)\r\n"
+        L"if ($files.Count -eq 0) { throw \"Selected model file not found: $repo / $baseName\" }\r\n"
+        L"$modelConfigName = (([string]$files[0].path) -replace '^.*/','')\r\n"
+        L"foreach ($file in $files) {\r\n"
+        L"  $remotePath = [string]$file.path\r\n"
+        L"  $fileName = $remotePath -replace '^.*/',''\r\n"
+        L"  if ($fileName -match '[\\\\/:]') { throw \"Unsafe model file name: $fileName\" }\r\n"
+        L"  $modelPath = Join-Path $modelsDir $fileName\r\n"
+        L"  $tmpPath = $modelPath + '.download'\r\n"
+        L"  $expected = $null\r\n"
+        L"  if ($file.lfs -and $file.lfs.oid) { $expected = ([string]$file.lfs.oid).ToLowerInvariant() }\r\n"
+        L"  if (-not $expected) { throw \"No SHA256 metadata for model file: $remotePath\" }\r\n"
+        L"  if (Test-Path -LiteralPath $modelPath) {\r\n"
+        L"    $existing = (Get-FileHash -Algorithm SHA256 -LiteralPath $modelPath).Hash.ToLowerInvariant()\r\n"
+        L"    if ($existing -eq $expected) { continue }\r\n"
+        L"    Remove-Item -LiteralPath $modelPath -Force\r\n"
+        L"  }\r\n"
+        L"  if (Test-Path -LiteralPath $tmpPath) { Remove-Item -LiteralPath $tmpPath -Force }\r\n"
+        L"  $url = \"$downloadBase/$remotePath?download=true\"\r\n"
+        L"  if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {\r\n"
+        L"    Start-BitsTransfer -Source $url -Destination $tmpPath\r\n"
+        L"  } else {\r\n"
+        L"    Invoke-WebRequest -Uri $url -OutFile $tmpPath -UseBasicParsing\r\n"
+        L"  }\r\n"
+        L"  $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $tmpPath).Hash.ToLowerInvariant()\r\n"
+        L"  if ($actual -ne $expected) {\r\n"
+        L"    Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue\r\n"
+        L"    throw \"Model SHA256 mismatch. Expected $expected but got $actual\"\r\n"
+        L"  }\r\n"
+        L"  Move-Item -LiteralPath $tmpPath -Destination $modelPath -Force\r\n"
         L"}\r\n"
-        L"if (Test-Path -LiteralPath $tmpPath) { Remove-Item -LiteralPath $tmpPath -Force }\r\n"
-        L"if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {\r\n"
-        L"  Start-BitsTransfer -Source $url -Destination $tmpPath\r\n"
-        L"} else {\r\n"
-        L"  Invoke-WebRequest -Uri $url -OutFile $tmpPath -UseBasicParsing\r\n"
-        L"}\r\n"
-        L"$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $tmpPath).Hash.ToLowerInvariant()\r\n"
-        L"if ($actual -ne $expected) {\r\n"
-        L"  Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue\r\n"
-        L"  throw \"Model SHA256 mismatch. Expected $expected but got $actual\"\r\n"
-        L"}\r\n"
-        L"Move-Item -LiteralPath $tmpPath -Destination $modelPath -Force\r\n",
+        L"$configPath = Join-Path $target 'tools\\payload_watermark\\worker_config.txt'\r\n"
+        L"if (Test-Path -LiteralPath $configPath) {\r\n"
+        L"  $lines = @(Get-Content -LiteralPath $configPath -Encoding UTF8)\r\n"
+        L"  $seen = $false\r\n"
+        L"  $updated = @()\r\n"
+        L"  foreach ($line in $lines) {\r\n"
+        L"    if ($line -match '^\\s*model\\s*=') { $updated += \"model=$modelConfigName\"; $seen = $true } else { $updated += $line }\r\n"
+        L"  }\r\n"
+        L"  if (-not $seen) { $updated = @(\"model=$modelConfigName\") + $updated }\r\n"
+        L"  Set-Content -LiteralPath $configPath -Value $updated -Encoding UTF8\r\n"
+        L"}\r\n",
         target_q,
-        APP_INSTALL_MODELS_DIR_NAME,
-        APP_INSTALL_MODEL_NAME,
-        APP_INSTALL_MODEL_DOWNLOAD_URL,
-        APP_INSTALL_MODEL_DOWNLOAD_SHA256
+        repo_q,
+        prefix_q,
+        quant_q,
+        APP_INSTALL_MODELS_DIR_NAME
     );
     xfree(target_q);
+    xfree(repo_q);
+    xfree(prefix_q);
+    xfree(quant_q);
     if (FAILED(hr)) {
         StringCchCopyW(err, err_cch, L"模型下载脚本太长。");
         return FALSE;
@@ -367,12 +467,13 @@ static BOOL run_powershell_script(const WCHAR *script_path, WCHAR *err, size_t e
 
 static DWORD WINAPI install_thread_proc(LPVOID param) {
     INSTALL_CTX *ctx = (INSTALL_CTX *)param;
+    const APP_INSTALL_MODEL_OPTION *model = install_model_option(ctx->model_index);
+    const APP_INSTALL_QUANT_OPTION *quant = install_quant_option(ctx->quant_index);
     WCHAR err[512] = L"";
     WCHAR zip_path[MAX_PATH] = L"";
     WCHAR ps1_path[MAX_PATH] = L"";
     WCHAR exe_path[MAX_PATH] = L"";
     WCHAR models_path[MAX_PATH] = L"";
-    WCHAR model_path[MAX_PATH] = L"";
 
     post_status(3, L"正在创建安装目录...");
     if (!ensure_directory(ctx->target, err, ARRAYSIZE(err))) goto fail;
@@ -389,8 +490,8 @@ static DWORD WINAPI install_thread_proc(LPVOID param) {
     if (!write_expand_script(ps1_path, zip_path, ctx->target, err, ARRAYSIZE(err))) goto fail;
     if (!run_powershell_script(ps1_path, err, ARRAYSIZE(err))) goto fail;
 
-    post_status(70, L"正在下载 Qwen 模型，首次安装需要较长时间...");
-    if (!write_model_download_script(ps1_path, ctx->target, err, ARRAYSIZE(err))) goto fail;
+    post_status(70, L"正在下载所选 Qwen3 模型，首次安装需要较长时间...");
+    if (!write_model_download_script(ps1_path, ctx->target, model, quant, err, ARRAYSIZE(err))) goto fail;
     if (!run_powershell_script(ps1_path, err, ARRAYSIZE(err))) goto fail;
 
     if (!join_path(exe_path, ARRAYSIZE(exe_path), ctx->target, APP_INSTALL_EXE_NAME) ||
@@ -399,9 +500,8 @@ static DWORD WINAPI install_thread_proc(LPVOID param) {
         goto fail;
     }
     if (!join_path(models_path, ARRAYSIZE(models_path), ctx->target, APP_INSTALL_MODELS_DIR_NAME) ||
-        !join_path(model_path, ARRAYSIZE(model_path), models_path, APP_INSTALL_MODEL_NAME) ||
-        GetFileAttributesW(model_path) == INVALID_FILE_ATTRIBUTES) {
-        StringCchPrintfW(err, ARRAYSIZE(err), L"安装完成校验失败：没有找到 %s。", APP_INSTALL_MODEL_NAME);
+        !directory_has_gguf(models_path)) {
+        StringCchCopyW(err, ARRAYSIZE(err), L"安装完成校验失败：没有找到已下载的 GGUF 模型。");
         goto fail;
     }
 
@@ -452,17 +552,15 @@ static void start_install(HWND hwnd) {
     }
     StringCchCopyW(ctx->target, ARRAYSIZE(ctx->target), target);
     ctx->launch_after = Button_GetCheck(g_launch_check) == BST_CHECKED;
-    EnableWindow(g_install_button, FALSE);
-    EnableWindow(g_close_button, FALSE);
-    EnableWindow(g_path_edit, FALSE);
+    ctx->model_index = (int)SendMessageW(g_model_combo, CB_GETCURSEL, 0, 0);
+    ctx->quant_index = (int)SendMessageW(g_quant_combo, CB_GETCURSEL, 0, 0);
+    set_install_controls_enabled(FALSE);
     SendMessageW(g_progress, PBM_SETPOS, 0, 0);
     SetWindowTextW(g_status, L"准备安装...");
     HANDLE thread = CreateThread(NULL, 0, install_thread_proc, ctx, 0, NULL);
     if (!thread) {
         xfree(ctx);
-        EnableWindow(g_install_button, TRUE);
-        EnableWindow(g_close_button, TRUE);
-        EnableWindow(g_path_edit, TRUE);
+        set_install_controls_enabled(TRUE);
         MessageBoxW(hwnd, L"无法启动安装线程。", CIA_INSTALLER_TITLE, MB_ICONERROR | MB_OK);
         return;
     }
@@ -479,10 +577,18 @@ static void layout(HWND hwnd) {
     int button_h = 34;
     int browse_w = 84;
     int y = margin;
-    MoveWindow(GetDlgItem(hwnd, 2000), margin, y, w - margin * 2, label_h, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDC_INSTALLER_PATH_LABEL), margin, y, w - margin * 2, label_h, TRUE);
     y += label_h + 4;
     MoveWindow(g_path_edit, margin, y, w - margin * 2 - browse_w - 8, edit_h, TRUE);
     MoveWindow(GetDlgItem(hwnd, IDC_INSTALLER_BROWSE), w - margin - browse_w, y, browse_w, edit_h, TRUE);
+    y += edit_h + 12;
+    MoveWindow(GetDlgItem(hwnd, IDC_INSTALLER_MODEL_LABEL), margin, y, w - margin * 2, label_h, TRUE);
+    y += label_h + 4;
+    MoveWindow(g_model_combo, margin, y, w - margin * 2, edit_h + 180, TRUE);
+    y += edit_h + 12;
+    MoveWindow(GetDlgItem(hwnd, IDC_INSTALLER_QUANT_LABEL), margin, y, w - margin * 2, label_h, TRUE);
+    y += label_h + 4;
+    MoveWindow(g_quant_combo, margin, y, w - margin * 2, edit_h + 120, TRUE);
     y += edit_h + 12;
     MoveWindow(g_launch_check, margin, y, w - margin * 2, 24, TRUE);
     y += 32;
@@ -497,12 +603,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
     switch (msg) {
     case WM_CREATE: {
         HWND label = CreateWindowExW(0, L"STATIC", L"安装路径", WS_CHILD | WS_VISIBLE,
-                                     0, 0, 0, 0, hwnd, (HMENU)2000, g_instance, NULL);
+                                     0, 0, 0, 0, hwnd, (HMENU)IDC_INSTALLER_PATH_LABEL, g_instance, NULL);
         g_path_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
                                       0, 0, 0, 0, hwnd, (HMENU)IDC_INSTALLER_PATH_EDIT, g_instance, NULL);
         HWND browse = CreateWindowExW(0, L"BUTTON", L"浏览...", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                                       0, 0, 0, 0, hwnd, (HMENU)IDC_INSTALLER_BROWSE, g_instance, NULL);
+        HWND model_label = CreateWindowExW(0, L"STATIC", L"模型", WS_CHILD | WS_VISIBLE,
+                                           0, 0, 0, 0, hwnd, (HMENU)IDC_INSTALLER_MODEL_LABEL, g_instance, NULL);
+        g_model_combo = CreateWindowExW(0, WC_COMBOBOXW, L"",
+                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                                        0, 0, 0, 0, hwnd, (HMENU)IDC_INSTALLER_MODEL_COMBO, g_instance, NULL);
+        HWND quant_label = CreateWindowExW(0, L"STATIC", L"量化精度", WS_CHILD | WS_VISIBLE,
+                                           0, 0, 0, 0, hwnd, (HMENU)IDC_INSTALLER_QUANT_LABEL, g_instance, NULL);
+        g_quant_combo = CreateWindowExW(0, WC_COMBOBOXW, L"",
+                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                                        0, 0, 0, 0, hwnd, (HMENU)IDC_INSTALLER_QUANT_COMBO, g_instance, NULL);
         g_launch_check = CreateWindowExW(0, L"BUTTON", L"安装完成后启动 ChineseInputAgent",
                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                          0, 0, 0, 0, hwnd, (HMENU)IDC_INSTALLER_LAUNCH, g_instance, NULL);
@@ -514,8 +630,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
                                            0, 0, 0, 0, hwnd, (HMENU)IDC_INSTALLER_INSTALL, g_instance, NULL);
         g_close_button = CreateWindowExW(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                                          0, 0, 0, 0, hwnd, (HMENU)IDC_INSTALLER_CLOSE, g_instance, NULL);
-        HWND controls[] = {label, g_path_edit, browse, g_launch_check, g_progress, g_status, g_install_button, g_close_button};
+        HWND controls[] = {label, g_path_edit, browse, model_label, g_model_combo, quant_label, g_quant_combo,
+                           g_launch_check, g_progress, g_status, g_install_button, g_close_button};
         for (size_t i = 0; i < ARRAYSIZE(controls); ++i) set_font(controls[i]);
+        populate_install_option_combos();
         WCHAR path[MAX_PATH];
         default_install_path(path, ARRAYSIZE(path));
         SetWindowTextW(g_path_edit, path);
@@ -550,9 +668,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
     case WM_APP_INSTALL_DONE: {
         WCHAR *text = (WCHAR *)lparam;
         BOOL install_succeeded = (BOOL)wparam;
-        EnableWindow(g_install_button, TRUE);
-        EnableWindow(g_close_button, TRUE);
-        EnableWindow(g_path_edit, TRUE);
+        set_install_controls_enabled(TRUE);
         if (install_succeeded) {
             SetWindowTextW(g_status, L"安装完成。");
             SendMessageW(g_progress, PBM_SETPOS, 100, 0);
@@ -602,7 +718,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
 
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, CIA_INSTALLER_TITLE,
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_SIZEBOX,
-                                CW_USEDEFAULT, CW_USEDEFAULT, 620, 280,
+                                CW_USEDEFAULT, CW_USEDEFAULT, 620, 390,
                                 NULL, NULL, instance, NULL);
     if (!hwnd) return 1;
     ShowWindow(hwnd, show);

@@ -32,8 +32,8 @@ copy /y tools\payload_watermark\worker_config.txt "%DIST%\tools\payload_watermar
 
 mkdir "%DIST%\models"
 (
-  echo ChineseInputAgentInstaller downloads base_model.gguf during install.
-  echo For portable zip-only installs, place a compatible Qwen GGUF model here as base_model.gguf.
+  echo ChineseInputAgentInstaller downloads the selected Qwen GGUF model during install.
+  echo For portable zip-only installs, place a compatible GGUF model here and update tools\payload_watermark\worker_config.txt model=...
 ) > "%DIST%\models\README.txt"
 
 mkdir "%DIST%\licenses"
