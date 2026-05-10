@@ -108,7 +108,7 @@ BOOL cia_core_encrypt_message(const WCHAR *plain, const WCHAR *topic,
     if (!cia_core_ensure_active_crypto(err, err_cch)) {
         return FALSE;
     }
-    return app_flow_encrypt_message(g_core_active_box, plain, topic, progress, out, err, err_cch);
+    return app_flow_encrypt_message(g_core_active_box, plain, topic, NULL, progress, out, err, err_cch);
 }
 
 BOOL cia_core_decrypt_text(const WCHAR *text, CIA_CORE_DECRYPT_RESULT *result,
@@ -189,7 +189,7 @@ BOOL cia_core_create_group(const WCHAR *group_name, const WCHAR *local_sender_na
 BOOL cia_core_encrypt_group_message(int group_index, const WCHAR *plain, const WCHAR *topic,
                                     const CIA_PROGRESS_SINK *progress,
                                     WCHAR **out, WCHAR *err, size_t err_cch) {
-    return app_flow_encrypt_group_message(group_index, plain, topic, progress, out, err, err_cch);
+    return app_flow_encrypt_group_message(group_index, plain, topic, NULL, progress, out, err, err_cch);
 }
 
 BOOL cia_core_load_chat_history(CIA_CORE_CONVERSATION_KIND kind, int conversation_index,

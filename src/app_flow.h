@@ -5,6 +5,7 @@
 #include <stddef.h>
 
 #include "app_progress.h"
+#include "app_carrier_options.h"
 #include "crypto_box.h"
 
 typedef BOOL (*APP_FLOW_CANCEL_FN)(void);
@@ -30,8 +31,10 @@ BOOL app_flow_extract_key_package_body(const WCHAR *text, WCHAR **out,
                                        WCHAR *fingerprint, size_t fingerprint_cch,
                                        WCHAR *err, size_t err_cch);
 BOOL app_flow_encrypt_message(CRYPTO_BOX *box, const WCHAR *plain, const WCHAR *topic,
+                              const APP_CARRIER_OPTIONS *carrier_options,
                               const CIA_PROGRESS_SINK *progress, WCHAR **out, WCHAR *err, size_t err_cch);
 BOOL app_flow_encrypt_group_message(int group_index, const WCHAR *plain, const WCHAR *topic,
+                                    const APP_CARRIER_OPTIONS *carrier_options,
                                     const CIA_PROGRESS_SINK *progress, WCHAR **out, WCHAR *err, size_t err_cch);
 BOOL app_flow_export_key(CRYPTO_BOX *box, const CIA_PROGRESS_SINK *progress, WCHAR **out, WCHAR *err, size_t err_cch);
 BOOL app_flow_export_group_key(int group_index, const CIA_PROGRESS_SINK *progress, WCHAR **out, WCHAR *err, size_t err_cch);

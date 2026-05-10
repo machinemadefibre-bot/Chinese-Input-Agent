@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <stddef.h>
 
+#include "app_carrier_options.h"
 #include "crypto_box.h"
 
 #define WM_APP_WORK_UPDATE (WM_APP + 10)
@@ -32,6 +33,7 @@ typedef struct APP_WORK_CTX {
     WCHAR *name;
     WCHAR *expected_fingerprint;
     int group_index;
+    APP_CARRIER_OPTIONS carrier_options;
     WCHAR *sent_plaintext;
     WCHAR *sent_sender;
     int sent_profile_index;

@@ -5,6 +5,7 @@
 #include <stddef.h>
 
 #include "app_progress.h"
+#include "app_carrier_options.h"
 
 typedef BOOL (*APP_LLM_CANCEL_FN)(void);
 
@@ -21,6 +22,7 @@ void shutdown_local_llm_worker(void);
 void close_local_llm_job(void);
 BOOL local_topk_encode_payload(const BYTE *payload, DWORD payload_len, const WCHAR *seed, const WCHAR *topic,
                                const WCHAR *prompt_template, const WCHAR *prefix, int tail_tokens,
+                               const APP_CARRIER_OPTIONS *carrier_options,
                                const CIA_PROGRESS_SINK *progress,
                                WCHAR **out, WCHAR *err, size_t err_cch);
 BOOL local_topk_decode_payload(const WCHAR *carrier, const WCHAR *seed, BYTE **out, DWORD *out_len,

@@ -44,6 +44,7 @@ static BOOL decrypt_sealed_with_box(CRYPTO_BOX *box, const BYTE *sealed, DWORD s
 }
 
 BOOL app_message_flow_encrypt_message(CRYPTO_BOX *box, const WCHAR *plain, const WCHAR *topic,
+                                      const APP_CARRIER_OPTIONS *carrier_options,
                                       const CIA_PROGRESS_SINK *progress, WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
     if (!box || !plain) {
@@ -69,13 +70,14 @@ BOOL app_message_flow_encrypt_message(CRYPTO_BOX *box, const WCHAR *plain, const
         return FALSE;
     }
 
-    BOOL carrier_encoded = app_carrier_encode_message_payload(sealed, sealed_len, seed, topic,
+    BOOL carrier_encoded = app_carrier_encode_message_payload(sealed, sealed_len, seed, topic, carrier_options,
                                                               progress, out, err, err_cch);
     secure_free(sealed, sealed_len);
     return carrier_encoded;
 }
 
 BOOL app_message_flow_encrypt_group_message(int group_index, const WCHAR *plain, const WCHAR *topic,
+                                            const APP_CARRIER_OPTIONS *carrier_options,
                                             const CIA_PROGRESS_SINK *progress, WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
     if (!plain) {
@@ -93,7 +95,7 @@ BOOL app_message_flow_encrypt_group_message(int group_index, const WCHAR *plain,
         set_error(err, err_cch, L"Failed to build group message seed.");
         return FALSE;
     }
-    BOOL carrier_encoded = app_carrier_encode_message_payload(sealed, sealed_len, seed, topic,
+    BOOL carrier_encoded = app_carrier_encode_message_payload(sealed, sealed_len, seed, topic, carrier_options,
                                                               progress, out, err, err_cch);
     secure_free(sealed, sealed_len);
     return carrier_encoded;

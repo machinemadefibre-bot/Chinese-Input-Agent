@@ -58,6 +58,7 @@ void app_work_free_ctx(APP_WORK_CTX *ctx) {
     secure_free_wide(ctx->input);
     xfree(ctx->topic);
     xfree(ctx->name);
+    xfree((WCHAR *)ctx->carrier_options.custom_prompt_text);
     secure_free_wide(ctx->expected_fingerprint);
     secure_free_wide(ctx->sent_plaintext);
     secure_free_wide(ctx->sent_sender);
@@ -289,6 +290,7 @@ static BOOL worker_encrypt(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, size_t er
     }
     CIA_PROGRESS_SINK progress = progress_sink_for_ctx(ctx);
     return app_flow_encrypt_message(box, ctx ? ctx->input : NULL, ctx ? ctx->topic : NULL,
+                                    ctx ? &ctx->carrier_options : NULL,
                                     &progress, out, err, err_cch);
 }
 
@@ -297,6 +299,7 @@ static BOOL worker_group_encrypt(APP_WORK_CTX *ctx, WCHAR **out, WCHAR *err, siz
     CIA_PROGRESS_SINK progress = progress_sink_for_ctx(ctx);
     return app_flow_encrypt_group_message(ctx ? ctx->group_index : -1, ctx ? ctx->input : NULL,
                                           ctx ? ctx->topic : NULL,
+                                          ctx ? &ctx->carrier_options : NULL,
                                           &progress, out, err, err_cch);
 }
 

@@ -24,6 +24,7 @@ temperature=0.7
 top_p=0.8
 top_k=128
 min_k=64
+redundancy_level=0
 
 # Retry, progress, and llama.cpp context tuning.
 encode_attempts=5

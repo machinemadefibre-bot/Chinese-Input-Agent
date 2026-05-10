@@ -12,6 +12,7 @@
 #include "app_tokenizer_prefs.h"
 #include "app_work.h"
 #include "ui_overlay.h"
+#include "ui_generation_settings.h"
 #include "ui_ids.h"
 #include "ui_layout.h"
 #include "ui_work_messages.h"
@@ -29,7 +30,9 @@ static HWND g_text_overlay;
 static HWND g_key_select;
 static HWND g_topic_edit;
 static HWND g_key_aux_edit;
+static HWND g_generation_settings_button;
 static HFONT g_ui_font;
+static UI_GENERATION_SETTINGS g_generation_settings;
 static BOOL g_archive_mode;
 static CRYPTO_BOX *g_active_box;
 static HWND g_overlay_clear_textbox;
@@ -71,6 +74,7 @@ static void refresh_main_mode_controls(void);
 static void set_textbox_overlay(HWND textbox, const WCHAR *text, BOOL show);
 static void clear_textbox_overlay_later(HWND textbox);
 static WCHAR *get_required_topic_text(HWND owner, HWND topic_edit);
+static BOOL copy_generation_options_to_ctx(APP_WORK_CTX *ctx);
 static CRYPTO_BOX *get_active_box_for_work(void *user);
 static void set_work_busy(void *user, BOOL busy);
 static void show_work_error(void *user, HWND owner, const WCHAR *message);
@@ -232,6 +236,8 @@ static void refresh_main_mode_controls(void) {
     HWND key_transfer = GetDlgItem(g_main_window, IDC_KEY_TRANSFER);
     HWND group_choice = GetDlgItem(g_main_window, IDC_KEY_TRANSFER_GROUP);
     HWND private_choice = GetDlgItem(g_main_window, IDC_KEY_TRANSFER_PRIVATE);
+    HWND generation_settings = GetDlgItem(g_main_window, IDC_GENERATION_SETTINGS);
+    BOOL show_generation_settings = g_main_view_mode == MAIN_VIEW_CHAT && !g_archive_mode;
     if (archive) {
         if (group_exchange) SetWindowTextW(archive, UI_TEXT_SET_GROUP_ALIAS);
         else if (private_exchange) SetWindowTextW(archive, UI_TEXT_ARCHIVE);
@@ -254,6 +260,10 @@ static void refresh_main_mode_controls(void) {
                               UI_TEXT_GROUP_MEMBER_ALIAS_CUE : UI_TEXT_GROUP_NICKNAME_CUE));
         ShowWindow(g_key_aux_edit, group_exchange ? SW_SHOW : SW_HIDE);
         EnableWindow(g_key_aux_edit, !busy && group_exchange);
+    }
+    if (generation_settings) {
+        ShowWindow(generation_settings, show_generation_settings ? SW_SHOW : SW_HIDE);
+        EnableWindow(generation_settings, !busy && show_generation_settings);
     }
     if (encrypt) {
         EnableWindow(encrypt, !g_archive_mode);
@@ -378,6 +388,20 @@ static void leave_key_exchange_mode(void) {
 static BOOL read_exchange_name(HWND edit, WCHAR **out) {
     *out = win_get_window_text_alloc(edit);
     return *out != NULL;
+}
+
+static BOOL copy_generation_options_to_ctx(APP_WORK_CTX *ctx) {
+    if (!ctx) return FALSE;
+    ctx->carrier_options.has_temperature = TRUE;
+    ctx->carrier_options.temperature = g_generation_settings.temperature;
+    ctx->carrier_options.has_top_p = TRUE;
+    ctx->carrier_options.top_p = g_generation_settings.top_p;
+    ctx->carrier_options.redundancy_level = g_generation_settings.redundancy_level;
+    if (g_generation_settings.custom_prompt && g_generation_settings.custom_prompt[0]) {
+        ctx->carrier_options.custom_prompt_text = win_dup_wide(g_generation_settings.custom_prompt);
+        if (!ctx->carrier_options.custom_prompt_text) return FALSE;
+    }
+    return TRUE;
 }
 
 static BOOL exchange_kind_matches_current_mode(APP_FLOW_EXCHANGE_KIND exchange_kind) {
@@ -694,6 +718,12 @@ static void do_encrypt(HWND hwnd) {
     ctx->input = plain_w;
     ctx->topic = topic;
     ctx->group_index = g_selected_group ? g_selected_group_index : -1;
+    if (!copy_generation_options_to_ctx(ctx)) {
+        secure_free_wide(plain_for_history);
+        app_work_free_ctx(ctx);
+        show_error(hwnd, UI_TEXT_ENCRYPT_FAILED);
+        return;
+    }
     ctx->sent_plaintext = plain_for_history;
     ctx->sent_profile_index = g_selected_group ? -1 : profiles_active_index();
     ctx->sent_group_index = g_selected_group ? g_selected_group_index : -1;
@@ -754,15 +784,25 @@ static void layout_main(HWND hwnd, int width, int height) {
     if (button_w < UI_MAIN_MIN_BUTTON_WIDTH) button_w = UI_MAIN_MIN_BUTTON_WIDTH;
 
     MoveWindow(g_key_select, margin, margin, width - margin * 2, UI_MAIN_COMBO_DROPDOWN_HEIGHT, TRUE);
+    BOOL show_generation_settings = g_main_view_mode == MAIN_VIEW_CHAT && !g_archive_mode && g_generation_settings_button;
     if (g_main_view_mode == MAIN_VIEW_GROUP_KEY_EXCHANGE && g_key_aux_edit) {
         int input_w = (width - margin * 2 - gap) / 2;
         if (input_w < UI_MAIN_MIN_BUTTON_WIDTH) input_w = UI_MAIN_MIN_BUTTON_WIDTH;
         MoveWindow(g_topic_edit, margin, topic_y, input_w, topic_h, TRUE);
         MoveWindow(g_key_aux_edit, margin + input_w + gap, topic_y,
                    width - margin * 2 - input_w - gap, topic_h, TRUE);
+        if (g_generation_settings_button) MoveWindow(g_generation_settings_button, margin, topic_y, 0, topic_h, TRUE);
+    } else if (show_generation_settings) {
+        int settings_w = UI_MAIN_CUSTOM_BUTTON_WIDTH;
+        int topic_w = width - margin * 2 - gap - settings_w;
+        if (topic_w < UI_MAIN_MIN_BUTTON_WIDTH) topic_w = UI_MAIN_MIN_BUTTON_WIDTH;
+        MoveWindow(g_topic_edit, margin, topic_y, topic_w, topic_h, TRUE);
+        MoveWindow(g_generation_settings_button, margin + topic_w + gap, topic_y, settings_w, topic_h, TRUE);
+        if (g_key_aux_edit) MoveWindow(g_key_aux_edit, margin, topic_y, width - margin * 2, topic_h, TRUE);
     } else {
         MoveWindow(g_topic_edit, margin, topic_y, width - margin * 2, topic_h, TRUE);
         if (g_key_aux_edit) MoveWindow(g_key_aux_edit, margin, topic_y, width - margin * 2, topic_h, TRUE);
+        if (g_generation_settings_button) MoveWindow(g_generation_settings_button, margin, topic_y, 0, topic_h, TRUE);
     }
     MoveWindow(g_textbox, margin, edit_y, width - margin * 2, edit_h, TRUE);
     ui_overlay_layout(g_text_overlay, g_textbox);
@@ -813,6 +853,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                                          WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL,
                                          0, 0, 0, 0, hwnd, (HMENU)IDC_KEY_AUX, g_instance, NULL);
         SendMessageW(g_key_aux_edit, EM_SETCUEBANNER, TRUE, (LPARAM)UI_TEXT_GROUP_SELF_NAME_CUE);
+        g_generation_settings_button = CreateWindowExW(0, L"BUTTON", UI_TEXT_CUSTOM_GENERATION,
+                                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                                       0, 0, 0, 0, hwnd, (HMENU)IDC_GENERATION_SETTINGS,
+                                                       g_instance, NULL);
         g_textbox = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | ES_MULTILINE |
                                     ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
@@ -835,7 +879,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         HWND key_private = CreateWindowExW(0, L"BUTTON", UI_TEXT_PRIVATE_CHAT,
                                            WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
                                            0, 0, 0, 0, hwnd, (HMENU)IDC_KEY_TRANSFER_PRIVATE, g_instance, NULL);
-        HWND controls[] = { g_key_select, g_topic_edit, g_key_aux_edit, g_textbox, g_text_overlay,
+        HWND controls[] = { g_key_select, g_topic_edit, g_key_aux_edit, g_generation_settings_button,
+                            g_textbox, g_text_overlay,
                             encrypt, decrypt, clear, key_transfer, key_group, key_private };
         for (size_t i = 0; i < ARRAYSIZE(controls); ++i) set_control_font(controls[i]);
         refresh_key_combo();
@@ -941,6 +986,14 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         case IDC_KEY_TRANSFER_PRIVATE:
             enter_private_key_exchange_mode(hwnd);
             break;
+        case IDC_GENERATION_SETTINGS: {
+            WCHAR err[256] = L"";
+            if (!ui_generation_settings_show(g_instance, hwnd, g_ui_font, &g_generation_settings,
+                                             err, ARRAYSIZE(err))) {
+                show_error(hwnd, err[0] ? err : UI_TEXT_GEN_SETTINGS_FAILED);
+            }
+            break;
+        }
         }
         break;
     case WM_CLOSE:
@@ -978,8 +1031,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
 
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof(icc);
-    icc.dwICC = ICC_STANDARD_CLASSES;
+    icc.dwICC = ICC_STANDARD_CLASSES | ICC_BAR_CLASSES;
     InitCommonControlsEx(&icc);
+    ui_generation_settings_load(&g_generation_settings);
 
     NONCLIENTMETRICSW ncm;
     ZeroMemory(&ncm, sizeof(ncm));
@@ -996,12 +1050,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     WCHAR err[256] = L"";
     if (!profiles_load(err, ARRAYSIZE(err))) {
         MessageBoxW(NULL, err, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
+        ui_generation_settings_free(&g_generation_settings);
         app_llm_cleanup();
         return 1;
     }
     if (!app_groups_load(err, ARRAYSIZE(err))) {
         profiles_shutdown();
         MessageBoxW(NULL, err, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
+        ui_generation_settings_free(&g_generation_settings);
         app_llm_cleanup();
         return 1;
     }
@@ -1009,6 +1065,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
         app_groups_shutdown();
         profiles_shutdown();
         MessageBoxW(NULL, err, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
+        ui_generation_settings_free(&g_generation_settings);
         app_llm_cleanup();
         return 1;
     }
@@ -1017,6 +1074,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
         app_groups_shutdown();
         profiles_shutdown();
         MessageBoxW(NULL, err, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
+        ui_generation_settings_free(&g_generation_settings);
         app_llm_cleanup();
         return 1;
     }
@@ -1026,6 +1084,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
         app_groups_shutdown();
         profiles_shutdown();
         MessageBoxW(NULL, UI_TEXT_WINDOW_INIT_FAILED, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
+        ui_generation_settings_free(&g_generation_settings);
         app_llm_cleanup();
         return 1;
     }
@@ -1040,6 +1099,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
         app_groups_shutdown();
         profiles_shutdown();
         MessageBoxW(NULL, UI_TEXT_WINDOW_INIT_FAILED, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
+        ui_generation_settings_free(&g_generation_settings);
         app_llm_cleanup();
         return 1;
     }
@@ -1061,6 +1121,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     app_tokenizer_prefs_shutdown();
     app_groups_shutdown();
     profiles_shutdown();
+    ui_generation_settings_free(&g_generation_settings);
     if (g_ui_font) DeleteObject(g_ui_font);
     return (int)msg.wParam;
 }

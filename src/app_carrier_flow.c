@@ -118,7 +118,7 @@ static BOOL encode_exchange_package(const BYTE *pkg, DWORD pkg_len,
         return FALSE;
     }
     BOOL package_encoded = local_topk_encode_payload(pkg, pkg_len, KEY_PACKAGE_TOPK_SEED, topic, prompt_template,
-                                                     prefix.data, -1, progress, out, err, err_cch);
+                                                     prefix.data, -1, NULL, progress, out, err, err_cch);
     wstrb_free(&prefix);
     return package_encoded;
 }
@@ -197,10 +197,11 @@ BOOL app_carrier_get_message_seed(CRYPTO_BOX *box, WCHAR *seed, size_t seed_cch,
 
 BOOL app_carrier_encode_message_payload(const BYTE *payload, DWORD payload_len,
                                         const WCHAR *seed, const WCHAR *topic,
+                                        const APP_CARRIER_OPTIONS *carrier_options,
                                         const CIA_PROGRESS_SINK *progress, WCHAR **out,
                                         WCHAR *err, size_t err_cch) {
     return local_topk_encode_payload(payload, payload_len, seed, topic, NULL, NULL, -1,
-                                     progress, out, err, err_cch);
+                                     carrier_options, progress, out, err, err_cch);
 }
 
 BOOL app_carrier_decode_message_payload(const WCHAR *carrier, const WCHAR *seed,

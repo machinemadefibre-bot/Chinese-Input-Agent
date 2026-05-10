@@ -113,6 +113,7 @@ function Test-WorkerPromptsAreRuntimeFiles {
     Assert-True $workerConfig.Contains("temperature=0.7") "Qwen3 non-thinking sampling defaults should live in runtime worker_config.txt"
     Assert-True $workerConfig.Contains("top_p=0.8") "Qwen3 non-thinking top-p default should live in runtime worker_config.txt"
     Assert-True $workerConfig.Contains("top_k=128") "Qwen3 carrier top-k default should live in runtime worker_config.txt"
+    Assert-True $workerConfig.Contains("redundancy_level=0") "worker default redundancy should remain disabled in runtime worker_config.txt"
     Assert-True $workerConfig.Contains("max_tail_tokens=64") "worker free-tail clamp should live in runtime worker_config.txt"
     Assert-True $workerConfig.Contains("length_payload_multiplier=") "worker length scaling should live in runtime worker_config.txt"
     Assert-True $workerConfig.Contains("encode_attempts=") "worker retry count should live in runtime worker_config.txt"
@@ -128,6 +129,42 @@ function Test-WorkerPromptsAreRuntimeFiles {
     Assert-True $workerBat.Contains(":stage_prompts") "worker packaging should stage runtime prompt templates"
     Assert-True $workerBat.Contains(":stage_tokenizers") "worker packaging should stage runtime tokenizer assets"
     Assert-True $workerBat.Contains("worker_config.txt") "worker packaging should stage runtime worker config"
+}
+
+function Test-CustomGenerationSettingsAndRedundancy {
+    $cmake = Read-RepoFile "CMakeLists.txt"
+    $main = Read-RepoFile "src\main.c"
+    $settingsHeader = Read-RepoFile "src\ui_generation_settings.h"
+    $settingsImpl = Read-RepoFile "src\ui_generation_settings.c"
+    $optionsHeader = Read-RepoFile "src\app_carrier_options.h"
+    $appWork = Read-RepoFile "src\app_work.c"
+    $carrierFlow = Read-RepoFile "src\app_carrier_flow.c"
+    $appLlm = Read-RepoFile "src\app_llm.c"
+    $workerCpp = Read-RepoFile "tools\payload_watermark\cia_llama_worker.cpp"
+
+    Assert-True $cmake.Contains("src/ui_generation_settings.c") "generation settings UI should be compiled into the app executable"
+    Assert-True $main.Contains("IDC_GENERATION_SETTINGS") "main window should create a custom generation settings button"
+    Assert-True $main.Contains("ui_generation_settings_show(") "main window should open the generation settings dialog"
+    Assert-True $main.Contains("copy_generation_options_to_ctx(") "chat encrypt should copy generation settings into background work"
+    Assert-True $settingsHeader.Contains("UI_GENERATION_SETTINGS") "generation settings should have a small UI-owned settings struct"
+    Assert-True $settingsImpl.Contains("APP_GENERATION_SETTINGS_FILE_NAME") "generation settings should save to a centralized app data path"
+    Assert-True $settingsImpl.Contains("APP_GENERATION_PROMPT_FILE_NAME") "custom prompt should save to a centralized app data path"
+    Assert-True $settingsImpl.Contains("write_file_bytes_atomic") "saved generation settings should use atomic writes"
+    Assert-True $settingsImpl.Contains("TRACKBAR_CLASSW") "temperature and top-p should use Win32 trackbar controls"
+    Assert-True $optionsHeader.Contains("APP_CARRIER_REDUNDANCY_LOW") "carrier options should expose low redundancy"
+    Assert-True $optionsHeader.Contains("custom_prompt_text") "carrier options should carry an optional custom prompt"
+    Assert-True $appWork.Contains("carrier_options") "background work should carry generation options"
+    Assert-True $carrierFlow.Contains("const APP_CARRIER_OPTIONS *carrier_options") "message carrier encode should accept optional generation settings"
+    Assert-True $carrierFlow.Contains("NULL, progress") "key exchange carrier encode should pass NULL options"
+    Assert-True $appLlm.Contains('"prompt_file"') "app_llm should send a per-request custom prompt file"
+    Assert-True $appLlm.Contains(',\"temperature\"') "app_llm should send per-request temperature"
+    Assert-True $appLlm.Contains(',\"top_p\"') "app_llm should send per-request top-p"
+    Assert-True $appLlm.Contains(',\"redundancy_level\"') "app_llm should send per-request redundancy level"
+    Assert-True $workerCpp.Contains("json_get_double_strict") "worker should parse per-request numeric sampling overrides"
+    Assert-True $workerCpp.Contains("custom_prompt_template") "worker should accept per-request custom prompt templates"
+    Assert-True $workerCpp.Contains("frame_payload_redundant") "worker should support redundant carrier frames"
+    Assert-True $workerCpp.Contains("repair_redundancy_block") "worker should attempt low-cost block repair"
+    Assert-True $workerCpp.Contains("crc32_bytes") "redundant frames should verify recovered payloads"
 }
 
 function Test-CryptoBoxUsesOpaqueContext {
@@ -417,6 +454,7 @@ $tests = @(
     "Test-DocsDoNotOverstateForwardSecrecy",
     "Test-WorkerResponseIdIsChecked",
     "Test-WorkerPromptsAreRuntimeFiles",
+    "Test-CustomGenerationSettingsAndRedundancy",
     "Test-CryptoBoxUsesOpaqueContext",
     "Test-CryptoBoxUsesSessionTransport",
     "Test-ProfilesDoNotManageCryptoLifecycle",

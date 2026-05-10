@@ -21,13 +21,15 @@ BOOL app_flow_extract_key_package_body(const WCHAR *text, WCHAR **out,
 }
 
 BOOL app_flow_encrypt_message(CRYPTO_BOX *box, const WCHAR *plain, const WCHAR *topic,
+                              const APP_CARRIER_OPTIONS *carrier_options,
                               const CIA_PROGRESS_SINK *progress, WCHAR **out, WCHAR *err, size_t err_cch) {
-    return app_message_flow_encrypt_message(box, plain, topic, progress, out, err, err_cch);
+    return app_message_flow_encrypt_message(box, plain, topic, carrier_options, progress, out, err, err_cch);
 }
 
 BOOL app_flow_encrypt_group_message(int group_index, const WCHAR *plain, const WCHAR *topic,
+                                    const APP_CARRIER_OPTIONS *carrier_options,
                                     const CIA_PROGRESS_SINK *progress, WCHAR **out, WCHAR *err, size_t err_cch) {
-    return app_message_flow_encrypt_group_message(group_index, plain, topic, progress, out, err, err_cch);
+    return app_message_flow_encrypt_group_message(group_index, plain, topic, carrier_options, progress, out, err, err_cch);
 }
 
 BOOL app_flow_export_key(CRYPTO_BOX *box, const CIA_PROGRESS_SINK *progress, WCHAR **out, WCHAR *err, size_t err_cch) {

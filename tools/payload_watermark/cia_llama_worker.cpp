@@ -294,11 +294,14 @@ static std::string build_topk_prompt(const std::string & topic,
                                      const PromptLengthConfig & length_config,
                                      const std::string & prompt_dir,
                                      const std::string & prompt_template_name,
+                                     const std::string & custom_prompt_template,
                                      const std::string & outline) {
     std::string clean = clean_prompt_topic(topic);
     PromptLengthBounds bounds = prompt_length_bounds(payload_digits, tail_budget, length_config);
     std::string template_name = sanitize_prompt_template_name(prompt_template_name);
-    std::string prompt = load_prompt_template(prompt_dir, template_name, fallback_prompt_template(template_name));
+    std::string prompt = custom_prompt_template.empty() ?
+        load_prompt_template(prompt_dir, template_name, fallback_prompt_template(template_name)) :
+        custom_prompt_template;
     const bool has_outline_placeholder = prompt.find("{outline}") != std::string::npos;
     replace_all(prompt, "{topic}", clean);
     replace_all(prompt, "{length_requirement}", format_length_requirement(bounds));
@@ -754,6 +757,22 @@ static bool json_get_int_strict(const std::string & json, const std::string & ke
     return true;
 }
 
+static bool json_get_double_strict(const std::string & json, const std::string & key, double & out) {
+    std::string pat = "\"" + key + "\"";
+    size_t p = json.find(pat);
+    if (p == std::string::npos) return false;
+    p = json.find(':', p + pat.size());
+    if (p == std::string::npos) return false;
+    ++p;
+    while (p < json.size() && std::isspace(static_cast<unsigned char>(json[p]))) ++p;
+    const char * start = json.c_str() + p;
+    char * end = nullptr;
+    double value = std::strtod(start, &end);
+    if (end == start) return false;
+    out = value;
+    return true;
+}
+
 static std::vector<int> tokenize(const llama_vocab * vocab, const std::string & text, bool add_special, bool parse_special) {
     int n = llama_tokenize(vocab, text.c_str(), static_cast<int32_t>(text.size()), nullptr, 0, add_special, parse_special);
     if (n == 0) return {};
@@ -930,7 +949,107 @@ static bool read_uvarint(const std::vector<uint8_t> & d, size_t & pos, uint32_t 
     return false;
 }
 
-static std::vector<uint8_t> frame_payload(const std::vector<uint8_t> & payload, int radix) {
+static bool read_u32_le(const std::vector<uint8_t> & d, size_t & pos, uint32_t & out) {
+    if (pos > d.size() || d.size() - pos < 4) return false;
+    out = uint32_t(d[pos]) |
+          (uint32_t(d[pos + 1]) << 8) |
+          (uint32_t(d[pos + 2]) << 16) |
+          (uint32_t(d[pos + 3]) << 24);
+    pos += 4;
+    return true;
+}
+
+static uint32_t crc32_bytes(const uint8_t * data, size_t len) {
+    uint32_t crc = 0xffffffffu;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+        }
+    }
+    return ~crc;
+}
+
+static uint8_t gf256_mul(uint8_t a, uint8_t b) {
+    uint8_t out = 0;
+    while (b) {
+        if (b & 1u) out ^= a;
+        bool carry = (a & 0x80u) != 0;
+        a = uint8_t(a << 1);
+        if (carry) a ^= 0x1du;
+        b >>= 1;
+    }
+    return out;
+}
+
+static uint8_t gf256_inv(uint8_t value) {
+    if (!value) return 0;
+    for (int candidate = 1; candidate < 256; ++candidate) {
+        if (gf256_mul(value, static_cast<uint8_t>(candidate)) == 1) {
+            return static_cast<uint8_t>(candidate);
+        }
+    }
+    return 0;
+}
+
+static int redundancy_block_size(int level) {
+    if (level == 1) return 40;
+    if (level == 2) return 20;
+    if (level == 3) return 10;
+    return 0;
+}
+
+static void append_redundancy_parity(std::vector<uint8_t> & out,
+                                     const std::vector<uint8_t> & data,
+                                     int block_size) {
+    for (size_t offset = 0; offset < data.size(); offset += static_cast<size_t>(block_size)) {
+        size_t len = std::min(static_cast<size_t>(block_size), data.size() - offset);
+        uint8_t p0 = 0;
+        uint8_t p1 = 0;
+        for (size_t i = 0; i < len; ++i) {
+            uint8_t value = data[offset + i];
+            p0 ^= value;
+            p1 ^= gf256_mul(value, static_cast<uint8_t>(i + 1));
+        }
+        out.push_back(p0);
+        out.push_back(p1);
+    }
+}
+
+static bool verify_redundancy_block(const std::vector<uint8_t> & data,
+                                    size_t offset, size_t len,
+                                    uint8_t expected_p0, uint8_t expected_p1) {
+    uint8_t p0 = 0;
+    uint8_t p1 = 0;
+    for (size_t i = 0; i < len; ++i) {
+        uint8_t value = data[offset + i];
+        p0 ^= value;
+        p1 ^= gf256_mul(value, static_cast<uint8_t>(i + 1));
+    }
+    return p0 == expected_p0 && p1 == expected_p1;
+}
+
+static bool repair_redundancy_block(std::vector<uint8_t> & data,
+                                    size_t offset, size_t len,
+                                    uint8_t expected_p0, uint8_t expected_p1) {
+    uint8_t p0 = 0;
+    uint8_t p1 = 0;
+    for (size_t i = 0; i < len; ++i) {
+        uint8_t value = data[offset + i];
+        p0 ^= value;
+        p1 ^= gf256_mul(value, static_cast<uint8_t>(i + 1));
+    }
+    uint8_t s0 = p0 ^ expected_p0;
+    uint8_t s1 = p1 ^ expected_p1;
+    if (!s0 && !s1) return true;
+    if (!s0 || !s1) return true; // one parity byte may be damaged; CRC still verifies the frame.
+    uint8_t pos = gf256_mul(s1, gf256_inv(s0));
+    if (pos == 0 || pos > len) return false;
+    data[offset + static_cast<size_t>(pos - 1)] ^= s0;
+    return verify_redundancy_block(data, offset, len, expected_p0, expected_p1);
+}
+
+static std::vector<uint8_t> frame_payload_legacy(const std::vector<uint8_t> & payload, int radix) {
     (void)radix;
     std::vector<uint8_t> out;
     if (payload.size() > 0xffffffffu) throw std::runtime_error("top-k 载荷过大，无法编码");
@@ -939,7 +1058,64 @@ static std::vector<uint8_t> frame_payload(const std::vector<uint8_t> & payload, 
     return out;
 }
 
-static std::vector<uint8_t> unframe_payload(const std::vector<uint8_t> & frame, int radix) {
+static std::vector<uint8_t> frame_payload_redundant(const std::vector<uint8_t> & payload, int radix, int redundancy_level) {
+    (void)radix;
+    int block_size = redundancy_block_size(redundancy_level);
+    if (block_size <= 0) return frame_payload_legacy(payload, radix);
+    if (payload.size() > 0xffffffffu - 4u) throw std::runtime_error("top-k payload is too large for redundant frame");
+    std::vector<uint8_t> protected_data = payload;
+    append_u32_le(protected_data, crc32_bytes(payload.data(), payload.size()));
+
+    std::vector<uint8_t> out;
+    out.insert(out.end(), {'C', 'I', 'R', '1'});
+    out.push_back(static_cast<uint8_t>(redundancy_level));
+    out.push_back(static_cast<uint8_t>(block_size));
+    append_uvarint(out, static_cast<uint32_t>(payload.size()));
+    out.insert(out.end(), protected_data.begin(), protected_data.end());
+    append_redundancy_parity(out, protected_data, block_size);
+    return out;
+}
+
+static bool try_unframe_redundant_payload(const std::vector<uint8_t> & frame, std::vector<uint8_t> & payload) {
+    payload.clear();
+    if (frame.size() < 7 || frame[0] != 'C' || frame[1] != 'I' || frame[2] != 'R' || frame[3] != '1') {
+        return false;
+    }
+    size_t pos = 4;
+    int level = frame[pos++];
+    int block_size = frame[pos++];
+    if (block_size != redundancy_block_size(level)) return false;
+    uint32_t payload_len = 0;
+    if (!read_uvarint(frame, pos, payload_len)) return false;
+    size_t data_len = static_cast<size_t>(payload_len) + 4u;
+    size_t block_count = data_len ? (data_len + static_cast<size_t>(block_size) - 1u) / static_cast<size_t>(block_size) : 1u;
+    size_t parity_len = block_count * 2u;
+    if (pos > frame.size() || data_len > frame.size() - pos || parity_len > frame.size() - pos - data_len) {
+        return false;
+    }
+    std::vector<uint8_t> protected_data(frame.begin() + static_cast<std::ptrdiff_t>(pos),
+                                        frame.begin() + static_cast<std::ptrdiff_t>(pos + data_len));
+    size_t parity_pos = pos + data_len;
+    for (size_t block = 0; block < block_count; ++block) {
+        size_t offset = block * static_cast<size_t>(block_size);
+        size_t len = std::min(static_cast<size_t>(block_size), protected_data.size() - offset);
+        uint8_t p0 = frame[parity_pos + block * 2u];
+        uint8_t p1 = frame[parity_pos + block * 2u + 1u];
+        if (!repair_redundancy_block(protected_data, offset, len, p0, p1)) {
+            throw std::runtime_error("top-k redundant frame parity check failed");
+        }
+    }
+    size_t crc_read_pos = static_cast<size_t>(payload_len);
+    uint32_t expected_crc = 0;
+    if (!read_u32_le(protected_data, crc_read_pos, expected_crc)) return false;
+    uint32_t actual_crc = crc32_bytes(protected_data.data(), payload_len);
+    if (actual_crc != expected_crc) {
+        throw std::runtime_error("top-k redundant frame CRC check failed");
+    }
+    payload.assign(protected_data.begin(), protected_data.begin() + static_cast<std::ptrdiff_t>(payload_len));
+    return true;
+}
+static std::vector<uint8_t> unframe_payload_legacy(const std::vector<uint8_t> & frame, int radix) {
     (void)radix;
     if (frame.empty()) throw std::runtime_error("top-k 紧凑载荷帧为空，无法读取长度");
     size_t pos = 0;
@@ -958,8 +1134,13 @@ static std::vector<uint8_t> unframe_payload(const std::vector<uint8_t> & frame, 
     return payload;
 }
 
-static std::vector<int> encode_payload_to_digits(const std::vector<uint8_t> & payload, int radix) {
-    auto framed = frame_payload(payload, radix);
+static std::vector<uint8_t> unframe_payload(const std::vector<uint8_t> & frame, int radix) {
+    std::vector<uint8_t> payload;
+    if (try_unframe_redundant_payload(frame, payload)) return payload;
+    return unframe_payload_legacy(frame, radix);
+}
+static std::vector<int> encode_payload_to_digits(const std::vector<uint8_t> & payload, int radix, int redundancy_level) {
+    auto framed = redundancy_level == 0 ? frame_payload_legacy(payload, radix) : frame_payload_redundant(payload, radix, redundancy_level);
     return bytes_to_base_digits(framed, radix);
 }
 
@@ -1394,6 +1575,7 @@ public:
     float top_p = 0.8f;
     int top_k = 20;
     int min_k = 64;
+    int redundancy_level = 0;
     PromptLengthConfig length_config;
     int encode_attempts = 5;
     int retry_seed_stride = 9973;
@@ -2108,11 +2290,31 @@ public:
     std::string encode_payload(const std::string & seed, const std::vector<uint8_t> & payload, const std::string & topic,
                                const std::string & prompt_template_name,
                                int tail_tokens_override = -1,
+                               const std::string & custom_prompt_template = std::string(),
+                               float temperature_override = -1.0f,
+                               float top_p_override = -1.0f,
+                               int redundancy_override = -1,
                                std::string * outline_used = nullptr,
                                const std::function<void(const std::string &, size_t, size_t, double)> & progress_cb = {}) {
+        struct SamplingOverride {
+            LlamaPayloadWorker & worker;
+            float old_temperature;
+            float old_top_p;
+            SamplingOverride(LlamaPayloadWorker & w, float temp_value, float top_p_value)
+                : worker(w), old_temperature(w.temperature), old_top_p(w.top_p) {
+                if (temp_value > 0.0f) worker.temperature = temp_value;
+                if (top_p_value > 0.0f && top_p_value <= 1.0f) worker.top_p = top_p_value;
+            }
+            ~SamplingOverride() {
+                worker.temperature = old_temperature;
+                worker.top_p = old_top_p;
+            }
+        } sampling_override(*this, temperature_override, top_p_override);
         TokenTable & table = table_for_seed(seed);
         if (!is_power_of_two_radix(table.radix)) throw std::runtime_error("top-k 载荷进制必须是 2、4、8 或 16");
-        auto digits = encode_payload_to_digits(payload, table.radix);
+        int effective_redundancy = redundancy_override >= 0 ? redundancy_override : redundancy_level;
+        if (effective_redundancy < 0 || effective_redundancy > 3) effective_redundancy = 0;
+        auto digits = encode_payload_to_digits(payload, table.radix, effective_redundancy);
         const int requested_tail = tail_tokens_override >= 0 ? tail_tokens_override : free_tail_tokens;
         const int tail_budget = std::max(0, std::min(requested_tail, max_tail_tokens));
         PromptLengthBounds bounds = prompt_length_bounds(digits.size(), tail_budget, length_config);
@@ -2126,7 +2328,7 @@ public:
         }
         if (outline_used) *outline_used = outline_text;
         const std::string prompt = build_topk_prompt(topic, digits.size(), tail_budget, length_config,
-                                                     prompt_dir, prompt_template_name, outline_text);
+                                                     prompt_dir, prompt_template_name, custom_prompt_template, outline_text);
         std::string last_error;
         for (int attempt = 1; attempt <= encode_attempts; ++attempt) {
             std::string text;
@@ -2468,6 +2670,7 @@ static void apply_worker_config_key(LlamaPayloadWorker & worker, const std::stri
     else if (key == "top_p") worker.top_p = std::stof(value);
     else if (key == "top_k") worker.top_k = std::stoi(value);
     else if (key == "min_k") worker.min_k = std::stoi(value);
+    else if (key == "redundancy_level") worker.redundancy_level = std::stoi(value);
     else if (key == "length_min_chars") worker.length_config.min_chars_floor = std::stoi(value);
     else if (key == "length_payload_multiplier") worker.length_config.payload_digit_multiplier = std::stof(value);
     else if (key == "length_upper_tail_extra_chars") worker.length_config.upper_tail_extra_chars = std::stoi(value);
@@ -2561,6 +2764,7 @@ int main(int argc, char ** argv) {
             else if (a == "--top-p") worker.top_p = std::stof(need("--top-p"));
             else if (a == "--top-k") worker.top_k = std::stoi(need("--top-k"));
             else if (a == "--min-k") worker.min_k = std::stoi(need("--min-k"));
+            else if (a == "--redundancy-level") worker.redundancy_level = std::stoi(need("--redundancy-level"));
             else if (a == "--outline-enabled") worker.outline_enabled = std::stoi(need("--outline-enabled")) != 0;
             else if (a == "--outline-tokens") worker.outline_tokens = std::stoi(need("--outline-tokens"));
             else if (a == "--prompt-dir") worker.prompt_dir = need("--prompt-dir");
@@ -2577,6 +2781,7 @@ int main(int argc, char ** argv) {
         if (!is_power_of_two_radix(worker.radix)) throw std::runtime_error("top-k 载荷进制必须是 2、4、8 或 16");
         if (worker.n_ctx < 512 || worker.n_threads <= 0 || worker.top_k <= 0 || worker.min_k <= 0) throw std::runtime_error("worker 运行参数不合法");
         if (worker.temperature <= 0.0f || worker.top_p <= 0.0f || worker.top_p > 1.0f) throw std::runtime_error("worker 采样参数不合法");
+        if (worker.redundancy_level < 0 || worker.redundancy_level > 3) throw std::runtime_error("worker redundancy level is invalid");
         if (worker.free_tail_tokens < 0 || worker.min_tail_tokens < 0 || worker.max_tail_tokens < 0 ||
             worker.min_tail_tokens > worker.max_tail_tokens) throw std::runtime_error("worker 收尾参数不合法");
         if (worker.length_config.min_chars_floor < 0 ||
@@ -2623,10 +2828,21 @@ int main(int argc, char ** argv) {
                 else json_get_string(line, "topic", topic);
                 std::string prompt_template_name = "default";
                 json_get_string(line, "prompt_template", prompt_template_name);
+                std::string custom_prompt_template;
+                std::string prompt_file_path;
+                if (json_get_string(line, "prompt_file", prompt_file_path) && !prompt_file_path.empty()) {
+                    custom_prompt_template = read_text(prompt_file_path);
+                }
                 std::string seed;
                 if (!json_get_string(line, "seed", seed) || seed.empty()) throw std::runtime_error("top-k 编码请求缺少 seed 字段");
                 int tail_tokens = -1;
                 if (json_has_key(line, "tail_tokens") && !json_get_int_strict(line, "tail_tokens", tail_tokens)) throw std::runtime_error("top-k 编码请求 tail_tokens 字段无效");
+                double request_temperature = -1.0;
+                double request_top_p = -1.0;
+                if (json_has_key(line, "temperature") && !json_get_double_strict(line, "temperature", request_temperature)) throw std::runtime_error("top-k encode request temperature is invalid");
+                if (json_has_key(line, "top_p") && !json_get_double_strict(line, "top_p", request_top_p)) throw std::runtime_error("top-k encode request top_p is invalid");
+                int request_redundancy = -1;
+                if (json_has_key(line, "redundancy_level") && !json_get_int_strict(line, "redundancy_level", request_redundancy)) throw std::runtime_error("top-k encode request redundancy_level is invalid");
                 std::string outline_out_path;
                 bool write_outline = json_get_string(line, "outline_out", outline_out_path);
                 auto payload = read_binary(payload_path);
@@ -2641,7 +2857,12 @@ int main(int argc, char ** argv) {
                               ",\"tps\":" + speed.str() +
                               ",\"text\":\"" + json_escape(partial) + "\"}");
                 };
-                std::string text = worker.encode_payload(seed, payload, topic, prompt_template_name, tail_tokens, write_outline ? &outline_used : nullptr, progress_cb);
+                std::string text = worker.encode_payload(seed, payload, topic, prompt_template_name, tail_tokens,
+                                                         custom_prompt_template,
+                                                         static_cast<float>(request_temperature),
+                                                         static_cast<float>(request_top_p),
+                                                         request_redundancy,
+                                                         write_outline ? &outline_used : nullptr, progress_cb);
                 write_text_file(out_path, text);
                 if (write_outline) write_text_file(outline_out_path, outline_used);
                 emit_json(ok_response(id, ",\"backend\":\"llama.cpp\",\"backend_detail\":\"" + json_escape(worker.backend_used) + "\",\"radix\":" + std::to_string(worker.radix) + ",\"bytes\":" + std::to_string(payload.size()) + ",\"chars\":" + std::to_string(cjk_count(text)) + ",\"tokenizer_id\":\"" + json_escape(worker.tokenizer_id) + "\"" + (write_outline ? ",\"outline_chars\":" + std::to_string(cjk_count(outline_used)) : "")));

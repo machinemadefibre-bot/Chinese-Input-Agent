@@ -89,8 +89,9 @@ static BOOL append_json_wide_field(STRB *request_builder, const char *name, cons
 static BOOL build_worker_request_json(STRB *request_builder, DWORD id, const char *cmd,
                                       const WCHAR *payload_path, const WCHAR *text_path,
                                       const WCHAR *topic_path, const WCHAR *seed,
-                                      const WCHAR *prompt_template, const WCHAR *preferred_tokenizer,
-                                      const WCHAR *out_path, int tail_tokens) {
+                                      const WCHAR *prompt_template, const WCHAR *prompt_file,
+                                      const WCHAR *preferred_tokenizer, const WCHAR *out_path,
+                                      int tail_tokens, const APP_CARRIER_OPTIONS *carrier_options) {
     ZeroMemory(request_builder, sizeof(*request_builder));
     if (!strb_appendf(request_builder, "{\"id\":%lu,\"cmd\":\"%s\"", (unsigned long)id, cmd)) return FALSE;
     if (payload_path && !append_json_wide_field(request_builder, "payload", payload_path, TRUE)) return FALSE;
@@ -98,9 +99,18 @@ static BOOL build_worker_request_json(STRB *request_builder, DWORD id, const cha
     if (topic_path && !append_json_wide_field(request_builder, "topic_file", topic_path, TRUE)) return FALSE;
     if (seed && !append_json_wide_field(request_builder, "seed", seed, TRUE)) return FALSE;
     if (prompt_template && prompt_template[0] && !append_json_wide_field(request_builder, "prompt_template", prompt_template, TRUE)) return FALSE;
+    if (prompt_file && prompt_file[0] && !append_json_wide_field(request_builder, "prompt_file", prompt_file, TRUE)) return FALSE;
     if (preferred_tokenizer && preferred_tokenizer[0] && !append_json_wide_field(request_builder, "preferred_tokenizer", preferred_tokenizer, TRUE)) return FALSE;
     if (out_path && !append_json_wide_field(request_builder, "out", out_path, TRUE)) return FALSE;
     if (tail_tokens >= 0 && !strb_appendf(request_builder, ",\"tail_tokens\":%d", tail_tokens)) return FALSE;
+    if (carrier_options) {
+        if (carrier_options->has_temperature &&
+            !strb_appendf(request_builder, ",\"temperature\":%.3f", carrier_options->temperature)) return FALSE;
+        if (carrier_options->has_top_p &&
+            !strb_appendf(request_builder, ",\"top_p\":%.3f", carrier_options->top_p)) return FALSE;
+        if (carrier_options->redundancy_level != APP_CARRIER_REDUNDANCY_NONE &&
+            !strb_appendf(request_builder, ",\"redundancy_level\":%d", (int)carrier_options->redundancy_level)) return FALSE;
+    }
     return strb_append(request_builder, "}\n");
 }
 
@@ -411,8 +421,9 @@ fail:
 
 static BOOL local_llm_worker_request(const char *cmd, const WCHAR *payload_path, const WCHAR *text_path,
                                      const WCHAR *topic_path, const WCHAR *seed, const WCHAR *prompt_template,
-                                     const WCHAR *preferred_tokenizer, const WCHAR *out_path,
-                                     int tail_tokens, const CIA_PROGRESS_SINK *progress, WCHAR *err, size_t err_cch) {
+                                     const WCHAR *prompt_file, const WCHAR *preferred_tokenizer, const WCHAR *out_path,
+                                     int tail_tokens, const APP_CARRIER_OPTIONS *carrier_options,
+                                     const CIA_PROGRESS_SINK *progress, WCHAR *err, size_t err_cch) {
     if (!g_llm_worker.lock_ready) {
         set_error(err, err_cch, L"Local top-k worker manager is not initialized.");
         return FALSE;
@@ -437,7 +448,8 @@ static BOOL local_llm_worker_request(const char *cmd, const WCHAR *payload_path,
     DWORD id = ++g_llm_worker.next_id;
     STRB request = {0};
     if (!build_worker_request_json(&request, id, cmd, payload_path, text_path, topic_path, seed,
-                                   prompt_template, preferred_tokenizer, out_path, tail_tokens)) {
+                                   prompt_template, prompt_file, preferred_tokenizer, out_path,
+                                   tail_tokens, carrier_options)) {
         strb_free(&request);
         set_error(err, err_cch, L"Failed to build local top-k worker request.");
         LeaveCriticalSection(&g_llm_worker.lock);
@@ -550,6 +562,7 @@ void shutdown_local_llm_worker(void) {
 
 BOOL local_topk_encode_payload(const BYTE *payload, DWORD payload_len, const WCHAR *seed, const WCHAR *topic,
                                const WCHAR *prompt_template, const WCHAR *prefix, int tail_tokens,
+                               const APP_CARRIER_OPTIONS *carrier_options,
                                const CIA_PROGRESS_SINK *progress,
                                WCHAR **out, WCHAR *err, size_t err_cch) {
     *out = NULL;
@@ -560,6 +573,7 @@ BOOL local_topk_encode_payload(const BYTE *payload, DWORD payload_len, const WCH
 
     WCHAR payload_path[MAX_PATH] = L"";
     WCHAR topic_path[MAX_PATH] = L"";
+    WCHAR prompt_path[MAX_PATH] = L"";
     WCHAR out_path[MAX_PATH] = L"";
     if (!make_temp_path(payload_path, ARRAYSIZE(payload_path)) ||
         !make_temp_path(topic_path, ARRAYSIZE(topic_path)) ||
@@ -572,10 +586,17 @@ BOOL local_topk_encode_payload(const BYTE *payload, DWORD payload_len, const WCH
         set_error(err, err_cch, L"Operation failed.");
         goto fail;
     }
+    if (carrier_options && carrier_options->custom_prompt_text && carrier_options->custom_prompt_text[0]) {
+        if (!make_temp_path(prompt_path, ARRAYSIZE(prompt_path)) ||
+            !write_text_utf8_file(prompt_path, carrier_options->custom_prompt_text)) {
+            set_error(err, err_cch, L"Operation failed.");
+            goto fail;
+        }
+    }
 
     WCHAR worker_err[512] = L"";
-    BOOL ran = local_llm_worker_request("encode", payload_path, NULL, topic_path, seed, prompt_template, NULL,
-                                        out_path, tail_tokens, progress,
+    BOOL ran = local_llm_worker_request("encode", payload_path, NULL, topic_path, seed, prompt_template,
+                                        prompt_path, NULL, out_path, tail_tokens, carrier_options, progress,
                                         worker_err, ARRAYSIZE(worker_err));
     if (!ran) {
         if (app_llm_cancelled()) {
@@ -609,12 +630,14 @@ BOOL local_topk_encode_payload(const BYTE *payload, DWORD payload_len, const WCH
 
     secure_delete_file(payload_path);
     secure_delete_file(topic_path);
+    secure_delete_file(prompt_path);
     secure_delete_file(out_path);
     return TRUE;
 
 fail:
     secure_delete_file(payload_path);
     secure_delete_file(topic_path);
+    secure_delete_file(prompt_path);
     secure_delete_file(out_path);
     return FALSE;
 }
@@ -641,7 +664,7 @@ BOOL local_topk_decode_payload(const WCHAR *carrier, const WCHAR *seed, BYTE **o
     }
 
     WCHAR worker_err[512] = L"";
-    BOOL ran = local_llm_worker_request("decode", NULL, text_path, NULL, seed, NULL, NULL, out_path, -1, NULL,
+    BOOL ran = local_llm_worker_request("decode", NULL, text_path, NULL, seed, NULL, NULL, NULL, out_path, -1, NULL, NULL,
                                         worker_err, ARRAYSIZE(worker_err));
     if (!ran) {
         if (app_llm_cancelled()) {
@@ -772,7 +795,7 @@ BOOL local_topk_decode_payload_multi(const WCHAR *carrier, const WCHAR *seed, co
 
     WCHAR worker_err[512] = L"";
     BOOL ran = local_llm_worker_request("decode_multi", NULL, text_path, NULL, seed, NULL,
-                                        preferred_tokenizer_id, out_path, -1, NULL,
+                                        NULL, preferred_tokenizer_id, out_path, -1, NULL, NULL,
                                         worker_err, ARRAYSIZE(worker_err));
     if (!ran) {
         if (app_llm_cancelled()) {

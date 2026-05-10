@@ -42,6 +42,7 @@ set(APP_SOURCES
   src/ui_key_transfer.c
   src/ui_name_prompt.c
   src/ui_overlay.c
+  src/ui_generation_settings.c
   src/ui_work_messages.c
   src/win_util.c
   src/app.rc

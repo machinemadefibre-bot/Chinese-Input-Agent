@@ -12,6 +12,8 @@
 #define APP_GROUP_ARCHIVE_FILE_FORMAT L"group_archive_%016llx.dat"
 #define APP_CHAT_HISTORY_DB_NAME L"chat_history.db"
 #define APP_TOKENIZER_PREFS_FILE_NAME L"tokenizer_prefs.dat"
+#define APP_GENERATION_SETTINGS_FILE_NAME L"generation_settings.ini"
+#define APP_GENERATION_PROMPT_FILE_NAME L"custom_prompt.txt"
 
 #define APP_WORKER_TOOLS_DIR L"tools\\payload_watermark"
 #define APP_WORKER_PACKAGE_DIR_NAME L"llama_worker_package"
