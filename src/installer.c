@@ -3,6 +3,7 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <bcrypt.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <wchar.h>
@@ -181,7 +182,24 @@ static BOOL ensure_directory(const WCHAR *path, WCHAR *err, size_t err_cch) {
 static BOOL temp_file_path(const WCHAR *suffix, WCHAR *out, size_t cch) {
     WCHAR dir[MAX_PATH];
     if (!GetTempPathW(ARRAYSIZE(dir), dir)) return FALSE;
-    return SUCCEEDED(StringCchPrintfW(out, cch, APP_INSTALL_TEMP_FILE_FORMAT, dir, (unsigned long)GetCurrentProcessId(), suffix));
+    static const WCHAR hex[] = L"0123456789abcdef";
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        BYTE random_bytes[16];
+        WCHAR token[33];
+        if (BCryptGenRandom(NULL, random_bytes, sizeof(random_bytes), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) return FALSE;
+        for (int idx = 0; idx < 16; ++idx) {
+            token[idx * 2] = hex[random_bytes[idx] >> 4];
+            token[idx * 2 + 1] = hex[random_bytes[idx] & 0x0f];
+        }
+        token[32] = L'\0';
+        SecureZeroMemory(random_bytes, sizeof(random_bytes));
+        if (SUCCEEDED(StringCchPrintfW(out, cch, APP_INSTALL_TEMP_FILE_FORMAT, dir, token, suffix)) &&
+            GetFileAttributesW(out) == INVALID_FILE_ATTRIBUTES &&
+            GetLastError() == ERROR_FILE_NOT_FOUND) {
+            return TRUE;
+        }
+    }
+    return FALSE;
 }
 
 static BOOL read_payload_trailer(FILE *self, int64_t file_size, PAYLOAD_TRAILER *trailer) {
@@ -216,15 +234,16 @@ static BOOL extract_embedded_zip(const WCHAR *zip_path, WCHAR *err, size_t err_c
         return FALSE;
     }
 
-    FILE *zip = _wfopen(zip_path, L"wb");
-    if (!zip) {
+    HANDLE zip = CreateFileW(zip_path, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                             FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_NORMAL, NULL);
+    if (zip == INVALID_HANDLE_VALUE) {
         fclose(self);
         StringCchCopyW(err, err_cch, L"无法创建临时压缩包。");
         return FALSE;
     }
 
     if (_fseeki64(self, (int64_t)trailer.offset, SEEK_SET) != 0) {
-        fclose(zip);
+        CloseHandle(zip);
         fclose(self);
         StringCchCopyW(err, err_cch, L"读取内嵌 portable 包失败。");
         return FALSE;
@@ -232,7 +251,7 @@ static BOOL extract_embedded_zip(const WCHAR *zip_path, WCHAR *err, size_t err_c
 
     BYTE *copy_buffer = (BYTE *)xalloc(APP_INSTALL_COPY_BUFFER_BYTES);
     if (!copy_buffer) {
-        fclose(zip);
+        CloseHandle(zip);
         fclose(self);
         StringCchCopyW(err, err_cch, L"内存不足。");
         return FALSE;
@@ -243,9 +262,13 @@ static BOOL extract_embedded_zip(const WCHAR *zip_path, WCHAR *err, size_t err_c
     while (left > 0) {
         size_t chunk = left > APP_INSTALL_COPY_BUFFER_BYTES ? APP_INSTALL_COPY_BUFFER_BYTES : (size_t)left;
         size_t bytes_read = fread(copy_buffer, 1, chunk, self);
-        if (bytes_read != chunk || fwrite(copy_buffer, 1, chunk, zip) != chunk) {
+        DWORD written = 0;
+        if (bytes_read != chunk ||
+            chunk > 0xffffffffu ||
+            !WriteFile(zip, copy_buffer, (DWORD)chunk, &written, NULL) ||
+            written != (DWORD)chunk) {
             xfree(copy_buffer);
-            fclose(zip);
+            CloseHandle(zip);
             fclose(self);
             StringCchCopyW(err, err_cch, L"写出临时压缩包失败。");
             return FALSE;
@@ -259,7 +282,7 @@ static BOOL extract_embedded_zip(const WCHAR *zip_path, WCHAR *err, size_t err_c
     }
 
     xfree(copy_buffer);
-    fclose(zip);
+    CloseHandle(zip);
     fclose(self);
     return TRUE;
 }
@@ -308,7 +331,7 @@ static BOOL write_expand_script(const WCHAR *script_path, const WCHAR *zip_path,
         StringCchCopyW(err, err_cch, L"安装路径太长。");
         return FALSE;
     }
-    HANDLE h = CreateFileW(script_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
+    HANDLE h = CreateFileW(script_path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, NULL);
     if (h == INVALID_HANDLE_VALUE) {
         StringCchCopyW(err, err_cch, L"无法创建临时解压脚本。");
         return FALSE;
@@ -376,7 +399,7 @@ static BOOL write_model_download_script(const WCHAR *script_path, const WCHAR *t
         L"    Remove-Item -LiteralPath $modelPath -Force\r\n"
         L"  }\r\n"
         L"  if (Test-Path -LiteralPath $tmpPath) { Remove-Item -LiteralPath $tmpPath -Force }\r\n"
-        L"  $url = \"$downloadBase/$remotePath?download=true\"\r\n"
+        L"  $url = \"$downloadBase/$remotePath\"\r\n"
         L"  if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {\r\n"
         L"    Start-BitsTransfer -Source $url -Destination $tmpPath\r\n"
         L"  } else {\r\n"
@@ -414,7 +437,7 @@ static BOOL write_model_download_script(const WCHAR *script_path, const WCHAR *t
         StringCchCopyW(err, err_cch, L"模型下载脚本太长。");
         return FALSE;
     }
-    HANDLE h = CreateFileW(script_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
+    HANDLE h = CreateFileW(script_path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, NULL);
     if (h == INVALID_HANDLE_VALUE) {
         StringCchCopyW(err, err_cch, L"无法创建模型下载脚本。");
         return FALSE;
@@ -430,11 +453,21 @@ static BOOL write_model_download_script(const WCHAR *script_path, const WCHAR *t
 }
 
 static BOOL run_powershell_script(const WCHAR *script_path, WCHAR *err, size_t err_cch) {
+    WCHAR system_dir[MAX_PATH];
+    WCHAR powershell_path[MAX_PATH];
     WCHAR cmd[MAX_PATH * 2];
+    if (!GetSystemDirectoryW(system_dir, ARRAYSIZE(system_dir)) ||
+        FAILED(StringCchPrintfW(powershell_path, ARRAYSIZE(powershell_path),
+                                L"%s\\WindowsPowerShell\\v1.0\\powershell.exe", system_dir)) ||
+        GetFileAttributesW(powershell_path) == INVALID_FILE_ATTRIBUTES) {
+        StringCchCopyW(err, err_cch, L"PowerShell unavailable.");
+        return FALSE;
+    }
     if (FAILED(StringCchPrintfW(
             cmd,
             ARRAYSIZE(cmd),
-            L"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%s\"",
+            L"\"%s\" -NoProfile -ExecutionPolicy Bypass -File \"%s\"",
+            powershell_path,
             script_path))) {
         StringCchCopyW(err, err_cch, L"PowerShell 命令太长。");
         return FALSE;
@@ -448,7 +481,7 @@ static BOOL run_powershell_script(const WCHAR *script_path, WCHAR *err, size_t e
     si.wShowWindow = SW_HIDE;
     WCHAR mutable_cmd[MAX_PATH * 2];
     StringCchCopyW(mutable_cmd, ARRAYSIZE(mutable_cmd), cmd);
-    BOOL started = CreateProcessW(NULL, mutable_cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    BOOL started = CreateProcessW(powershell_path, mutable_cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
     if (!started) {
         StringCchPrintfW(err, err_cch, L"无法启动 powershell.exe，错误码：%lu", (unsigned long)GetLastError());
         return FALSE;

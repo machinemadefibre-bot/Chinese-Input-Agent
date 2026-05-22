@@ -37,5 +37,9 @@ BOOL app_carrier_decode_message_payload_multi(const WCHAR *carrier, const WCHAR 
                                               const WCHAR *preferred_tokenizer_id,
                                               APP_LLM_DECODE_CANDIDATE **out, DWORD *out_count,
                                               WCHAR *err, size_t err_cch);
+BOOL app_carrier_decode_message_payload_probe_multi(const WCHAR *carrier, const WCHAR *seed,
+                                                    const WCHAR *preferred_tokenizer_id,
+                                                    APP_LLM_DECODE_CANDIDATE **out, DWORD *out_count,
+                                                    WCHAR *err, size_t err_cch);
 
 #endif

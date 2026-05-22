@@ -1090,6 +1090,47 @@ BOOL crypto_box_get_remote_public_key(CRYPTO_BOX *box, BYTE **out, DWORD *out_le
     return TRUE;
 }
 
+BOOL crypto_box_derive_image_stego_locator_key(CRYPTO_BOX *box, BYTE out[32],
+                                               WCHAR *err, size_t err_cch) {
+    if (!box || !out ||
+        !validate_private_key_blob(box->private_key.data, box->private_key.len) ||
+        !validate_public_key_blob(box->public_key.data, box->public_key.len) ||
+        !validate_public_key_blob(box->remote_public_key.data, box->remote_public_key.len)) {
+        set_box_error(err, err_cch, L"No imported contact public key.");
+        return FALSE;
+    }
+    static const uint8_t label[] = "ChineseInputAgent private image stego locator v1";
+    uint8_t shared[X25519_KEY_BYTES];
+    uint8_t role0[X25519_KEY_BYTES];
+    uint8_t role1[X25519_KEY_BYTES];
+    BOOL derived = FALSE;
+    ZeroMemory(shared, sizeof(shared));
+    if (!x25519_shared_secret(box->private_key.data, box->remote_public_key.data, shared)) {
+        set_box_error(err, err_cch, L"Image locator key agreement failed.");
+        goto cleanup;
+    }
+    if (memcmp(box->public_key.data, box->remote_public_key.data, X25519_KEY_BYTES) <= 0) {
+        memcpy(role0, box->public_key.data, X25519_KEY_BYTES);
+        memcpy(role1, box->remote_public_key.data, X25519_KEY_BYTES);
+    } else {
+        memcpy(role0, box->remote_public_key.data, X25519_KEY_BYTES);
+        memcpy(role1, box->public_key.data, X25519_KEY_BYTES);
+    }
+    const uint8_t *parts[3] = { label, role0, role1 };
+    DWORD lens[3] = { (DWORD)(sizeof(label) - 1), X25519_KEY_BYTES, X25519_KEY_BYTES };
+    if (!hmac_sha256_segments(shared, sizeof(shared), parts, lens, 3, out)) {
+        set_box_error(err, err_cch, L"Image locator key derivation failed.");
+        goto cleanup;
+    }
+    derived = TRUE;
+cleanup:
+    if (!derived) SecureZeroMemory(out, 32);
+    SecureZeroMemory(shared, sizeof(shared));
+    SecureZeroMemory(role0, sizeof(role0));
+    SecureZeroMemory(role1, sizeof(role1));
+    return derived;
+}
+
 BOOL crypto_box_get_public_fingerprint(CRYPTO_BOX *box, WCHAR *out, size_t cch, WCHAR *err, size_t err_cch) {
     if (!box || !validate_public_key_blob(box->public_key.data, box->public_key.len)) {
         set_box_error(err, err_cch, L"Local public key is not ready.");
@@ -1489,4 +1530,17 @@ cleanup:
     SecureZeroMemory(temp_skipped_keys, sizeof(temp_skipped_keys));
     SecureZeroMemory(&old_skipped_slot, sizeof(old_skipped_slot));
     return message_decrypted;
+}
+
+BOOL crypto_box_probe_message_header(CRYPTO_BOX *box, const BYTE *message_prefix, DWORD prefix_len) {
+    if (!box || !message_prefix || prefix_len < SESSION_HEADER_BYTES ||
+        message_prefix[0] != SESSION_PACKET_FORMAT) return FALSE;
+    uint64_t session_id = read_u64_le(message_prefix + 1);
+    uint32_t counter = read_u32_le(message_prefix + 1 + SESSION_ID_BYTES);
+    if (session_id == 0 || counter == 0xffffffffu) return FALSE;
+    if (find_skipped_key_index(box, session_id, counter) >= 0) return TRUE;
+    if (!box->recv_chain_ready || session_id != box->recv_session_id) return FALSE;
+    if (counter < box->recv_counter) return FALSE;
+    uint32_t gap = counter - box->recv_counter;
+    return gap <= SESSION_MAX_SKIPPED_KEYS && gap <= count_free_skipped_keys(box);
 }

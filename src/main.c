@@ -1,6 +1,10 @@
 #include <windows.h>
 #include <commctrl.h>
+#include <commdlg.h>
+#include <richedit.h>
 
+#include "app_attachments.h"
+#include "app_clipboard_monitor.h"
 #include "app_constants.h"
 #include "app_limits.h"
 #include "app_shared.h"
@@ -9,12 +13,14 @@
 #include "app_groups.h"
 #include "app_archive.h"
 #include "app_flow.h"
+#include "app_image_flow.h"
 #include "app_tokenizer_prefs.h"
 #include "app_work.h"
 #include "ui_overlay.h"
 #include "ui_generation_settings.h"
 #include "ui_ids.h"
 #include "ui_layout.h"
+#include "ui_tray.h"
 #include "ui_work_messages.h"
 #include "ui_strings.h"
 #include "win_util.h"
@@ -32,12 +38,15 @@ static HWND g_topic_edit;
 static HWND g_key_aux_edit;
 static HWND g_generation_settings_button;
 static HFONT g_ui_font;
+static HMODULE g_richedit_module;
 static UI_GENERATION_SETTINGS g_generation_settings;
 static BOOL g_archive_mode;
 static CRYPTO_BOX *g_active_box;
 static HWND g_overlay_clear_textbox;
 static BOOL g_selected_group;
 static int g_selected_group_index = -1;
+static BOOL g_exit_requested;
+static BOOL g_clipboard_decrypt_active;
 
 typedef enum MAIN_VIEW_MODE {
     MAIN_VIEW_CHAT = 0,
@@ -83,6 +92,10 @@ static BOOL save_chat_plaintext(int profile_index, const WCHAR *sender, const WC
                                 WCHAR *err, size_t err_cch);
 static BOOL save_group_chat_plaintext(int group_index, const WCHAR *sender, const WCHAR *plain,
                                       WCHAR *err, size_t err_cch);
+static BOOL handle_pending_image_encrypt(HWND hwnd);
+static BOOL handle_clipboard_image_decrypt(HWND hwnd);
+static void show_main_window(HWND hwnd);
+static void decrypt_pending_clipboard(HWND hwnd);
 static void layout_main(HWND hwnd, int width, int height);
 
 static LPARAM make_profile_item_data(int profile_index) {
@@ -674,6 +687,105 @@ static BOOL work_messages_save_sent_group_plaintext(void *user, int group_index,
     return save_group_chat_plaintext(group_index, sender, plain, err, err_cch);
 }
 
+static BOOL choose_open_image_file(HWND owner, WCHAR *path, size_t cch, const WCHAR *title) {
+    if (!path || cch == 0 || cch > MAX_PATH) return FALSE;
+    path[0] = L'\0';
+    OPENFILENAMEW ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrTitle = title;
+    ofn.lpstrFilter = L"JPEG (*.jpg;*.jpeg)\0*.jpg;*.jpeg\0Images (*.jpg;*.jpeg;*.png;*.bmp;*.avif)\0*.jpg;*.jpeg;*.png;*.bmp;*.avif\0All files\0*.*\0";
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = (DWORD)cch;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    return GetOpenFileNameW(&ofn);
+}
+
+static BOOL choose_save_jpeg_file(HWND owner, WCHAR *path, size_t cch) {
+    if (!path || cch == 0 || cch > MAX_PATH) return FALSE;
+    path[0] = L'\0';
+    OPENFILENAMEW ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrTitle = L"\u9009\u62e9\u8f93\u51fa JPEG";
+    ofn.lpstrFilter = L"JPEG (*.jpg)\0*.jpg\0All files\0*.*\0";
+    ofn.lpstrDefExt = L"jpg";
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = (DWORD)cch;
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    return GetSaveFileNameW(&ofn);
+}
+
+static BOOL handle_pending_image_encrypt(HWND hwnd) {
+    if (!app_attachments_has_pending()) return FALSE;
+    WCHAR secret_path[MAX_PATH];
+    WCHAR cover_path[MAX_PATH];
+    WCHAR out_path[MAX_PATH];
+    WCHAR err[256] = L"";
+    if (!app_attachments_first_path(secret_path, ARRAYSIZE(secret_path))) {
+        show_error(hwnd, UI_TEXT_IMAGE_EMBED_FAILED);
+        return TRUE;
+    }
+    if (!choose_open_image_file(hwnd, cover_path, ARRAYSIZE(cover_path), L"\u9009\u62e9 JPEG \u5c01\u9762\u56fe")) {
+        show_error(hwnd, UI_TEXT_IMAGE_SELECT_COVER_FAILED);
+        return TRUE;
+    }
+    if (!choose_save_jpeg_file(hwnd, out_path, ARRAYSIZE(out_path))) {
+        show_error(hwnd, UI_TEXT_IMAGE_SELECT_OUTPUT_FAILED);
+        return TRUE;
+    }
+    if (!g_selected_group && !g_active_box && !reload_active_crypto(err, ARRAYSIZE(err))) {
+        show_error(hwnd, err[0] ? err : UI_TEXT_IMAGE_EMBED_FAILED);
+        return TRUE;
+    }
+    set_textbox_overlay(g_textbox, L"\u6b63\u5728\u751f\u6210\u9690\u5199\u56fe\u7247\uff0c\u8bf7\u7a0d\u5019...", TRUE);
+    BOOL embedded = g_selected_group ?
+        app_image_flow_embed_group(g_selected_group_index, cover_path, secret_path,
+                                   &g_generation_settings.image_options, out_path, err, ARRAYSIZE(err)) :
+        app_image_flow_embed_private(g_active_box, cover_path, secret_path,
+                                     &g_generation_settings.image_options, out_path, err, ARRAYSIZE(err));
+    set_textbox_overlay(g_textbox, NULL, FALSE);
+    if (!embedded) {
+        show_error(hwnd, err[0] ? err : UI_TEXT_IMAGE_EMBED_FAILED);
+        return TRUE;
+    }
+    app_attachments_clear();
+    WCHAR message[MAX_PATH + 64];
+    if (SUCCEEDED(StringCchPrintfW(message, ARRAYSIZE(message),
+                                   L"\u5df2\u5bfc\u51fa\u53ef\u53d1\u9001\u56fe\u7247\uff1a\r\n%s", out_path))) {
+        SetWindowTextW(g_textbox, message);
+    }
+    return TRUE;
+}
+
+static BOOL handle_clipboard_image_decrypt(HWND hwnd) {
+    WCHAR image_path[MAX_PATH];
+    if (!app_attachments_clipboard_image_path(hwnd, image_path, ARRAYSIZE(image_path))) return FALSE;
+    WCHAR *saved_path = NULL;
+    BOOL is_group = FALSE;
+    int group_index = -1;
+    WCHAR err[256] = L"";
+    set_textbox_overlay(g_textbox, L"\u6b63\u5728\u63d0\u53d6\u9690\u85cf\u56fe\u7247\uff0c\u8bf7\u7a0d\u5019...", TRUE);
+    BOOL extracted = app_image_flow_extract_auto(g_active_box, image_path, &saved_path,
+                                                 &is_group, &group_index, err, ARRAYSIZE(err));
+    set_textbox_overlay(g_textbox, NULL, FALSE);
+    if (!extracted) {
+        secure_free_wide(saved_path);
+        return FALSE;
+    }
+    WCHAR message[MAX_PATH + 64];
+    if (SUCCEEDED(StringCchPrintfW(message, ARRAYSIZE(message),
+                                   L"\u5df2\u4fdd\u5b58\u9690\u85cf\u56fe\u7247\uff1a\r\n%s", saved_path))) {
+        SetWindowTextW(g_textbox, message);
+    }
+    secure_free_wide(saved_path);
+    (void)is_group;
+    (void)group_index;
+    return TRUE;
+}
+
 static void configure_app_work(HWND main_window) {
     APP_WORK_HOST host;
     ZeroMemory(&host, sizeof(host));
@@ -685,6 +797,7 @@ static void configure_app_work(HWND main_window) {
 }
 
 static void do_encrypt(HWND hwnd) {
+    if (handle_pending_image_encrypt(hwnd)) return;
     WCHAR *plain_w = win_get_window_text_alloc(g_textbox);
     if (!plain_w) {
         show_error(hwnd, UI_TEXT_ENCRYPT_FAILED);
@@ -746,6 +859,7 @@ static void do_encrypt(HWND hwnd) {
 }
 
 static void do_decrypt(HWND hwnd) {
+    if (handle_clipboard_image_decrypt(hwnd)) return;
     WCHAR *clip = NULL;
     if (!win_get_clipboard_text(hwnd, &clip)) {
         show_error(hwnd, UI_TEXT_DECRYPT_FAILED);
@@ -766,6 +880,38 @@ static void do_decrypt(HWND hwnd) {
     if (!app_work_start(ctx)) {
         set_textbox_overlay(g_textbox, NULL, FALSE);
         app_work_free_ctx(ctx);
+    }
+}
+
+static void show_main_window(HWND hwnd) {
+    ShowWindow(hwnd, SW_RESTORE);
+    SetForegroundWindow(hwnd);
+}
+
+static void decrypt_pending_clipboard(HWND hwnd) {
+    WCHAR *clip = app_clipboard_monitor_take_pending_text();
+    if (!clip) {
+        show_main_window(hwnd);
+        return;
+    }
+    APP_WORK_CTX *ctx = app_work_alloc(APP_WORK_KIND_DECRYPT, hwnd, g_textbox);
+    if (!ctx) {
+        secure_free_wide(clip);
+        app_clipboard_monitor_mark_last_opened_failed();
+        show_error(hwnd, UI_TEXT_DECRYPT_FAILED);
+        return;
+    }
+    ctx->input = clip;
+    g_clipboard_decrypt_active = TRUE;
+    ui_tray_set_pending(hwnd, FALSE);
+    show_main_window(hwnd);
+    set_textbox_overlay(g_textbox, UI_TEXT_DECRYPT_OVERLAY, TRUE);
+    if (!app_work_start(ctx)) {
+        set_textbox_overlay(g_textbox, NULL, FALSE);
+        g_clipboard_decrypt_active = FALSE;
+        app_clipboard_monitor_mark_last_opened_failed();
+        app_work_free_ctx(ctx);
+        show_error(hwnd, UI_TEXT_DECRYPT_FAILED);
     }
 }
 
@@ -824,10 +970,22 @@ static void set_control_font(HWND hwnd) {
 
 static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     switch (msg) {
+    case WM_APP_TRAY:
+        if (ui_tray_handle_message(hwnd, wparam, lparam)) return 0;
+        break;
+    case WM_APP_CLIPBOARD_PROBE_DONE:
+        if (app_clipboard_monitor_complete_probe(lparam)) {
+            ui_tray_set_pending(hwnd, TRUE);
+        }
+        return 0;
     case WM_APP_WORK_UPDATE:
     case WM_APP_WORK_DONE:
     case WM_APP_WORK_ERROR:
     case WM_APP_WORK_CANCELLED: {
+        BOOL clipboard_decrypt_done = g_clipboard_decrypt_active &&
+                                      (msg == WM_APP_WORK_DONE ||
+                                       msg == WM_APP_WORK_ERROR ||
+                                       msg == WM_APP_WORK_CANCELLED);
         UI_WORK_MESSAGE_HOST host;
         ZeroMemory(&host, sizeof(host));
         host.set_textbox_overlay = work_messages_set_overlay;
@@ -839,7 +997,13 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         host.save_decrypted_group_plaintext = work_messages_save_decrypted_group_plaintext;
         host.save_sent_plaintext = work_messages_save_sent_plaintext;
         host.save_sent_group_plaintext = work_messages_save_sent_group_plaintext;
-        return ui_work_handle_message(hwnd, msg, wparam, lparam, &host);
+        LRESULT handled = ui_work_handle_message(hwnd, msg, wparam, lparam, &host);
+        if (clipboard_decrypt_done) {
+            if (msg == WM_APP_WORK_DONE) app_clipboard_monitor_mark_last_opened_done();
+            else app_clipboard_monitor_mark_last_opened_failed();
+            g_clipboard_decrypt_active = FALSE;
+        }
+        return handled;
     }
     case WM_CREATE: {
         g_key_select = CreateWindowExW(0, WC_COMBOBOXW, L"",
@@ -857,11 +1021,12 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                                        0, 0, 0, 0, hwnd, (HMENU)IDC_GENERATION_SETTINGS,
                                                        g_instance, NULL);
-        g_textbox = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        g_textbox = CreateWindowExW(WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, L"",
                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | ES_MULTILINE |
                                     ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
                                     0, 0, 0, 0, hwnd, (HMENU)IDC_TEXTBOX, g_instance, NULL);
         SendMessageW(g_textbox, EM_SETLIMITTEXT, APP_MAX_EDIT_TEXT_CHARS, 0);
+        app_attachments_install(g_textbox);
         g_text_overlay = ui_overlay_create(g_textbox, g_instance, IDC_TEXT_OVERLAY);
 
         HWND encrypt = CreateWindowExW(0, L"BUTTON", UI_TEXT_ENCRYPT, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
@@ -885,12 +1050,18 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         for (size_t i = 0; i < ARRAYSIZE(controls); ++i) set_control_font(controls[i]);
         refresh_key_combo();
         refresh_main_mode_controls();
+        ui_tray_init(hwnd, g_instance);
+        app_clipboard_monitor_start(hwnd);
         break;
     }
     case WM_SIZE:
         layout_main(hwnd, LOWORD(lparam), HIWORD(lparam));
         return 0;
+    case WM_CLIPBOARDUPDATE:
+        if (!app_work_is_active()) app_clipboard_monitor_handle_update(hwnd);
+        return 0;
     case WM_TIMER:
+        if (ui_tray_handle_timer(hwnd, wparam)) return 0;
         if (wparam == TEXTBOX_OVERLAY_CLEAR_TIMER_ID) {
             KillTimer(hwnd, TEXTBOX_OVERLAY_CLEAR_TIMER_ID);
             if (g_overlay_clear_textbox && IsWindow(g_overlay_clear_textbox) && !app_work_is_active()) {
@@ -908,6 +1079,20 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     }
     case WM_COMMAND:
         switch (LOWORD(wparam)) {
+        case IDC_TRAY_OPEN:
+            show_main_window(hwnd);
+            break;
+        case IDC_TRAY_EXIT:
+            g_exit_requested = TRUE;
+            DestroyWindow(hwnd);
+            break;
+        case IDC_TRAY_DECRYPT_OPEN:
+            decrypt_pending_clipboard(hwnd);
+            break;
+        case IDC_TRAY_IGNORE:
+            app_clipboard_monitor_ignore_pending();
+            ui_tray_set_pending(hwnd, FALSE);
+            break;
         case IDC_KEY_SELECT:
             if (HIWORD(wparam) == CBN_SELCHANGE) {
                 int sel = (int)SendMessageW(g_key_select, CB_GETCURSEL, 0, 0);
@@ -997,10 +1182,16 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         }
         break;
     case WM_CLOSE:
-        if (app_work_is_active()) app_work_cancel();
-        DestroyWindow(hwnd);
+        if (g_exit_requested) {
+            if (app_work_is_active()) app_work_cancel();
+            DestroyWindow(hwnd);
+        } else {
+            ShowWindow(hwnd, SW_HIDE);
+        }
         return 0;
     case WM_DESTROY:
+        app_clipboard_monitor_stop(hwnd);
+        ui_tray_shutdown(hwnd);
         PostQuitMessage(0);
         return 0;
     }
@@ -1028,6 +1219,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     g_instance = instance;
     configure_app_work(NULL);
     app_llm_init(app_work_cancelled);
+    g_richedit_module = LoadLibraryW(L"Msftedit.dll");
+    if (!g_richedit_module) {
+        MessageBoxW(NULL, UI_TEXT_WINDOW_INIT_FAILED, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
+        app_llm_cleanup();
+        return 1;
+    }
 
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof(icc);
@@ -1052,6 +1249,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
         MessageBoxW(NULL, err, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
         ui_generation_settings_free(&g_generation_settings);
         app_llm_cleanup();
+        FreeLibrary(g_richedit_module);
         return 1;
     }
     if (!app_groups_load(err, ARRAYSIZE(err))) {
@@ -1059,6 +1257,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
         MessageBoxW(NULL, err, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
         ui_generation_settings_free(&g_generation_settings);
         app_llm_cleanup();
+        FreeLibrary(g_richedit_module);
         return 1;
     }
     if (!app_tokenizer_prefs_load(err, ARRAYSIZE(err))) {
@@ -1067,6 +1266,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
         MessageBoxW(NULL, err, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
         ui_generation_settings_free(&g_generation_settings);
         app_llm_cleanup();
+        FreeLibrary(g_richedit_module);
         return 1;
     }
     if (!activate_profile(profiles_active_index(), NULL, err, ARRAYSIZE(err))) {
@@ -1076,6 +1276,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
         MessageBoxW(NULL, err, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
         ui_generation_settings_free(&g_generation_settings);
         app_llm_cleanup();
+        FreeLibrary(g_richedit_module);
         return 1;
     }
     if (!register_windows()) {
@@ -1086,6 +1287,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
         MessageBoxW(NULL, UI_TEXT_WINDOW_INIT_FAILED, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
         ui_generation_settings_free(&g_generation_settings);
         app_llm_cleanup();
+        FreeLibrary(g_richedit_module);
         return 1;
     }
 
@@ -1101,6 +1303,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
         MessageBoxW(NULL, UI_TEXT_WINDOW_INIT_FAILED, CIA_APP_TITLE, MB_ICONERROR | MB_OK);
         ui_generation_settings_free(&g_generation_settings);
         app_llm_cleanup();
+        FreeLibrary(g_richedit_module);
         return 1;
     }
     configure_app_work(g_main_window);
@@ -1121,7 +1324,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     app_tokenizer_prefs_shutdown();
     app_groups_shutdown();
     profiles_shutdown();
+    app_attachments_clear();
     ui_generation_settings_free(&g_generation_settings);
     if (g_ui_font) DeleteObject(g_ui_font);
+    if (g_richedit_module) FreeLibrary(g_richedit_module);
     return (int)msg.wParam;
 }

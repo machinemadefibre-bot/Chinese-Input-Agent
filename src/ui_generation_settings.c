@@ -48,6 +48,7 @@ void ui_generation_settings_init_defaults(UI_GENERATION_SETTINGS *settings) {
     settings->temperature = 0.70;
     settings->top_p = 0.80;
     settings->redundancy_level = APP_CARRIER_REDUNDANCY_NONE;
+    image_stego_options_defaults(&settings->image_options);
 }
 
 void ui_generation_settings_free(UI_GENERATION_SETTINGS *settings) {
@@ -137,6 +138,20 @@ void ui_generation_settings_load(UI_GENERATION_SETTINGS *settings) {
         if (parse_int_line(config, L"redundancy", &int_value)) {
             settings->redundancy_level = clamp_redundancy((APP_CARRIER_REDUNDANCY_LEVEL)int_value);
         }
+        if (parse_int_line(config, L"image_target_short_side", &int_value) &&
+            (int_value == 0 || int_value == 1080 || int_value == 1440 || int_value == 2160)) {
+            settings->image_options.target_short_side = int_value;
+        }
+        if (parse_int_line(config, L"image_jpeg_quality", &int_value) &&
+            (int_value == 85 || int_value == 90 || int_value == 95)) {
+            settings->image_options.jpeg_quality = int_value;
+        }
+        if (parse_int_line(config, L"image_robustness", &int_value) && int_value >= 0 && int_value <= 2) {
+            settings->image_options.robustness_level = int_value;
+        }
+        if (parse_int_line(config, L"image_secret_mode", &int_value) && int_value >= 0 && int_value <= 3) {
+            settings->image_options.secret_quality_mode = int_value;
+        }
         settings->save_config = TRUE;
     }
     if (get_prompt_path(prompt_path, ARRAYSIZE(prompt_path)) && file_exists_w(prompt_path) &&
@@ -179,8 +194,19 @@ static BOOL save_generation_settings(const UI_GENERATION_SETTINGS *settings) {
         DeleteFileW(prompt_path);
         return TRUE;
     }
-    if (!wstrb_appendf(&config, L"temperature=%.2f\r\ntop_p=%.2f\r\nredundancy=%d\r\n",
-                       settings->temperature, settings->top_p, (int)settings->redundancy_level)) {
+    if (!wstrb_appendf(&config,
+                       L"temperature=%.2f\r\n"
+                       L"top_p=%.2f\r\n"
+                       L"redundancy=%d\r\n"
+                       L"image_target_short_side=%d\r\n"
+                       L"image_jpeg_quality=%d\r\n"
+                       L"image_robustness=%d\r\n"
+                       L"image_secret_mode=%d\r\n",
+                       settings->temperature, settings->top_p, (int)settings->redundancy_level,
+                       settings->image_options.target_short_side,
+                       settings->image_options.jpeg_quality,
+                       settings->image_options.robustness_level,
+                       settings->image_options.secret_quality_mode)) {
         wstrb_free(&config);
         return FALSE;
     }
@@ -218,7 +244,7 @@ static void layout_generation_dialog(HWND hwnd, int width, int height) {
     int y = margin;
     int content_w = width - margin * 2;
     int button_y = height - margin - button_h;
-    int edit_h = button_y - margin - (label_h + gap) * 4 - UI_GEN_SLIDER_HEIGHT * 2 - UI_MAIN_TOPIC_HEIGHT - gap * 6;
+    int edit_h = button_y - margin - (label_h + gap) * 8 - UI_GEN_SLIDER_HEIGHT * 2 - UI_MAIN_TOPIC_HEIGHT * 3 - gap * 10;
     if (edit_h < UI_GEN_EDIT_HEIGHT / 2) edit_h = UI_GEN_EDIT_HEIGHT / 2;
 
     MoveWindow(GetDlgItem(hwnd, -1), margin, y, content_w, label_h, TRUE);
@@ -241,6 +267,19 @@ static void layout_generation_dialog(HWND hwnd, int width, int height) {
     MoveWindow(GetDlgItem(hwnd, -4), margin, y, 90, label_h, TRUE);
     MoveWindow(GetDlgItem(hwnd, IDC_GEN_REDUNDANCY), margin + 100, y - 2, 180, UI_MAIN_TOPIC_HEIGHT, TRUE);
     MoveWindow(GetDlgItem(hwnd, IDC_GEN_SAVE_CONFIG), margin + 300, y, 160, label_h, TRUE);
+    y += UI_MAIN_TOPIC_HEIGHT + gap;
+
+    MoveWindow(GetDlgItem(hwnd, -5), margin, y, content_w, label_h, TRUE);
+    y += label_h;
+    MoveWindow(GetDlgItem(hwnd, -6), margin, y, 90, label_h, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDC_GEN_IMAGE_SHORT_SIDE), margin + 100, y - 2, 120, UI_MAIN_TOPIC_HEIGHT, TRUE);
+    MoveWindow(GetDlgItem(hwnd, -7), margin + 240, y, 60, label_h, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDC_GEN_IMAGE_JPEG_QUALITY), margin + 310, y - 2, 90, UI_MAIN_TOPIC_HEIGHT, TRUE);
+    y += UI_MAIN_TOPIC_HEIGHT + gap;
+    MoveWindow(GetDlgItem(hwnd, -8), margin, y, 90, label_h, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDC_GEN_IMAGE_ROBUSTNESS), margin + 100, y - 2, 120, UI_MAIN_TOPIC_HEIGHT, TRUE);
+    MoveWindow(GetDlgItem(hwnd, -9), margin + 240, y, 110, label_h, TRUE);
+    MoveWindow(GetDlgItem(hwnd, IDC_GEN_IMAGE_SECRET_MODE), margin + 360, y - 2, 140, UI_MAIN_TOPIC_HEIGHT, TRUE);
 
     MoveWindow(GetDlgItem(hwnd, IDOK), width - margin - UI_GEN_BUTTON_WIDTH * 2 - gap, button_y,
                UI_GEN_BUTTON_WIDTH, button_h, TRUE);
@@ -258,11 +297,41 @@ static WCHAR *read_prompt_edit(HWND hwnd) {
     return text;
 }
 
+static int image_short_side_from_combo(int selection) {
+    if (selection == 1) return 1440;
+    if (selection == 2) return 2160;
+    if (selection == 3) return 0;
+    return 1080;
+}
+
+static int image_short_side_to_combo(int value) {
+    if (value == 1440) return 1;
+    if (value == 2160) return 2;
+    if (value == 0) return 3;
+    return 0;
+}
+
+static int image_jpeg_quality_from_combo(int selection) {
+    if (selection == 0) return 85;
+    if (selection == 2) return 95;
+    return 90;
+}
+
+static int image_jpeg_quality_to_combo(int value) {
+    if (value == 85) return 0;
+    if (value == 95) return 2;
+    return 1;
+}
+
 static BOOL apply_dialog_values(HWND hwnd, GENERATION_DIALOG_STATE *state) {
     WCHAR *prompt = read_prompt_edit(hwnd);
     int temp_value = (int)SendMessageW(GetDlgItem(hwnd, IDC_GEN_TEMP_SLIDER), TBM_GETPOS, 0, 0);
     int top_p_value = (int)SendMessageW(GetDlgItem(hwnd, IDC_GEN_TOPP_SLIDER), TBM_GETPOS, 0, 0);
     int redundancy = (int)SendMessageW(GetDlgItem(hwnd, IDC_GEN_REDUNDANCY), CB_GETCURSEL, 0, 0);
+    int image_short_side = (int)SendMessageW(GetDlgItem(hwnd, IDC_GEN_IMAGE_SHORT_SIDE), CB_GETCURSEL, 0, 0);
+    int image_jpeg_quality = (int)SendMessageW(GetDlgItem(hwnd, IDC_GEN_IMAGE_JPEG_QUALITY), CB_GETCURSEL, 0, 0);
+    int image_robustness = (int)SendMessageW(GetDlgItem(hwnd, IDC_GEN_IMAGE_ROBUSTNESS), CB_GETCURSEL, 0, 0);
+    int image_secret_mode = (int)SendMessageW(GetDlgItem(hwnd, IDC_GEN_IMAGE_SECRET_MODE), CB_GETCURSEL, 0, 0);
     BOOL save_config = SendMessageW(GetDlgItem(hwnd, IDC_GEN_SAVE_CONFIG), BM_GETCHECK, 0, 0) == BST_CHECKED;
     xfree(state->settings->custom_prompt);
     state->settings->custom_prompt = prompt && prompt[0] ? prompt : NULL;
@@ -270,6 +339,10 @@ static BOOL apply_dialog_values(HWND hwnd, GENERATION_DIALOG_STATE *state) {
     state->settings->temperature = (double)clamp_slider_value(temp_value, 10, 120) / 100.0;
     state->settings->top_p = (double)clamp_slider_value(top_p_value, 10, 100) / 100.0;
     state->settings->redundancy_level = clamp_redundancy((APP_CARRIER_REDUNDANCY_LEVEL)redundancy);
+    state->settings->image_options.target_short_side = image_short_side_from_combo(image_short_side);
+    state->settings->image_options.jpeg_quality = image_jpeg_quality_from_combo(image_jpeg_quality);
+    state->settings->image_options.robustness_level = clamp_slider_value(image_robustness, 0, 2);
+    state->settings->image_options.secret_quality_mode = clamp_slider_value(image_secret_mode, 0, 3);
     state->settings->save_config = save_config;
     return TRUE;
 }
@@ -305,6 +378,32 @@ static LRESULT CALLBACK GenerationSettingsWndProc(HWND hwnd, UINT msg, WPARAM wp
         HWND redundancy_combo = CreateWindowExW(0, WC_COMBOBOXW, L"",
                                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
                                                 0, 0, 0, 0, hwnd, (HMENU)IDC_GEN_REDUNDANCY, cs->hInstance, NULL);
+        HWND image_label = CreateWindowExW(0, L"STATIC", UI_TEXT_GEN_IMAGE_LABEL, WS_CHILD | WS_VISIBLE,
+                                           0, 0, 0, 0, hwnd, (HMENU)-5, cs->hInstance, NULL);
+        HWND image_short_label = CreateWindowExW(0, L"STATIC", UI_TEXT_GEN_IMAGE_SHORT_SIDE_LABEL,
+                                                 WS_CHILD | WS_VISIBLE,
+                                                 0, 0, 0, 0, hwnd, (HMENU)-6, cs->hInstance, NULL);
+        HWND image_short_combo = CreateWindowExW(0, WC_COMBOBOXW, L"",
+                                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+                                                 0, 0, 0, 0, hwnd, (HMENU)IDC_GEN_IMAGE_SHORT_SIDE, cs->hInstance, NULL);
+        HWND image_jpeg_label = CreateWindowExW(0, L"STATIC", UI_TEXT_GEN_IMAGE_JPEG_QUALITY_LABEL,
+                                                WS_CHILD | WS_VISIBLE,
+                                                0, 0, 0, 0, hwnd, (HMENU)-7, cs->hInstance, NULL);
+        HWND image_jpeg_combo = CreateWindowExW(0, WC_COMBOBOXW, L"",
+                                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+                                                0, 0, 0, 0, hwnd, (HMENU)IDC_GEN_IMAGE_JPEG_QUALITY, cs->hInstance, NULL);
+        HWND image_robust_label = CreateWindowExW(0, L"STATIC", UI_TEXT_GEN_IMAGE_ROBUSTNESS_LABEL,
+                                                  WS_CHILD | WS_VISIBLE,
+                                                  0, 0, 0, 0, hwnd, (HMENU)-8, cs->hInstance, NULL);
+        HWND image_robust_combo = CreateWindowExW(0, WC_COMBOBOXW, L"",
+                                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+                                                  0, 0, 0, 0, hwnd, (HMENU)IDC_GEN_IMAGE_ROBUSTNESS, cs->hInstance, NULL);
+        HWND image_secret_label = CreateWindowExW(0, L"STATIC", UI_TEXT_GEN_IMAGE_SECRET_MODE_LABEL,
+                                                  WS_CHILD | WS_VISIBLE,
+                                                  0, 0, 0, 0, hwnd, (HMENU)-9, cs->hInstance, NULL);
+        HWND image_secret_combo = CreateWindowExW(0, WC_COMBOBOXW, L"",
+                                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+                                                  0, 0, 0, 0, hwnd, (HMENU)IDC_GEN_IMAGE_SECRET_MODE, cs->hInstance, NULL);
         HWND save_check = CreateWindowExW(0, L"BUTTON", UI_TEXT_GEN_SAVE_CONFIG,
                                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                           0, 0, 0, 0, hwnd, (HMENU)IDC_GEN_SAVE_CONFIG, cs->hInstance, NULL);
@@ -314,7 +413,9 @@ static LRESULT CALLBACK GenerationSettingsWndProc(HWND hwnd, UINT msg, WPARAM wp
                                       0, 0, 0, 0, hwnd, (HMENU)IDCANCEL, cs->hInstance, NULL);
         HWND controls[] = { prompt_label, prompt_edit, temp_label, temp_slider, temp_value,
                             top_p_label, top_p_slider, top_p_value, redundancy_label,
-                            redundancy_combo, save_check, ok, cancel };
+                            redundancy_combo, image_label, image_short_label, image_short_combo,
+                            image_jpeg_label, image_jpeg_combo, image_robust_label, image_robust_combo,
+                            image_secret_label, image_secret_combo, save_check, ok, cancel };
         for (size_t i = 0; i < ARRAYSIZE(controls); ++i) set_dialog_font(controls[i], state->ui_font);
         SendMessageW(temp_slider, TBM_SETRANGE, TRUE, MAKELPARAM(10, 120));
         SendMessageW(temp_slider, TBM_SETPOS, TRUE, clamp_slider_value((int)(state->settings->temperature * 100.0 + 0.5), 10, 120));
@@ -325,6 +426,28 @@ static LRESULT CALLBACK GenerationSettingsWndProc(HWND hwnd, UINT msg, WPARAM wp
         SendMessageW(redundancy_combo, CB_ADDSTRING, 0, (LPARAM)UI_TEXT_REDUNDANCY_MEDIUM);
         SendMessageW(redundancy_combo, CB_ADDSTRING, 0, (LPARAM)UI_TEXT_REDUNDANCY_HIGH);
         SendMessageW(redundancy_combo, CB_SETCURSEL, (WPARAM)clamp_redundancy(state->settings->redundancy_level), 0);
+        SendMessageW(image_short_combo, CB_ADDSTRING, 0, (LPARAM)UI_TEXT_IMAGE_SIDE_1080);
+        SendMessageW(image_short_combo, CB_ADDSTRING, 0, (LPARAM)UI_TEXT_IMAGE_SIDE_1440);
+        SendMessageW(image_short_combo, CB_ADDSTRING, 0, (LPARAM)UI_TEXT_IMAGE_SIDE_2160);
+        SendMessageW(image_short_combo, CB_ADDSTRING, 0, (LPARAM)UI_TEXT_IMAGE_SIDE_ORIGINAL);
+        SendMessageW(image_short_combo, CB_SETCURSEL,
+                     (WPARAM)image_short_side_to_combo(state->settings->image_options.target_short_side), 0);
+        SendMessageW(image_jpeg_combo, CB_ADDSTRING, 0, (LPARAM)L"85");
+        SendMessageW(image_jpeg_combo, CB_ADDSTRING, 0, (LPARAM)L"90");
+        SendMessageW(image_jpeg_combo, CB_ADDSTRING, 0, (LPARAM)L"95");
+        SendMessageW(image_jpeg_combo, CB_SETCURSEL,
+                     (WPARAM)image_jpeg_quality_to_combo(state->settings->image_options.jpeg_quality), 0);
+        SendMessageW(image_robust_combo, CB_ADDSTRING, 0, (LPARAM)UI_TEXT_IMAGE_ROBUST_NORMAL);
+        SendMessageW(image_robust_combo, CB_ADDSTRING, 0, (LPARAM)UI_TEXT_IMAGE_ROBUST_ROBUST);
+        SendMessageW(image_robust_combo, CB_ADDSTRING, 0, (LPARAM)UI_TEXT_IMAGE_ROBUST_STRONG);
+        SendMessageW(image_robust_combo, CB_SETCURSEL,
+                     (WPARAM)clamp_slider_value(state->settings->image_options.robustness_level, 0, 2), 0);
+        SendMessageW(image_secret_combo, CB_ADDSTRING, 0, (LPARAM)UI_TEXT_IMAGE_SECRET_AUTO);
+        SendMessageW(image_secret_combo, CB_ADDSTRING, 0, (LPARAM)UI_TEXT_IMAGE_SECRET_SMALL);
+        SendMessageW(image_secret_combo, CB_ADDSTRING, 0, (LPARAM)UI_TEXT_IMAGE_SECRET_BALANCED);
+        SendMessageW(image_secret_combo, CB_ADDSTRING, 0, (LPARAM)UI_TEXT_IMAGE_SECRET_CLEAR);
+        SendMessageW(image_secret_combo, CB_SETCURSEL,
+                     (WPARAM)clamp_slider_value(state->settings->image_options.secret_quality_mode, 0, 3), 0);
         SendMessageW(save_check, BM_SETCHECK, state->settings->save_config ? BST_CHECKED : BST_UNCHECKED, 0);
         update_slider_value_label(hwnd, IDC_GEN_TEMP_SLIDER, IDC_GEN_TEMP_VALUE);
         update_slider_value_label(hwnd, IDC_GEN_TOPP_SLIDER, IDC_GEN_TOPP_VALUE);

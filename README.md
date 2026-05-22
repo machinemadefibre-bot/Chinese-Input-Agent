@@ -48,11 +48,12 @@ ChineseInputAgent 不是首个自然语言隐写算法。RNN-Stega、STEGASURAS�
 - 导入/导出联系人密钥包，建立两台电脑之间的联系人关系。
 - 支持创建和加入对称群聊；群聊像一个可选择对象，群内成员共享群 epoch，v1 不做群内发送人防冒充。
 - 把明文加密后写成中文载体文章，对方复制整段文章即可解密。
+- 支持实验性的图片隐写：隐藏图片先走现有私聊/群聊加密，再用 JPEG DCT + Reed-Solomon FEC 嵌入载体图片。它的目标是提高中等 JPEG 二次压缩后的恢复概率，不承诺抗裁剪、缩放、截图、滤镜或平台强重写。
 - 消息生成和解析都在本机完成，使用本地 llama.cpp worker 和 GGUF 模型。
 - 支持按联系人或群聊保存聊天记录，加密和解密成功时自动记录明文。聊天记录正文以逐条加密 BLOB 存入 SQLite；会话类型、会话标识、时间戳、nonce、tag 和消息 UUID 等元数据仍是明文，不是 SQLCipher 式整库加密。私聊记录 key 从 profile master key 派生；群聊记录使用本机 DPAPI 保护的本地 group history key。
 - 解码时可以尝试多个 tokenizer；最终是否有效仍由加密层认证校验决定。
 - 使用 Windows Hello 保护本机 profile 密钥，关键本地数据保存时尽量避免半写坏文件。
-- 安装器会在安装时下载模型；portable 包也可以手动放入模型后离线使用。
+- 安装器会在安装时下载模型，并校验 Hugging Face LFS metadata 中的 SHA256；这表示下载文件匹配仓库元数据，不等于 release 内置固定 hash pin。portable 包也可以手动放入模型后离线使用。
 
 ## 它是
 
@@ -149,6 +150,8 @@ N bytes ciphertext
 群聊 v1 的目标是让持有同一群 epoch 的成员都能解密群消息；它不保证群内成员不能冒充其他成员。群昵称和备注名是显示信息，不是密码学身份认证。
 
 如果 state 文件回滚、丢失或损坏，session counter / chain state 可能无法继续通信，需要重新交换密钥包。第三方聊天平台如果改写、摘要、翻译、清洗或截断载体文章，payload 解码可能失败。
+
+SQLite 聊天记录只加密消息正文 BLOB；会话类型、会话标识、时间戳、nonce、tag 和 message UUID 等索引元数据仍然是明文。图片隐写的 DCT/FEC envelope 只负责恢复已加密 packet，内容保密和认证仍依赖私聊/群聊 AES-GCM。
 
 ## 构建
 

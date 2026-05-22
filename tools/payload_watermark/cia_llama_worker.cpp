@@ -1139,6 +1139,39 @@ static std::vector<uint8_t> unframe_payload(const std::vector<uint8_t> & frame, 
     if (try_unframe_redundant_payload(frame, payload)) return payload;
     return unframe_payload_legacy(frame, radix);
 }
+
+static std::vector<uint8_t> unframe_payload_probe(const std::vector<uint8_t> & frame, int radix, size_t wanted_bytes) {
+    (void)radix;
+    if (frame.empty()) throw std::runtime_error("top-k probe frame is empty");
+    size_t pos = 0;
+    uint32_t payload_len = 0;
+    if (frame.size() >= 7 && frame[0] == 'C' && frame[1] == 'I' && frame[2] == 'R' && frame[3] == '1') {
+        pos = 4;
+        int level = frame[pos++];
+        int block_size = frame[pos++];
+        if (block_size != redundancy_block_size(level)) throw std::runtime_error("top-k probe redundant frame header is invalid");
+        if (!read_uvarint(frame, pos, payload_len) || payload_len == 0) {
+            throw std::runtime_error("top-k probe redundant frame payload length is invalid");
+        }
+    } else if (!read_uvarint(frame, pos, payload_len) || payload_len == 0) {
+        throw std::runtime_error("top-k probe frame payload length is invalid");
+    }
+    size_t need = std::min(static_cast<size_t>(payload_len), wanted_bytes);
+    if (pos > frame.size() || frame.size() - pos < need) {
+        throw std::runtime_error("top-k probe frame prefix is too short");
+    }
+    return std::vector<uint8_t>(frame.begin() + static_cast<std::ptrdiff_t>(pos),
+                                frame.begin() + static_cast<std::ptrdiff_t>(pos + need));
+}
+
+static std::string utf8_prefix_bytes(const std::string & text, size_t max_bytes) {
+    if (text.size() <= max_bytes) return text;
+    size_t cut = max_bytes;
+    while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xc0u) == 0x80u) --cut;
+    if (cut == 0) cut = max_bytes;
+    return text.substr(0, cut);
+}
+
 static std::vector<int> encode_payload_to_digits(const std::vector<uint8_t> & payload, int radix, int redundancy_level) {
     auto framed = redundancy_level == 0 ? frame_payload_legacy(payload, radix) : frame_payload_redundant(payload, radix, redundancy_level);
     return bytes_to_base_digits(framed, radix);
@@ -2380,6 +2413,23 @@ public:
         return decode_payload_for_vocab(vocab, seed, text);
     }
 
+    std::vector<uint8_t> decode_payload_probe_for_vocab(const llama_vocab * decode_vocab,
+                                                        const std::string & seed,
+                                                        const std::string & text,
+                                                        size_t wanted_bytes) const {
+        std::string prefix = utf8_prefix_bytes(text, 4096);
+        auto text_tokens = tokenize(decode_vocab, prefix, false, false);
+        if (text_tokens.empty()) throw std::runtime_error("top-k probe text did not tokenize");
+        if (text_tokens.size() > 256) text_tokens.resize(256);
+        std::vector<int> digits;
+        digits.reserve(text_tokens.size());
+        for (int token : text_tokens) {
+            digits.push_back(topk_digit_for_token(seed, digits.size(), token, radix));
+        }
+        auto bytes = base_digits_to_bytes(digits, radix);
+        return unframe_payload_probe(bytes, radix, wanted_bytes);
+    }
+
     std::vector<DecodeCandidate> decode_payload_multi(const std::string & seed,
                                                       const std::string & text,
                                                       const std::string & preferred_tokenizer) {
@@ -2422,6 +2472,53 @@ public:
         }
         if (candidates.empty()) {
             throw std::runtime_error("no configured tokenizer decoded a framed top-k payload");
+        }
+        return candidates;
+    }
+
+    std::vector<DecodeCandidate> decode_payload_probe_multi(const std::string & seed,
+                                                            const std::string & text,
+                                                            const std::string & preferred_tokenizer,
+                                                            size_t wanted_bytes) {
+        std::vector<std::string> tokenizers = ordered_decode_tokenizers(preferred_tokenizer);
+        if (tokenizers.empty()) append_unique_string(tokenizers, "model");
+        std::vector<DecodeCandidate> candidates;
+        std::mutex candidates_lock;
+        std::vector<std::future<void>> jobs;
+        size_t next = 0;
+        int limit = std::max(1, decode_threads);
+        auto launch_one = [&](const std::string & id) {
+            return std::async(std::launch::async, [&, id]() {
+                try {
+                    const llama_vocab * decode_vocab = vocab_for_tokenizer(id);
+                    DecodeCandidate candidate;
+                    candidate.tokenizer_id = id;
+                    candidate.payload = decode_payload_probe_for_vocab(decode_vocab, seed, text, wanted_bytes);
+                    std::lock_guard<std::mutex> guard(candidates_lock);
+                    bool duplicate = false;
+                    for (const auto & existing : candidates) {
+                        if (existing.payload == candidate.payload) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate) candidates.push_back(std::move(candidate));
+                } catch (const std::exception &) {
+                    /* Wrong seed/tokenizer candidates are expected during clipboard probing. */
+                }
+            });
+        };
+        while (next < tokenizers.size() || !jobs.empty()) {
+            while (next < tokenizers.size() && jobs.size() < static_cast<size_t>(limit)) {
+                jobs.push_back(launch_one(tokenizers[next++]));
+            }
+            if (!jobs.empty()) {
+                jobs.front().get();
+                jobs.erase(jobs.begin());
+            }
+        }
+        if (candidates.empty()) {
+            throw std::runtime_error("no configured tokenizer decoded a framed top-k probe");
         }
         return candidates;
     }
@@ -2886,6 +2983,17 @@ int main(int argc, char ** argv) {
                 auto candidates = worker.decode_payload_multi(seed, text, preferred_tokenizer);
                 write_decode_candidates_file(out_path, candidates);
                 emit_json(ok_response(id, ",\"backend\":\"llama.cpp\",\"backend_detail\":\"" + json_escape(worker.backend_used) + "\",\"radix\":" + std::to_string(worker.radix) + ",\"candidates\":" + std::to_string(candidates.size())));
+            } else if (cmd == "decode_probe_multi") {
+                std::string text_path, out_path;
+                if (!json_get_string(line, "text", text_path) || !json_get_string(line, "out", out_path)) throw std::runtime_error("top-k probe request is missing text or out");
+                std::string seed;
+                if (!json_get_string(line, "seed", seed) || seed.empty()) throw std::runtime_error("top-k probe request is missing seed");
+                std::string preferred_tokenizer;
+                json_get_string(line, "preferred_tokenizer", preferred_tokenizer);
+                std::string text = read_text(text_path);
+                auto candidates = worker.decode_payload_probe_multi(seed, text, preferred_tokenizer, 32);
+                write_decode_candidates_file(out_path, candidates);
+                emit_json(ok_response(id, ",\"backend\":\"llama.cpp\",\"backend_detail\":\"" + json_escape(worker.backend_used) + "\",\"radix\":" + std::to_string(worker.radix) + ",\"probe_bytes\":32,\"candidates\":" + std::to_string(candidates.size())));
             } else {
                 throw std::runtime_error("未知 worker 命令：" + cmd);
             }

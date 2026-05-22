@@ -45,6 +45,7 @@ This does not mean the project can bypass moderation, platform rules, or legal p
 - Protect message content with a session transport and authenticated symmetric encryption; Double Ratchet-style forward secrecy is not implemented yet.
 - Generate Chinese carrier text locally with a Qwen GGUF model through llama.cpp.
 - Encode ciphertext with a top-k token carrier and recover it from the generated article.
+- Hide encrypted image payloads in JPEG carriers with DCT-domain embedding plus Reed-Solomon FEC. This is experimental and only aims to improve recovery after moderate JPEG recompression; it does not promise resistance to cropping, resizing, screenshots, filters, or aggressive platform rewriting.
 - Try multiple tokenizer profiles during decode; the encryption layer decides which candidate is valid.
 - Prefer CUDA, fall back to Vulkan, and then fall back to CPU.
 - Store profiles, contacts, groups, and chat history in the portable app's local `data/` directory. Chat history message bodies are stored as per-row encrypted SQLite blobs; conversation kind/key, timestamps, nonce, tag, and message UUID remain plaintext metadata. This is not SQLCipher-style whole-database encryption. Private history keys are derived from the profile master key; group history uses a local DPAPI-protected group history key.
@@ -113,13 +114,15 @@ git submodule update --init --recursive
 
 ### Model
 
-The repository does not include the model file. The installer produced by `package-installer-mingw.bat` downloads the Qwen3-4B-Instruct-2507 Q4_K_M GGUF model from Hugging Face during install, verifies its SHA-256, and writes it here:
+The repository does not include the model file. The installer produced by `package-installer-mingw.bat` downloads the selected Qwen3 GGUF model from Hugging Face during install, verifies it against the SHA-256 from Hugging Face LFS metadata, and writes it here:
 
 ```text
 models/base_model.gguf
 ```
 
 For portable zip-only or offline installs, place a llama.cpp-compatible Qwen GGUF at that path manually. See [models/README.md](models/README.md) for details.
+
+That installer check verifies that the downloaded file matches the current repository metadata on Hugging Face. It is not a release-pinned model hash manifest.
 
 Runtime worker configuration lives here:
 
@@ -163,6 +166,8 @@ The current session transport uses static identity keys plus one-time handshake 
 Group messages use a separate symmetric group transport. The v1 goal is confidentiality against non-members after each epoch change; it does not cryptographically prove which member sent a message.
 
 The current design goal is to make copying, sending, and recovering text possible through ordinary chat software. It is not designed to resist all traffic analysis, text rewriting, summarization, translation, active attacks, or platform-side text cleanup. If a third-party platform rewrites the text, decoding may fail.
+
+SQLite chat history encrypts message body blobs, but conversation kind/key, timestamps, nonce, tag, and message UUID remain plaintext metadata. Image stego DCT/FEC envelopes only recover encrypted packets; confidentiality and authenticity still come from the private/group AEAD layer.
 
 Contact packages should contain public information only. If exported content ever appears to contain private keys or recoverable private-key material, please open an issue immediately.
 

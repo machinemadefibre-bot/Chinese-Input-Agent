@@ -23,6 +23,12 @@ typedef struct APP_FLOW_DECRYPT_RESULT {
     BOOL is_group;
 } APP_FLOW_DECRYPT_RESULT;
 
+typedef struct APP_FLOW_PROBE_RESULT {
+    int profile_index;
+    int group_index;
+    BOOL is_group;
+} APP_FLOW_PROBE_RESULT;
+
 void app_flow_free_decrypt_result(APP_FLOW_DECRYPT_RESULT *result);
 BOOL app_flow_extract_exchange_body(const WCHAR *text, APP_FLOW_EXCHANGE_KIND *kind_out,
                                     WCHAR **out, WCHAR *fingerprint, size_t fingerprint_cch,
@@ -54,5 +60,8 @@ BOOL app_flow_decrypt_clip_auto(const WCHAR *clip, APP_FLOW_CANCEL_FN cancel_fn,
 BOOL app_flow_decrypt_clip_auto_profile(const WCHAR *clip, APP_FLOW_CANCEL_FN cancel_fn,
                                         WCHAR **plain_w_out, int *profile_index_out,
                                         WCHAR *err, size_t err_cch);
+BOOL app_flow_probe_clip_short(const WCHAR *clip, APP_FLOW_CANCEL_FN cancel_fn,
+                               APP_FLOW_PROBE_RESULT *result,
+                               WCHAR *err, size_t err_cch);
 
 #endif

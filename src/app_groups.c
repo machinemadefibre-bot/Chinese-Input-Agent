@@ -1397,8 +1397,27 @@ BOOL app_groups_encrypt_message(int index, const WCHAR *plain,
     BYTE *payload = NULL;
     DWORD payload_len = 0;
     if (!build_message_payload(group, plain, &payload, &payload_len, err, err_cch)) return FALSE;
+    BOOL encrypted = app_groups_encrypt_blob(index, payload, payload_len, out, out_len, err, err_cch);
+    secure_free(payload, payload_len);
+    return encrypted;
+}
+
+BOOL app_groups_encrypt_blob(int index, const BYTE *plain, DWORD plain_len,
+                             BYTE **out, DWORD *out_len,
+                             WCHAR *err, size_t err_cch) {
+    *out = NULL;
+    *out_len = 0;
+    APP_GROUP *group = group_at(index);
+    if (!group || (!plain && plain_len)) {
+        set_error(err, err_cch, L"Invalid group encryption request.");
+        return FALSE;
+    }
+    if (group->send_counter == 0xffffffffu) {
+        set_error(err, err_cch, L"Group send counter is exhausted. Create a new group invite.");
+        return FALSE;
+    }
+    DWORD payload_len = plain_len;
     if (payload_len > 0xffffffffu - APP_GROUP_MESSAGE_OVERHEAD_BYTES) {
-        secure_free(payload, payload_len);
         set_error(err, err_cch, L"Group plaintext is too large.");
         return FALSE;
     }
@@ -1432,7 +1451,7 @@ BOOL app_groups_encrypt_message(int index, const WCHAR *plain,
     }
     CopyMemory(message, header, GROUP_HEADER_BYTES);
     if (!aes_gcm_encrypt_raw(message_key, message, GROUP_HEADER_BYTES, nonce,
-                             payload, payload_len,
+                             plain, payload_len,
                              message + GROUP_HEADER_BYTES, GROUP_TAG_BYTES,
                              message + APP_GROUP_MESSAGE_OVERHEAD_BYTES)) {
         set_error(err, err_cch, L"Group AES-GCM encryption failed.");
@@ -1451,7 +1470,6 @@ BOOL app_groups_encrypt_message(int index, const WCHAR *plain,
     message = NULL;
     encrypted = TRUE;
 cleanup:
-    secure_free(payload, payload_len);
     secure_free(message, message_len);
     SecureZeroMemory(header, sizeof(header));
     SecureZeroMemory(old_chain_key, sizeof(old_chain_key));
@@ -1643,6 +1661,238 @@ BOOL app_groups_decrypt_message(const BYTE *message, DWORD message_len,
                                 WCHAR *err, size_t err_cch) {
     return app_groups_decrypt_message_ex(message, message_len, plain_out, sender_out,
                                          group_index_out, NULL, err, err_cch);
+}
+
+BOOL app_groups_decrypt_blob(const BYTE *message, DWORD message_len,
+                             BYTE **plain_out, DWORD *plain_len_out,
+                             int *group_index_out, WCHAR **sender_out,
+                             WCHAR *err, size_t err_cch) {
+    *plain_out = NULL;
+    *plain_len_out = 0;
+    if (group_index_out) *group_index_out = -1;
+    if (sender_out) *sender_out = NULL;
+    if (!message || message_len < APP_GROUP_MESSAGE_OVERHEAD_BYTES || message[0] != GROUP_MESSAGE_FORMAT) {
+        set_error(err, err_cch, L"Invalid group message format.");
+        return FALSE;
+    }
+    uint64_t group_id = read_u64_le(message + 1);
+    uint16_t epoch = read_u16_le(message + 9);
+    uint32_t sender_id = read_u32_le(message + 11);
+    uint32_t counter = read_u32_le(message + 15);
+    if (counter == 0xffffffffu) {
+        set_error(err, err_cch, L"Group receive counter is exhausted. Create a new group invite.");
+        return FALSE;
+    }
+    int group_index = find_group_by_id(group_id);
+    if (group_index < 0) {
+        set_error(err, err_cch, L"No matching group was found.");
+        return FALSE;
+    }
+    APP_GROUP *group = &g_groups[group_index];
+    if (epoch != group->epoch || sender_id == 0) {
+        set_error(err, err_cch, L"Group message does not match the active group epoch.");
+        return FALSE;
+    }
+
+    GROUP_RECV_CHAIN *chain = find_recv_chain(group, sender_id);
+    BOOL chain_was_new = FALSE;
+    GROUP_RECV_CHAIN backup_chain;
+    ZeroMemory(&backup_chain, sizeof(backup_chain));
+    if (!chain) {
+        chain_was_new = TRUE;
+        if (!ensure_recv_capacity(group)) {
+            set_error(err, err_cch, L"Group member limit reached.");
+            return FALSE;
+        }
+        chain = &group->recv_chains[group->recv_count];
+        ZeroMemory(chain, sizeof(*chain));
+        chain->sender_id = sender_id;
+        if (!derive_sender_chain_key(group->epoch_seed, sender_id, chain->chain_key)) {
+            SecureZeroMemory(chain, sizeof(*chain));
+            set_error(err, err_cch, L"Group sender chain derivation failed.");
+            return FALSE;
+        }
+    } else {
+        backup_chain = *chain;
+    }
+
+    DWORD cipher_len = message_len - APP_GROUP_MESSAGE_OVERHEAD_BYTES;
+    BYTE *payload = NULL;
+    BYTE message_key[32];
+    BYTE next_chain_key[32];
+    BYTE working_chain_key[32];
+    BYTE nonce[12];
+    GROUP_SKIPPED_KEY temp_skipped[GROUP_SKIPPED_KEYS];
+    int skipped_slot = -1;
+    WCHAR *sender = NULL;
+    BOOL decrypted = FALSE;
+    ZeroMemory(message_key, sizeof(message_key));
+    ZeroMemory(next_chain_key, sizeof(next_chain_key));
+    ZeroMemory(working_chain_key, sizeof(working_chain_key));
+    ZeroMemory(nonce, sizeof(nonce));
+    ZeroMemory(temp_skipped, sizeof(temp_skipped));
+
+    skipped_slot = find_skipped_key(chain, counter);
+    if (skipped_slot >= 0) {
+        CopyMemory(message_key, chain->skipped[skipped_slot].key, sizeof(message_key));
+    } else {
+        if (counter < chain->next_counter) {
+            set_error(err, err_cch, L"Group message counter is too old.");
+            goto cleanup;
+        }
+        uint32_t gap = counter - chain->next_counter;
+        if (gap > GROUP_SKIPPED_KEYS || gap > count_free_skipped_keys(chain)) {
+            set_error(err, err_cch, L"Group message is outside the out-of-order window.");
+            goto cleanup;
+        }
+        CopyMemory(working_chain_key, chain->chain_key, sizeof(working_chain_key));
+        for (uint32_t skipped_idx = 0; skipped_idx < gap; ++skipped_idx) {
+            BYTE skipped_next_chain[32];
+            ZeroMemory(skipped_next_chain, sizeof(skipped_next_chain));
+            temp_skipped[skipped_idx].used = TRUE;
+            temp_skipped[skipped_idx].counter = chain->next_counter + skipped_idx;
+            if (!derive_chain_step(working_chain_key, temp_skipped[skipped_idx].key, skipped_next_chain)) {
+                SecureZeroMemory(skipped_next_chain, sizeof(skipped_next_chain));
+                set_error(err, err_cch, L"Group skipped-key derivation failed.");
+                goto cleanup;
+            }
+            SecureZeroMemory(working_chain_key, sizeof(working_chain_key));
+            CopyMemory(working_chain_key, skipped_next_chain, sizeof(working_chain_key));
+            SecureZeroMemory(skipped_next_chain, sizeof(skipped_next_chain));
+        }
+        if (!derive_chain_step(working_chain_key, message_key, next_chain_key)) {
+            set_error(err, err_cch, L"Group message key derivation failed.");
+            goto cleanup;
+        }
+    }
+    if (!derive_group_nonce(message_key, message, nonce)) {
+        set_error(err, err_cch, L"Group nonce derivation failed.");
+        goto cleanup;
+    }
+    payload = (BYTE *)xalloc(cipher_len ? cipher_len : 1);
+    if (!payload) {
+        set_error(err, err_cch, L"Out of memory.");
+        goto cleanup;
+    }
+    if (!aes_gcm_decrypt_raw(message_key, message, GROUP_HEADER_BYTES, nonce,
+                             message + APP_GROUP_MESSAGE_OVERHEAD_BYTES, cipher_len,
+                             message + GROUP_HEADER_BYTES, GROUP_TAG_BYTES, payload)) {
+        set_error(err, err_cch, L"Group message authentication failed.");
+        goto cleanup;
+    }
+    if (sender_out &&
+        !format_sender_label(current_local_minute_of_day(),
+                             chain && chain->alias_name[0] ? chain->alias_name :
+                             (chain ? chain->reported_name : L""),
+                             sender_id, &sender)) {
+        set_error(err, err_cch, L"Failed to build group sender label.");
+        goto cleanup;
+    }
+
+    if (chain_was_new) ++group->recv_count;
+    if (skipped_slot >= 0) {
+        SecureZeroMemory(&chain->skipped[skipped_slot], sizeof(chain->skipped[skipped_slot]));
+    } else {
+        uint32_t gap = counter - chain->next_counter;
+        for (uint32_t skipped_idx = 0; skipped_idx < gap; ++skipped_idx) {
+            int free_idx = -1;
+            for (int slot_idx = 0; slot_idx < (int)GROUP_SKIPPED_KEYS; ++slot_idx) {
+                if (!chain->skipped[slot_idx].used) {
+                    free_idx = slot_idx;
+                    break;
+                }
+            }
+            if (free_idx < 0) {
+                set_error(err, err_cch, L"Group skipped-key cache is full.");
+                goto rollback;
+            }
+            chain->skipped[free_idx] = temp_skipped[skipped_idx];
+            SecureZeroMemory(&temp_skipped[skipped_idx], sizeof(temp_skipped[skipped_idx]));
+        }
+        CopyMemory(chain->chain_key, next_chain_key, sizeof(chain->chain_key));
+        chain->next_counter = counter + 1;
+    }
+    if (!app_groups_save()) {
+        set_error(err, err_cch, L"Group state save failed.");
+        goto rollback;
+    }
+    if (group_index_out) *group_index_out = group_index;
+    if (sender_out) *sender_out = sender;
+    else secure_free_wide(sender);
+    *plain_out = payload;
+    *plain_len_out = cipher_len;
+    payload = NULL;
+    sender = NULL;
+    decrypted = TRUE;
+    goto cleanup;
+
+rollback:
+    if (chain_was_new) {
+        if (group->recv_count > 0 && &group->recv_chains[group->recv_count - 1] == chain) {
+            --group->recv_count;
+        }
+        clear_recv_chain(chain);
+    } else {
+        *chain = backup_chain;
+    }
+cleanup:
+    secure_free(payload, cipher_len);
+    secure_free_wide(sender);
+    SecureZeroMemory(message_key, sizeof(message_key));
+    SecureZeroMemory(next_chain_key, sizeof(next_chain_key));
+    SecureZeroMemory(working_chain_key, sizeof(working_chain_key));
+    SecureZeroMemory(nonce, sizeof(nonce));
+    SecureZeroMemory(temp_skipped, sizeof(temp_skipped));
+    SecureZeroMemory(&backup_chain, sizeof(backup_chain));
+    return decrypted;
+}
+
+BOOL app_groups_probe_message_header(const BYTE *message_prefix, DWORD prefix_len, int *group_index_out) {
+    if (group_index_out) *group_index_out = -1;
+    if (!message_prefix || prefix_len < GROUP_HEADER_BYTES || message_prefix[0] != GROUP_MESSAGE_FORMAT) return FALSE;
+    uint64_t group_id = read_u64_le(message_prefix + 1);
+    uint16_t epoch = read_u16_le(message_prefix + 9);
+    uint32_t sender_id = read_u32_le(message_prefix + 11);
+    uint32_t counter = read_u32_le(message_prefix + 15);
+    if (sender_id == 0 || counter == 0xffffffffu) return FALSE;
+    int group_index = find_group_by_id(group_id);
+    if (group_index < 0) return FALSE;
+    APP_GROUP *group = &g_groups[group_index];
+    if (epoch != group->epoch) return FALSE;
+    GROUP_RECV_CHAIN *chain = find_recv_chain(group, sender_id);
+    if (!chain) {
+        if (group->recv_count >= APP_GROUP_MAX_MEMBERS) return FALSE;
+        if (counter > GROUP_SKIPPED_KEYS) return FALSE;
+    } else if (find_skipped_key(chain, counter) < 0) {
+        if (counter < chain->next_counter) return FALSE;
+        uint32_t gap = counter - chain->next_counter;
+        if (gap > GROUP_SKIPPED_KEYS || gap > count_free_skipped_keys(chain)) return FALSE;
+    }
+    if (group_index_out) *group_index_out = group_index;
+    return TRUE;
+}
+
+BOOL app_groups_derive_image_stego_locator_key(int index,
+                                               BYTE out[32],
+                                               WCHAR *err, size_t err_cch) {
+    APP_GROUP *group = group_at(index);
+    if (!group || !out) {
+        set_error(err, err_cch, L"Invalid group image locator request.");
+        return FALSE;
+    }
+    static const BYTE label[] = "ChineseInputAgent group image stego locator v1";
+    BYTE group_id_bytes[8];
+    BYTE epoch_bytes[2];
+    write_u64_le(group_id_bytes, group->group_id);
+    write_u16_le(epoch_bytes, group->epoch);
+    const BYTE *parts[3] = { label, group_id_bytes, epoch_bytes };
+    DWORD lens[3] = { (DWORD)(sizeof(label) - 1), sizeof(group_id_bytes), sizeof(epoch_bytes) };
+    BOOL derived = hmac_sha256_segments(group->epoch_seed, sizeof(group->epoch_seed),
+                                        parts, lens, ARRAYSIZE(parts), out);
+    SecureZeroMemory(group_id_bytes, sizeof(group_id_bytes));
+    SecureZeroMemory(epoch_bytes, sizeof(epoch_bytes));
+    if (!derived) set_error(err, err_cch, L"Group image locator key derivation failed.");
+    return derived;
 }
 
 BOOL app_groups_archive_append_text(int index, const WCHAR *sender, const WCHAR *plain,

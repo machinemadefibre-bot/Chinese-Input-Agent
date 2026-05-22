@@ -59,6 +59,11 @@ function Test-InstallerDownloadsWorkerDefaultModel {
     Assert-True (-not $installerConfig.Contains("Thinking-2507")) "installer should not offer suffix thinking variants"
     Assert-True $installer.Contains('Invoke-RestMethod -Uri $treeUrl') "installer should query Hugging Face model metadata for selected files"
     Assert-True $installer.Contains("Get-FileHash -Algorithm SHA256") "installer should verify downloaded model files"
+    Assert-True (-not $installer.Contains("?download=true")) "installer should use bare Hugging Face resolve URLs"
+    Assert-True $installer.Contains("BCryptGenRandom") "installer temp names should use random bytes"
+    Assert-True $installer.Contains("CREATE_NEW") "installer temp files should not overwrite existing files"
+    Assert-True $installer.Contains("GetSystemDirectoryW") "installer should use the system PowerShell path"
+    Assert-True $installer.Contains("CreateProcessW(powershell_path") "installer should pass PowerShell as lpApplicationName"
     Assert-True $installer.Contains("worker_config.txt") "installer should update worker_config.txt for the selected model"
     Assert-True $installer.Contains("IDC_INSTALLER_MODEL_COMBO") "installer should expose a model selector"
     Assert-True $installer.Contains("IDC_INSTALLER_QUANT_COMBO") "installer should expose a quantization selector"
@@ -174,6 +179,86 @@ function Test-CustomGenerationSettingsAndRedundancy {
     Assert-True $workerCpp.Contains("frame_payload_redundant") "worker should support redundant carrier frames"
     Assert-True $workerCpp.Contains("repair_redundancy_block") "worker should attempt low-cost block repair"
     Assert-True $workerCpp.Contains("crc32_bytes") "redundant frames should verify recovered payloads"
+}
+
+function Test-ImageStegoAvifIntegration {
+    $cmake = Read-RepoFile "CMakeLists.txt"
+    $testBat = Read-RepoFile "test.bat"
+    $main = Read-RepoFile "src\main.c"
+    $settingsHeader = Read-RepoFile "src\ui_generation_settings.h"
+    $settingsImpl = Read-RepoFile "src\ui_generation_settings.c"
+    $imageFlow = Read-RepoFile "src\app_image_flow.c"
+    $imagePrepare = Read-RepoFile "src\app_image_prepare.c"
+    $imageStego = Read-RepoFile "src\app_image_stego.c"
+    $groupsHeader = Read-RepoFile "src\app_groups.h"
+    $cryptoHeader = Read-RepoFile "src\crypto_box.h"
+
+    Assert-True $cmake.Contains("src/app_image_flow.c") "image flow should be compiled into cia_core"
+    Assert-True $cmake.Contains("src/app_image_fec.c") "image Reed-Solomon FEC should be compiled into cia_core"
+    Assert-True $cmake.Contains("add_executable(image_fec_test") "image FEC should have a CMake smoke test target"
+    Assert-True $testBat.Contains("test_image_fec.ps1") "test.bat should run the image FEC test"
+    Assert-True $cmake.Contains("src/app_image_prepare.c") "AVIF image preparation should be compiled into cia_core"
+    Assert-True $cmake.Contains("src/app_image_stego.c") "JPEG DCT stego should be compiled into cia_core"
+    Assert-True $cmake.Contains("src/app_attachments.c") "RichEdit attachment handling should be compiled into the UI executable"
+    Assert-True $cmake.Contains("third_party/libavif") "AVIF support should use vendored libavif"
+    Assert-True $cmake.Contains("AVIF_CODEC_AOM") "libavif should be configured with an AVIF backend"
+    Assert-True $cmake.Contains("AVIF_CODEC_AOM_DECODE ON") "libavif should validate and decode AVIF inputs"
+    Assert-True $cmake.Contains("third_party/libjpeg-turbo") "DCT coefficient work should use vendored libjpeg-turbo"
+    Assert-True $cmake.Contains("windowscodecs") "core should link WIC for image decode/resize"
+    Assert-True $main.Contains("MSFTEDIT_CLASS") "main textbox should use RichEdit"
+    Assert-True $main.Contains("app_attachments_install") "RichEdit should install attachment paste/drop handling"
+    Assert-True $main.Contains("app_image_flow_embed_private") "private image sends should use image flow"
+    Assert-True $main.Contains("app_image_flow_embed_group") "group image sends should use image flow"
+    Assert-True $main.Contains("app_image_flow_extract_auto") "image decrypt should try the image stego flow"
+    Assert-True $settingsHeader.Contains("IMAGE_STEGO_DCT_OPTIONS") "generation settings should carry image stego options"
+    Assert-True $settingsImpl.Contains("image_target_short_side") "image short-side option should be persisted"
+    Assert-True $settingsImpl.Contains("image_secret_mode") "AVIF hidden image compression mode should be persisted"
+    Assert-True $imagePrepare.Contains("#include <avif/avif.h>") "hidden images should be compressed through libavif"
+    Assert-True $imagePrepare.Contains("avifEncoderWrite") "hidden image preparation should encode AVIF bytes"
+    Assert-True $imagePrepare.Contains("avifDecoderReadMemory") "AVIF fast path should validate input bytes before embedding"
+    Assert-True $imageStego.Contains("#include <jpeglib.h>") "DCT stego should use libjpeg coefficient APIs"
+    Assert-True $imageStego.Contains("jpeg_read_coefficients") "DCT stego should read JPEG coefficients"
+    Assert-True $imageStego.Contains("jpeg_write_coefficients") "DCT stego should write JPEG coefficients"
+    Assert-True $imageStego.Contains("CIDCT2") "DCT stego should write the hardened v2 envelope"
+    Assert-True $imageStego.Contains("CIDCT1") "DCT stego should keep a bounded v1 fallback"
+    Assert-True $imageStego.Contains("APP_IMAGE_STEGO_MAX_SLOTS") "DCT stego should cap coefficient permutation allocation"
+    Assert-True $imageStego.Contains("APP_IMAGE_STEGO_MAX_PACKET_BYTES") "DCT stego should cap untrusted payload lengths"
+    Assert-True $imageStego.Contains("parse_dct2_header") "DCT stego should authenticate header fields before allocation"
+    Assert-True $imageStego.Contains("frame_fits_slots") "DCT stego should check capacity before allocating decoded frames"
+    Assert-True $imageStego.Contains("app_image_fec_decode") "DCT stego should use Reed-Solomon FEC recovery"
+    Assert-True $imageFlow.Contains("CIAPIC1") "image plaintext should use a dedicated image record envelope"
+    Assert-True $groupsHeader.Contains("app_groups_encrypt_blob") "group image flow should use blob encryption instead of text payload parsing"
+    Assert-True $cryptoHeader.Contains("crypto_box_derive_image_stego_locator_key") "private image stego should derive a locator key from contact keys"
+}
+
+function Test-ClipboardMonitorUsesShortProbe {
+    $cmake = Read-RepoFile "CMakeLists.txt"
+    $main = Read-RepoFile "src\main.c"
+    $monitor = Read-RepoFile "src\app_clipboard_monitor.c"
+    $tray = Read-RepoFile "src\ui_tray.c"
+    $flowHeader = Read-RepoFile "src\app_flow.h"
+    $messageFlow = Read-RepoFile "src\app_message_flow.c"
+    $cryptoHeader = Read-RepoFile "src\crypto_box.h"
+    $groupsHeader = Read-RepoFile "src\app_groups.h"
+    $workerCpp = Read-RepoFile "tools\payload_watermark\cia_llama_worker.cpp"
+
+    Assert-True $cmake.Contains("src/app_clipboard_monitor.c") "clipboard monitor should compile into the UI executable"
+    Assert-True $cmake.Contains("src/ui_tray.c") "tray UI should compile into the UI executable"
+    Assert-True $main.Contains("WM_CLIPBOARDUPDATE") "main window should receive clipboard update notifications"
+    Assert-True $main.Contains("app_clipboard_monitor_handle_update") "main window should route clipboard updates to the monitor"
+    Assert-True $main.Contains("app_clipboard_monitor_take_pending_text") "pending carrier text should be consumed only when the user opens it"
+    Assert-True $monitor.Contains("AddClipboardFormatListener") "clipboard monitor should use the Windows clipboard listener API"
+    Assert-True $monitor.Contains("CLIPBOARD_MIN_PROBE_CHARS 100") "clipboard monitor should ignore short text"
+    Assert-True $monitor.Contains("app_flow_probe_clip_short") "clipboard monitor should call the short probe API"
+    Assert-True $monitor.Contains("g_probe_generation") "clipboard monitor should ignore stale probe thread results"
+    Assert-True (-not $monitor.Contains("app_flow_decrypt_clip_auto")) "clipboard monitor should not run full decrypt during probe"
+    Assert-True $tray.Contains("Shell_NotifyIconW") "tray module should own Shell_NotifyIcon usage"
+    Assert-True $flowHeader.Contains("APP_FLOW_PROBE_RESULT") "core flow should expose a small probe result"
+    Assert-True $messageFlow.Contains("app_carrier_decode_message_payload_probe_multi") "short probe should use the limited carrier decode path"
+    Assert-True $cryptoHeader.Contains("crypto_box_probe_message_header") "private short probe should validate only the message header"
+    Assert-True $groupsHeader.Contains("app_groups_probe_message_header") "group short probe should validate only the group header"
+    Assert-True $workerCpp.Contains("decode_probe_multi") "worker should expose limited multi-tokenizer probe decode"
+    Assert-True $workerCpp.Contains("unframe_payload_probe") "worker probe should recover only a bounded frame prefix"
 }
 
 function Test-CryptoBoxUsesOpaqueContext {
@@ -447,6 +532,9 @@ function Test-TopLevelCMakeBuildTargets {
     Assert-True $cmake.Contains("src/app_carrier_flow.c") "CMakeLists should include app_carrier_flow.c"
     Assert-True $cmake.Contains("src/app_contact_flow.c") "CMakeLists should include app_contact_flow.c"
     Assert-True $cmake.Contains("src/app_message_flow.c") "CMakeLists should include app_message_flow.c"
+    Assert-True $cmake.Contains("src/app_image_flow.c") "CMakeLists should include app_image_flow.c"
+    Assert-True $cmake.Contains("src/app_image_prepare.c") "CMakeLists should include app_image_prepare.c"
+    Assert-True $cmake.Contains("src/app_image_stego.c") "CMakeLists should include app_image_stego.c"
     Assert-True $cmake.Contains("src/app_groups.c") "CMakeLists should include app_groups.c"
     Assert-True $cmake.Contains("src/app_chat_history.c") "CMakeLists should include app_chat_history.c"
     Assert-True $cmake.Contains("third_party/sqlite/sqlite3.c") "CMakeLists should include SQLite amalgamation"
@@ -464,6 +552,8 @@ $tests = @(
     "Test-WorkerResponseIdIsChecked",
     "Test-WorkerPromptsAreRuntimeFiles",
     "Test-CustomGenerationSettingsAndRedundancy",
+    "Test-ImageStegoAvifIntegration",
+    "Test-ClipboardMonitorUsesShortProbe",
     "Test-CryptoBoxUsesOpaqueContext",
     "Test-CryptoBoxUsesSessionTransport",
     "Test-ProfilesDoNotManageCryptoLifecycle",

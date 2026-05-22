@@ -20,5 +20,8 @@ BOOL app_message_flow_decrypt_clip_auto(const WCHAR *clip, APP_FLOW_CANCEL_FN ca
 BOOL app_message_flow_decrypt_clip_auto_profile(const WCHAR *clip, APP_FLOW_CANCEL_FN cancel_fn,
                                                 WCHAR **plain_w_out, int *profile_index_out,
                                                 WCHAR *err, size_t err_cch);
+BOOL app_message_flow_probe_clip_short(const WCHAR *clip, APP_FLOW_CANCEL_FN cancel_fn,
+                                       APP_FLOW_PROBE_RESULT *result,
+                                       WCHAR *err, size_t err_cch);
 
 #endif

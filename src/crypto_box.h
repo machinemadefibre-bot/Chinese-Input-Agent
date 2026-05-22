@@ -24,8 +24,11 @@ BOOL crypto_box_encrypt(CRYPTO_BOX *box, const BYTE *plain, DWORD plain_len, BYT
                         WCHAR *err, size_t err_cch);
 BOOL crypto_box_decrypt(CRYPTO_BOX *box, const BYTE *message, DWORD message_len, BYTE **out, DWORD *out_len,
                         WCHAR *err, size_t err_cch);
+BOOL crypto_box_probe_message_header(CRYPTO_BOX *box, const BYTE *message_prefix, DWORD prefix_len);
 BOOL crypto_box_get_public_key(CRYPTO_BOX *box, BYTE **out, DWORD *out_len, WCHAR *err, size_t err_cch);
 BOOL crypto_box_get_remote_public_key(CRYPTO_BOX *box, BYTE **out, DWORD *out_len, WCHAR *err, size_t err_cch);
+BOOL crypto_box_derive_image_stego_locator_key(CRYPTO_BOX *box, BYTE out[32],
+                                               WCHAR *err, size_t err_cch);
 BOOL crypto_box_get_public_fingerprint(CRYPTO_BOX *box, WCHAR *out, size_t cch, WCHAR *err, size_t err_cch);
 BOOL crypto_box_contact_package_fingerprint(const BYTE *pkg, DWORD pkg_len, WCHAR *out, size_t cch,
                                             WCHAR *err, size_t err_cch);

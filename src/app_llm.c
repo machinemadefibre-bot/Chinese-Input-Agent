@@ -825,3 +825,58 @@ fail:
     secure_delete_file(out_path);
     return FALSE;
 }
+
+BOOL local_topk_decode_probe_multi(const WCHAR *carrier, const WCHAR *seed, const WCHAR *preferred_tokenizer_id,
+                                   APP_LLM_DECODE_CANDIDATE **out, DWORD *out_count,
+                                   WCHAR *err, size_t err_cch) {
+    *out = NULL;
+    *out_count = 0;
+    if (!carrier || !carrier[0] || !seed || !seed[0]) {
+        set_error(err, err_cch, L"Invalid local top-k probe request.");
+        return FALSE;
+    }
+
+    WCHAR text_path[MAX_PATH] = L"";
+    WCHAR out_path[MAX_PATH] = L"";
+    if (!make_temp_path(text_path, ARRAYSIZE(text_path)) ||
+        !make_temp_path(out_path, ARRAYSIZE(out_path))) {
+        set_error(err, err_cch, L"Operation failed.");
+        goto fail;
+    }
+    if (!write_text_utf8_file(text_path, carrier)) {
+        set_error(err, err_cch, L"Operation failed.");
+        goto fail;
+    }
+
+    WCHAR worker_err[512] = L"";
+    BOOL ran = local_llm_worker_request("decode_probe_multi", NULL, text_path, NULL, seed, NULL,
+                                        NULL, preferred_tokenizer_id, out_path, -1, NULL, NULL,
+                                        worker_err, ARRAYSIZE(worker_err));
+    if (!ran) {
+        if (app_llm_cancelled()) {
+            if (!err[0]) StringCchCopyW(err, err_cch, L"\u5df2\u505c\u6b62\u3002");
+            goto fail;
+        }
+        StringCchCopyW(err, err_cch, worker_err[0] ? worker_err : L"Local top-k worker returned no usable probe.");
+        goto fail;
+    }
+
+    BYTE *candidate_file = NULL;
+    DWORD candidate_file_len = 0;
+    if (!read_file_bytes(out_path, &candidate_file, &candidate_file_len)) {
+        set_error(err, err_cch, L"Operation failed.");
+        goto fail;
+    }
+    BOOL parsed = parse_decode_candidates(candidate_file, candidate_file_len, out, out_count, err, err_cch);
+    secure_free(candidate_file, candidate_file_len);
+    if (!parsed) goto fail;
+
+    secure_delete_file(text_path);
+    secure_delete_file(out_path);
+    return TRUE;
+
+fail:
+    secure_delete_file(text_path);
+    secure_delete_file(out_path);
+    return FALSE;
+}

@@ -30,6 +30,9 @@ BOOL local_topk_decode_payload(const WCHAR *carrier, const WCHAR *seed, BYTE **o
 BOOL local_topk_decode_payload_multi(const WCHAR *carrier, const WCHAR *seed, const WCHAR *preferred_tokenizer_id,
                                      APP_LLM_DECODE_CANDIDATE **out, DWORD *out_count,
                                      WCHAR *err, size_t err_cch);
+BOOL local_topk_decode_probe_multi(const WCHAR *carrier, const WCHAR *seed, const WCHAR *preferred_tokenizer_id,
+                                   APP_LLM_DECODE_CANDIDATE **out, DWORD *out_count,
+                                   WCHAR *err, size_t err_cch);
 void app_llm_free_decode_candidates(APP_LLM_DECODE_CANDIDATE *candidates, DWORD count);
 
 #endif

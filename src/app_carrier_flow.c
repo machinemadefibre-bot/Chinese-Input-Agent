@@ -216,3 +216,10 @@ BOOL app_carrier_decode_message_payload_multi(const WCHAR *carrier, const WCHAR 
                                               WCHAR *err, size_t err_cch) {
     return local_topk_decode_payload_multi(carrier, seed, preferred_tokenizer_id, out, out_count, err, err_cch);
 }
+
+BOOL app_carrier_decode_message_payload_probe_multi(const WCHAR *carrier, const WCHAR *seed,
+                                                    const WCHAR *preferred_tokenizer_id,
+                                                    APP_LLM_DECODE_CANDIDATE **out, DWORD *out_count,
+                                                    WCHAR *err, size_t err_cch) {
+    return local_topk_decode_probe_multi(carrier, seed, preferred_tokenizer_id, out, out_count, err, err_cch);
+}

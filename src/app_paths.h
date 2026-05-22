@@ -25,6 +25,6 @@
 #define APP_INSTALL_EXE_NAME L"ChineseInputAgent.exe"
 #define APP_INSTALL_MODELS_DIR_NAME L"models"
 #define APP_INSTALL_MODEL_NAME L"base_model.gguf"
-#define APP_INSTALL_TEMP_FILE_FORMAT L"%scia_installer_%lu%s"
+#define APP_INSTALL_TEMP_FILE_FORMAT L"%scia_installer_%s%s"
 
 #endif

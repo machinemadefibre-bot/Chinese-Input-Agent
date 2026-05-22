@@ -42,6 +42,9 @@ BOOL app_groups_import_package(const BYTE *pkg, DWORD pkg_len,
 BOOL app_groups_encrypt_message(int index, const WCHAR *plain,
                                 BYTE **out, DWORD *out_len,
                                 WCHAR *err, size_t err_cch);
+BOOL app_groups_encrypt_blob(int index, const BYTE *plain, DWORD plain_len,
+                             BYTE **out, DWORD *out_len,
+                             WCHAR *err, size_t err_cch);
 BOOL app_groups_decrypt_message(const BYTE *message, DWORD message_len,
                                 WCHAR **plain_out, WCHAR **sender_out,
                                 int *group_index_out,
@@ -50,6 +53,14 @@ BOOL app_groups_decrypt_message_ex(const BYTE *message, DWORD message_len,
                                    WCHAR **plain_out, WCHAR **sender_out,
                                    int *group_index_out, uint32_t *sender_id_out,
                                    WCHAR *err, size_t err_cch);
+BOOL app_groups_decrypt_blob(const BYTE *message, DWORD message_len,
+                             BYTE **plain_out, DWORD *plain_len_out,
+                             int *group_index_out, WCHAR **sender_out,
+                             WCHAR *err, size_t err_cch);
+BOOL app_groups_probe_message_header(const BYTE *message_prefix, DWORD prefix_len, int *group_index_out);
+BOOL app_groups_derive_image_stego_locator_key(int index,
+                                               BYTE out[32],
+                                               WCHAR *err, size_t err_cch);
 
 BOOL app_groups_archive_append_text(int index, const WCHAR *sender, const WCHAR *plain,
                                     WCHAR *err, size_t err_cch);

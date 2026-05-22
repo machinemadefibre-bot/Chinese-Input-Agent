@@ -76,3 +76,9 @@ BOOL app_flow_decrypt_clip_auto_profile(const WCHAR *clip, APP_FLOW_CANCEL_FN ca
     return app_message_flow_decrypt_clip_auto_profile(clip, cancel_fn, plain_w_out, profile_index_out,
                                                       err, err_cch);
 }
+
+BOOL app_flow_probe_clip_short(const WCHAR *clip, APP_FLOW_CANCEL_FN cancel_fn,
+                               APP_FLOW_PROBE_RESULT *result,
+                               WCHAR *err, size_t err_cch) {
+    return app_message_flow_probe_clip_short(clip, cancel_fn, result, err, err_cch);
+}

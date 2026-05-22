@@ -265,3 +265,99 @@ BOOL app_message_flow_decrypt_clip_auto_profile(const WCHAR *clip, APP_FLOW_CANC
     app_message_flow_free_decrypt_result(&result);
     return TRUE;
 }
+
+BOOL app_message_flow_probe_clip_short(const WCHAR *clip, APP_FLOW_CANCEL_FN cancel_fn,
+                                       APP_FLOW_PROBE_RESULT *result,
+                                       WCHAR *err, size_t err_cch) {
+    if (!result) {
+        set_error(err, err_cch, L"Invalid probe result buffer.");
+        return FALSE;
+    }
+    ZeroMemory(result, sizeof(*result));
+    result->profile_index = -1;
+    result->group_index = -1;
+
+    for (int group_index = 0; group_index < app_groups_count(); ++group_index) {
+        if (cancel_fn && cancel_fn()) {
+            set_error(err, err_cch, L"\u5df2\u505c\u6b62\u3002");
+            return FALSE;
+        }
+        WCHAR seed[256] = L"";
+        if (!app_groups_get_message_seed(group_index, seed, ARRAYSIZE(seed))) continue;
+        WCHAR preferred_tokenizer[APP_TOKENIZER_ID_CCH] = L"";
+        APP_LLM_DECODE_CANDIDATE *candidates = NULL;
+        DWORD candidate_count = 0;
+        WCHAR local_err[256] = L"";
+        app_tokenizer_prefs_get_group_recent(group_index, preferred_tokenizer, ARRAYSIZE(preferred_tokenizer));
+        if (!app_carrier_decode_message_payload_probe_multi(clip, seed,
+                                                            preferred_tokenizer[0] ? preferred_tokenizer : NULL,
+                                                            &candidates, &candidate_count,
+                                                            local_err, ARRAYSIZE(local_err))) {
+            continue;
+        }
+        for (DWORD candidate_idx = 0; candidate_idx < candidate_count; ++candidate_idx) {
+            int matched_group = -1;
+            if (app_groups_probe_message_header(candidates[candidate_idx].payload,
+                                                candidates[candidate_idx].payload_len,
+                                                &matched_group)) {
+                app_llm_free_decode_candidates(candidates, candidate_count);
+                result->group_index = matched_group;
+                result->is_group = TRUE;
+                return TRUE;
+            }
+        }
+        app_llm_free_decode_candidates(candidates, candidate_count);
+    }
+
+    int original = profiles_active_index();
+    int count = profiles_count();
+    for (int pass = 0; pass < count; ++pass) {
+        if (cancel_fn && cancel_fn()) {
+            set_error(err, err_cch, L"\u5df2\u505c\u6b62\u3002");
+            return FALSE;
+        }
+        int index;
+        if (original >= 0 && original < count && pass == count - 1) {
+            index = original;
+        } else {
+            index = pass;
+            if (original >= 0 && original < count && index >= original) index++;
+        }
+        if (index < 0 || index >= count) continue;
+
+        WCHAR local_err[256] = L"";
+        CRYPTO_BOX *box = NULL;
+        if (!profiles_open_crypto(index, &box, local_err, ARRAYSIZE(local_err))) {
+            continue;
+        }
+        WCHAR seed[256] = L"";
+        WCHAR preferred_tokenizer[APP_TOKENIZER_ID_CCH] = L"";
+        APP_LLM_DECODE_CANDIDATE *candidates = NULL;
+        DWORD candidate_count = 0;
+        if (app_carrier_get_message_seed(box, seed, ARRAYSIZE(seed), FALSE, local_err, ARRAYSIZE(local_err))) {
+            app_tokenizer_prefs_get_profile(index, preferred_tokenizer, ARRAYSIZE(preferred_tokenizer));
+            if (app_carrier_decode_message_payload_probe_multi(clip, seed,
+                                                               preferred_tokenizer[0] ? preferred_tokenizer : NULL,
+                                                               &candidates, &candidate_count,
+                                                               local_err, ARRAYSIZE(local_err))) {
+                for (DWORD candidate_idx = 0; candidate_idx < candidate_count; ++candidate_idx) {
+                    if (crypto_box_probe_message_header(box,
+                                                        candidates[candidate_idx].payload,
+                                                        candidates[candidate_idx].payload_len)) {
+                        crypto_box_close(box);
+                        app_llm_free_decode_candidates(candidates, candidate_count);
+                        profiles_lock_inactive_masters();
+                        result->profile_index = index;
+                        result->is_group = FALSE;
+                        return TRUE;
+                    }
+                }
+            }
+        }
+        crypto_box_close(box);
+        app_llm_free_decode_candidates(candidates, candidate_count);
+    }
+    profiles_lock_inactive_masters();
+    set_error(err, err_cch, L"No short decrypt probe matched this clipboard text.");
+    return FALSE;
+}

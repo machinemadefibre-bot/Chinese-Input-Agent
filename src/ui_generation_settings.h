@@ -5,12 +5,14 @@
 #include <stddef.h>
 
 #include "app_carrier_options.h"
+#include "app_image_stego.h"
 
 typedef struct UI_GENERATION_SETTINGS {
     WCHAR *custom_prompt;
     double temperature;
     double top_p;
     APP_CARRIER_REDUNDANCY_LEVEL redundancy_level;
+    IMAGE_STEGO_DCT_OPTIONS image_options;
     BOOL save_config;
 } UI_GENERATION_SETTINGS;
 
